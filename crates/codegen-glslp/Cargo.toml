@@ -1,0 +1,11 @@
+[package]
+name = "codegen-glslp"
+description = "IR → glslp emitter (post-v1). Best-effort legacy export off the same lowered IR (Architecture §B/§C)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ir = { workspace = true }

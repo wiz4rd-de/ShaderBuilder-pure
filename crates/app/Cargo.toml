@@ -1,0 +1,19 @@
+[package]
+name = "app"
+description = "Tauri application: commands, channels, window, and wiring (Architecture §B/§E)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# `app` is the top of the dependency graph: it wires together every other crate.
+[dependencies]
+core-model = { workspace = true }
+ir = { workspace = true }
+codegen-slang = { workspace = true }
+codegen-glslp = { workspace = true }
+slang-compile = { workspace = true }
+preview-engine = { workspace = true }
+source = { workspace = true }
+preset-io = { workspace = true }

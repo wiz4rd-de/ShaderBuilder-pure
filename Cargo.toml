@@ -1,0 +1,39 @@
+# ShaderBuilder-pure — Rust workspace.
+#
+# One crate per module in Architecture §B. Most crates are stubs in Phase 0;
+# later phases drop their implementations into a pre-existing home with stable
+# names and boundaries. See CONTRIBUTING.md and the wiki for the roadmap.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+repository = "https://github.com/wiz4rd-de/ShaderBuilder-pure"
+publish = false
+
+# Shared dependency versions live here so every crate stays in lockstep.
+# Crates opt in with `serde = { workspace = true }`.
+[workspace.dependencies]
+# Internal crates (path deps — the dependency graph is real even while bodies are stubs).
+core-model = { path = "crates/core-model" }
+ir = { path = "crates/ir" }
+codegen-slang = { path = "crates/codegen-slang" }
+codegen-glslp = { path = "crates/codegen-glslp" }
+slang-compile = { path = "crates/slang-compile" }
+preview-engine = { path = "crates/preview-engine" }
+source = { path = "crates/source" }
+preset-io = { path = "crates/preset-io" }
+
+# Third-party crates shared across the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ts-rs = "10"
+
+# A small but real release profile so `cargo build --release` and the Tauri
+# bundle behave predictably from day one.
+[profile.release]
+codegen-units = 1
+lto = true
