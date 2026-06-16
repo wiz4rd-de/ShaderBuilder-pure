@@ -1,0 +1,112 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app__titlebar {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  font-weight: 600;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.app__phase {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.app__project {
+  float: right;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.app__body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  min-height: 0;
+}
+
+.editor {
+  position: relative;
+  min-width: 0;
+  background: var(--bg);
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.preview__header {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.preview__pane {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  margin: 12px;
+}
+
+.preview__canvas-wrap {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.preview__canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #000;
+  /* Retro content is low-res by nature — keep pixels crisp when upscaled. */
+  image-rendering: pixelated;
+}
+
+.preview__stats {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.preview__stats button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.preview__stats button:hover {
+  border-color: var(--accent);
+}
+
+.preview__stat {
+  font-variant-numeric: tabular-nums;
+}

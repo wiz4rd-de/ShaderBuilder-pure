@@ -1,0 +1,33 @@
+[package]
+name = "app"
+description = "Tauri application: commands, channels, window, and wiring (Architecture §B/§E)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Split lib + thin bin: the lib (`app_lib`) holds `run()` so it is unit-testable
+# and stays mobile-ready; `main.rs` just calls it. This is the Tauri v2 convention.
+[lib]
+name = "app_lib"
+crate-type = ["lib"]
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# `app` is the top of the dependency graph: it wires together every other crate.
+[dependencies]
+tauri = { version = "2", features = [] }
+core-model = { workspace = true }
+ir = { workspace = true }
+codegen-slang = { workspace = true }
+codegen-glslp = { workspace = true }
+slang-compile = { workspace = true }
+preview-engine = { workspace = true }
+source = { workspace = true }
+preset-io = { workspace = true }

@@ -37,9 +37,16 @@ A phase is **done** when every sub-issue under its epic is closed and the phase'
 
 The roadmap is risk-ordered, so the unit of integration is **one phase = one PR** (Decision Log #16).
 
+### Integration branch
+
+`develop` is the integration branch. Each phase is built on its `phase-N` branch
+and **squash-merged into `develop`**. When a release is ready, `develop` is
+merged into `main` via a single release PR — so `main` only ever advances through
+reviewed releases.
+
 ### Branching
 
-- **Phase work:** one short-lived branch per phase, named `phase-N` (e.g. `phase-1`). Branch from the latest `main`.
+- **Phase work:** one short-lived branch per phase, named `phase-N` (e.g. `phase-1`). Branch from the latest `develop`.
 - **Non-phase work** (tooling, docs, hotfixes that aren't tied to a phase): `chore/...`, `docs/...`, or `fix/...`.
 
 ### Commits
@@ -52,15 +59,15 @@ The roadmap is risk-ordered, so the unit of integration is **one phase = one PR*
   ```
 
 - A loose [Conventional Commits](https://www.conventionalcommits.org/) prefix (`feat` / `fix` / `refactor` / `test` / `chore` / `docs`) is encouraged but not enforced.
-- Rebase the phase branch onto `main` to stay current rather than merging `main` in.
+- Rebase the phase branch onto `develop` to stay current rather than merging `develop` in.
 
 ### Pull requests — **squash-merge per phase**
 
-1. Open the PR when the phase's sub-issues are complete. Title it for the phase (e.g. `Phase 1 — Preview-engine vertical slice`).
+1. Open the PR against **`develop`** when the phase's sub-issues are complete. Title it for the phase (e.g. `Phase 1 — Preview-engine vertical slice`).
 2. In the PR description, close the work with `Closes #<epic>` and list the sub-issues it resolves.
 3. Merge with **Squash and merge**.
 
-This keeps `main` at **exactly one commit per phase** — a clean, roadmap-aligned history — while the full granular commit history of the phase stays visible inside the merged PR. Pick a clear squash-commit message (the phase name + a one-line summary).
+This keeps `develop` at **exactly one commit per phase** — a clean, roadmap-aligned history — while the full granular commit history of the phase stays visible inside the merged PR. Pick a clear squash-commit message (the phase name + a one-line summary).
 
 > Recommended repo setting (Settings → General → Pull Requests): enable **Allow squash merging** and, for tidiness, disable the merge-commit and rebase-merge options so squash is the default.
 
@@ -68,6 +75,55 @@ This keeps `main` at **exactly one commit per phase** — a clean, roadmap-align
 
 ## Development
 
-> Status: design phase — the crate skeleton and Tauri shell land in **Phase 0**. Until then this section is a placeholder.
+The stack is **Tauri** (Rust core + React / React Flow web UI), Linux-first for
+v1. The Rust workspace is split into the crates listed in
+[Architecture §B](https://github.com/wiz4rd-de/ShaderBuilder-pure/wiki/Architecture);
+the web UI lives in `web/`.
 
-The stack is **Tauri** (Rust core + React / React Flow web UI), Linux-first for v1. The Rust workspace is split into the crates listed in [Architecture §B](https://github.com/wiz4rd-de/ShaderBuilder-pure/wiki/Architecture); the web UI lives in `web/`. Build/test commands will be documented here once Phase 0 establishes the workspace and CI.
+### Prerequisites (Linux)
+
+- **Rust** — installed automatically from [`rust-toolchain.toml`](./rust-toolchain.toml) by rustup.
+- **Node.js 20+** and npm.
+- **Tauri system deps** — WebKitGTK 4.1, libsoup-3.0, GTK 3, librsvg, a C toolchain.
+  - Arch / Manjaro: `sudo pacman -S webkit2gtk-4.1 libsoup3 gtk3 librsvg base-devel`
+  - Debian / Ubuntu: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev build-essential`
+- Tauri CLI: `cargo install tauri-cli --version "^2"` (or use the bundled `npm --prefix web run tauri`).
+
+### Common commands
+
+| Task | Command |
+|------|---------|
+| Build the workspace | `cargo build --workspace` |
+| Test the workspace | `cargo test --workspace` |
+| Lint (as CI does) | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Format | `cargo fmt --all` |
+| Regenerate TS bindings | `cargo test -p core-model` (writes `web/src/bindings/`) |
+| Frontend typecheck / build | `cd web && npm run typecheck` / `npm run build` |
+| Run the app | `cargo tauri dev` (from the repo root) |
+
+> The frontend is a build input for the Tauri `app` crate — its assets are
+> embedded by `generate_context!` — so run a frontend build (or `cargo tauri dev`,
+> which does it for you) before compiling the `app` crate on its own.
+
+### Running in a headless / VM environment
+
+If you run the app over a remote or nested display without a GPU and hit a blank
+window or a `Failed to create GBM buffer` error, force software rendering:
+
+```bash
+GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1 cargo tauri dev
+```
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs on every push to
+`main` / `develop` and on every pull request, on Linux:
+
+- **frontend** job — `npm ci`, `npm run typecheck`, `npm run build`.
+- **rust** job — `cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo test --workspace`, and a **TypeScript
+  bindings drift check** (`git diff --exit-code web/src/bindings` after
+  regeneration) so the Rust schema and the generated TypeScript can never drift.
+
+Once the repository is configured, mark these checks **required** for merging in
+*Settings → Branches → Branch protection*.
