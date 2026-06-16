@@ -81,9 +81,12 @@ jobs:
             libsoup-3.0-dev \
             build-essential
 
-      # rustup installs the toolchain + components pinned in rust-toolchain.toml.
+      # Explicitly install the pinned toolchain *with* rustfmt + clippy. `rustup
+      # show` alone is unreliable on the runner: auto-install uses the minimal
+      # profile and skips the components listed in rust-toolchain.toml
+      # (rust-lang/rustup#4337), which would break the fmt/clippy steps.
       - name: Install Rust toolchain
-        run: rustup show
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -91,15 +94,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # `cargo test` above regenerated the committed TypeScript bindings (the
       # ts-rs #[ts(export)] tests). If they differ from what's checked in, the
-      # Rust schema and the TS bindings have drifted — fail the build.
+      # Rust schema and the TS bindings have drifted — fail the build. Use
+      # `git status --porcelain` so newly-added (untracked) and deleted binding
+      # files are caught too, not just modifications.
       - name: TypeScript bindings drift check
         run: |
-          git diff --exit-code -- web/src/bindings \
-            || (echo "::error::web/src/bindings is stale — run 'cargo test -p core-model' and commit." && exit 1)
+          if [ -n "$(git status --porcelain -- web/src/bindings)" ]; then
+            echo "::error::web/src/bindings is stale — run 'cargo test -p core-model' and commit."
+            git status --porcelain -- web/src/bindings
+            git diff -- web/src/bindings
+            exit 1
+          fi
