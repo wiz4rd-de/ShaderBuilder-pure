@@ -19,7 +19,9 @@ kind: string,
  */
 position: Vec2, 
 /**
- * Node configuration. Free-form JSON until the typed node set lands; the
- * generated TypeScript types this as `Record<string, unknown>`.
+ * Node configuration. Free-form JSON object until the typed node set lands;
+ * the generated TypeScript types this as `Record<string, unknown>`. Defaults
+ * to `{}` (not `null`) when omitted, so the on-wire value always matches the
+ * non-nullable generated type.
  */
 data: Record<string, unknown>, };

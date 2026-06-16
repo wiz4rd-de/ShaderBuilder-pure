@@ -105,6 +105,12 @@ pub struct Graph {
     pub edges: Vec<Edge>,
 }
 
+/// Default for [`Node::data`]: an empty JSON object (so an omitted `data`
+/// matches the non-nullable generated `Record<string, unknown>` type).
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// A single node in a per-pass [`Graph`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -117,9 +123,11 @@ pub struct Node {
     pub kind: String,
     /// Position on the editor canvas.
     pub position: Vec2,
-    /// Node configuration. Free-form JSON until the typed node set lands; the
-    /// generated TypeScript types this as `Record<string, unknown>`.
-    #[serde(default)]
+    /// Node configuration. Free-form JSON object until the typed node set lands;
+    /// the generated TypeScript types this as `Record<string, unknown>`. Defaults
+    /// to `{}` (not `null`) when omitted, so the on-wire value always matches the
+    /// non-nullable generated type.
+    #[serde(default = "empty_object")]
     #[ts(type = "Record<string, unknown>")]
     pub data: serde_json::Value,
 }
@@ -232,6 +240,15 @@ mod tests {
         let json = serde_json::to_string_pretty(&project).expect("serialize");
         let back: Project = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(project, back);
+    }
+
+    #[test]
+    fn node_data_defaults_to_empty_object() {
+        // `data` omitted -> {} (a valid Record<string, unknown>), never null.
+        let node: Node =
+            serde_json::from_str(r#"{"id":"n0","kind":"output","position":{"x":0,"y":0}}"#)
+                .expect("deserialize node without data");
+        assert_eq!(node.data, serde_json::json!({}));
     }
 
     #[test]
