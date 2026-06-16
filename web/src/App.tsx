@@ -3,6 +3,7 @@ import "@xyflow/react/dist/style.css";
 
 import "./App.css";
 import { EMPTY_PROJECT } from "./model";
+import { PreviewCanvas } from "./preview/PreviewCanvas";
 
 // Phase 0: an empty editor surface. The node taxonomy, inspectors, pipeline
 // view, and live compile arrive in Phase 5 — this only reserves the canvas.
@@ -33,9 +34,7 @@ export default function App() {
         <aside className="preview" aria-label="Preview">
           <div className="preview__header">Preview</div>
           <div className="preview__pane">
-            <span className="preview__placeholder">
-              preview pane — frame stream lands in #13
-            </span>
+            <PreviewCanvas />
           </div>
         </aside>
       </div>

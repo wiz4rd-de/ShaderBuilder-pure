@@ -1,8 +1,14 @@
 //! ShaderBuilder Tauri application.
 //!
-//! Phase 0: builds the Tauri context and opens a single window hosting the
-//! React/React Flow frontend (Architecture §A). The Rust↔web command surface
-//! and the `tauri::ipc::Channel` binary frame path land in #13.
+//! Phase 0: builds the Tauri context, opens a single window hosting the
+//! React/React Flow frontend (Architecture §A), and stands up the **binary
+//! frame transport** — a `tauri::ipc::Channel` carrying raw RGBA frames from
+//! Rust to a `<canvas>` (Architecture §E/§F). The frame *producer* is a dummy
+//! gradient ([`preview_engine::GradientSource`]); Phase 1 swaps in the offscreen
+//! wgpu renderer behind the same [`preview_engine::FrameSource`] seam **without
+//! touching this transport**.
+
+mod preview;
 
 /// The workspace engine crates wired into the app. Phase 0 keeps the
 /// `app` → all dependency edges (Architecture §B) live and referenced until
@@ -32,6 +38,11 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .manage(preview::PreviewState::default())
+        .invoke_handler(tauri::generate_handler![
+            preview::start_preview_stream,
+            preview::stop_preview_stream,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");
 }
