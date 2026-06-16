@@ -1,0 +1,8 @@
+# Where `ts-rs` writes the generated TypeScript bindings. `relative = true`
+# resolves it against this file's directory (the workspace root), so the path is
+# stable no matter which directory `cargo test` runs from.
+#
+# Regenerate with `cargo test -p core-model`; CI fails on any diff against the
+# committed bindings (see core-model/src/lib.rs and .github/workflows/ci.yml).
+[env]
+TS_RS_EXPORT_DIR = { value = "web/src/bindings", relative = true }
