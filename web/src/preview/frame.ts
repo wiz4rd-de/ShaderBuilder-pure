@@ -68,9 +68,10 @@ export function parseFrame(buffer: ArrayBuffer): PreviewFrame {
   if (buffer.byteLength < FRAME_HEADER_LEN + expected) {
     throw new Error("preview frame payload truncated");
   }
-  // Copy the pixel region into its own buffer so it's a plain, standalone
-  // Uint8ClampedArray<ArrayBuffer> (what ImageData requires).
-  const pixels = new Uint8ClampedArray(expected);
-  pixels.set(new Uint8Array(buffer, FRAME_HEADER_LEN, expected));
+  // A zero-copy view over the pixel region. `buffer` is always a plain
+  // ArrayBuffer here (toArrayBuffer guarantees it), so this is a
+  // Uint8ClampedArray<ArrayBuffer> whose length is exactly width*height*4 —
+  // exactly what ImageData wants — with no per-frame allocation in the hot path.
+  const pixels = new Uint8ClampedArray(buffer, FRAME_HEADER_LEN, expected);
   return { width, height, frameIndex, format, pixels };
 }

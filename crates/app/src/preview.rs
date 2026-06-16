@@ -21,23 +21,45 @@ const DEFAULT_PREVIEW_HEIGHT: u32 = 384;
 /// Frame period for ~60 fps.
 const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
 
-/// Managed state holding the stop flag of the single active preview stream.
+/// The single active preview stream: a caller-supplied id and its stop flag.
+struct ActiveStream {
+    id: String,
+    running: Arc<AtomicBool>,
+}
+
+/// Managed state holding the single active preview stream, if any.
 #[derive(Default)]
 pub struct PreviewState {
-    active: Mutex<Option<Arc<AtomicBool>>>,
+    active: Mutex<Option<ActiveStream>>,
 }
 
 impl PreviewState {
-    /// Stop the currently active stream, if any.
-    fn stop(&self) {
-        if let Some(flag) = self.active.lock().unwrap().take() {
-            flag.store(false, Ordering::Relaxed);
+    /// Stop whatever stream is active (used when a new one starts).
+    fn stop_any(&self) {
+        if let Some(stream) = self.active.lock().unwrap().take() {
+            stream.running.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Stop the active stream only if its id matches `id`. A stale `stop` for a
+    /// superseded stream is then a no-op — which is what makes start/stop robust
+    /// to out-of-order IPC (e.g. React StrictMode's mount→unmount→mount, where
+    /// the first unmount's stop can arrive after the second mount's start).
+    fn stop_matching(&self, id: &str) {
+        let mut guard = self.active.lock().unwrap();
+        if guard.as_ref().is_some_and(|s| s.id == id) {
+            guard
+                .take()
+                .unwrap()
+                .running
+                .store(false, Ordering::Relaxed);
         }
     }
 }
 
 /// Start streaming preview frames over `channel` at ~60 fps. Any previously
 /// running stream is stopped first, so at most one producer runs at a time.
+/// `stream_id` correlates this stream with its later `stop_preview_stream` call.
 ///
 /// Frames are sent as raw binary ([`InvokeResponseBody::Raw`]), not JSON; the
 /// frontend parses the documented header and blits to a `<canvas>`.
@@ -45,13 +67,17 @@ impl PreviewState {
 pub fn start_preview_stream(
     state: State<'_, PreviewState>,
     channel: Channel<InvokeResponseBody>,
+    stream_id: String,
     width: Option<u32>,
     height: Option<u32>,
 ) {
-    state.stop();
+    state.stop_any();
 
     let running = Arc::new(AtomicBool::new(true));
-    *state.active.lock().unwrap() = Some(running.clone());
+    *state.active.lock().unwrap() = Some(ActiveStream {
+        id: stream_id,
+        running: running.clone(),
+    });
 
     let width = width.unwrap_or(DEFAULT_PREVIEW_WIDTH);
     let height = height.unwrap_or(DEFAULT_PREVIEW_HEIGHT);
@@ -104,10 +130,11 @@ fn pump_frames<S: FrameSource>(
     running.store(false, Ordering::Relaxed);
 }
 
-/// Stop the active preview stream (idempotent).
+/// Stop the preview stream with the given id (idempotent; a non-matching or
+/// already-stopped id is a no-op).
 #[tauri::command]
-pub fn stop_preview_stream(state: State<'_, PreviewState>) {
-    state.stop();
+pub fn stop_preview_stream(state: State<'_, PreviewState>, stream_id: String) {
+    state.stop_matching(&stream_id);
 }
 
 #[cfg(test)]

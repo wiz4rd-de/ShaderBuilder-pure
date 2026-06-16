@@ -31,6 +31,11 @@ export function PreviewCanvas() {
     let framesThisWindow = 0;
     let windowStart = performance.now();
 
+    // Correlate this stream's start with its cleanup stop, so an out-of-order
+    // stop (StrictMode mount→unmount→mount, or rapid Start/Stop) can't kill a
+    // newer stream — the backend ignores a stop whose id is no longer active.
+    const streamId = crypto.randomUUID();
+
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = (message) => {
       if (cancelled) {
@@ -62,13 +67,14 @@ export function PreviewCanvas() {
 
     void invoke("start_preview_stream", {
       channel,
+      streamId,
       width: PREVIEW_WIDTH,
       height: PREVIEW_HEIGHT,
     });
 
     return () => {
       cancelled = true;
-      void invoke("stop_preview_stream");
+      void invoke("stop_preview_stream", { streamId });
     };
   }, [streaming]);
 
