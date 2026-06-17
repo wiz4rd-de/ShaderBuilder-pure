@@ -685,6 +685,25 @@ impl Renderer {
         self.history.clear();
     }
 
+    /// Reset every pass's feedback double-buffer to cold black (#31, §4): clear
+    /// each pass's `feedback_fbo` to `None` so the next [`Renderer::rebuild_chain`]
+    /// reallocates **and clears both halves** of the ping-pong (the `twin_stale`
+    /// path: a `None` feedback FBO forces `twin_stale`, which re-`allocate`s + runs
+    /// `clear_fbo` on both `fbo` and `feedback_fbo`). This is the feedback analogue
+    /// of [`Renderer::reset_history`]: a **seek** in the source pump (#31) must
+    /// reset feedback too, since the new frame is a discontinuity — exactly how
+    /// [`Renderer::set_chain`] resets feedback by rebuilding the passes. Leaving
+    /// `is_feedback_target` and `fbo` untouched keeps the pass's identity/size; only
+    /// the *accumulated history* in the twin is discarded, re-clearing on the next
+    /// frame. A no-op for a chain with no feedback targets.
+    pub fn reset_feedback(&mut self) {
+        for res in &mut self.passes {
+            if res.is_feedback_target {
+                res.feedback_fbo = None;
+            }
+        }
+    }
+
     /// Build a single history-ring frame (#25): a source-sized, single-level
     /// `SOURCE_FORMAT` texture with `rgba` uploaded into it, sampled as
     /// `OriginalHistoryK`.

@@ -21,8 +21,11 @@ pub mod viewport;
 pub use bindtable::{PlaceholderResolver, TextureClass, TextureResolver};
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
-pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
+pub use render_source::{PositionUpdate, RenderCommand, RenderSource, SourceSpec, DEFAULT_SHADER};
+// Re-export `source`'s `TestPattern` so the app can build a `SourceSpec` without
+// a direct `source` import for that one type (it already depends on `source`).
 pub use renderer::{LutSpec, Renderer, RendererError, OFFSCREEN_FORMAT};
+pub use source::TestPattern;
 pub use uniforms::{BuiltinUniforms, BuiltinValues, ParamDef, ParamStore, ParamView};
 pub use viewport::{ViewportConfig, ViewportRect};
 
@@ -2014,6 +2017,32 @@ void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }
         assert!(
             (after as i32 - 100).abs() <= 6,
             "rebuild should reset feedback to cold black (frame 0 ~100), got {after}"
+        );
+    }
+
+    #[test]
+    fn reset_feedback_clears_accumulated_history() {
+        // #31: `reset_feedback` is the seek-time feedback discontinuity. After
+        // accumulating several frames, `reset_feedback` (WITHOUT rebuilding the
+        // chain) must clear the double-buffer to cold black, so the next frame 0 is
+        // ~100 again — exactly like a chain rebuild, but preserving the pipeline.
+        let src = solid(4, 4, [200, 0, 0, 255]);
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&src);
+        r.set_chain(&[Pass::new(half_blend_feedback())])
+            .expect("set chain");
+        for _ in 0..5 {
+            r.render().expect("render");
+            let _ = r.read_back().expect("read back");
+        }
+        // Reset feedback only (no chain rebuild): twin FBO -> None -> realloc+clear.
+        r.reset_feedback();
+        r.render().expect("render");
+        let after = center_r(&r.read_back().expect("read back"));
+        assert!(
+            (after as i32 - 100).abs() <= 6,
+            "reset_feedback should reset the double-buffer to cold black \
+             (frame 0 ~100), got {after}"
         );
     }
 

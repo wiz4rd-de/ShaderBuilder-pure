@@ -16,9 +16,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use preview_engine::{FrameSource, RenderCommand, RenderSource};
+use preview_engine::{
+    FrameSource, PositionUpdate, RenderCommand, RenderSource, SourceSpec, TestPattern,
+};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 /// Default preview resolution. Small and fixed: transfer cost is bounded by the
 /// pane size, not the simulated viewport (Architecture §F).
@@ -26,6 +28,21 @@ const DEFAULT_PREVIEW_WIDTH: u32 = 512;
 const DEFAULT_PREVIEW_HEIGHT: u32 = 384;
 /// Frame period for ~60 fps.
 const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
+
+/// The `source-position` event payload (#31): the pump's current frame index and
+/// the sequence length, forwarded to the webview whenever the source position
+/// changes (play advance / step / seek / load). A still image or a static pattern
+/// reports `len == 1`.
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct PositionPayload {
+    /// The current frame index in `0..len`.
+    pub index: usize,
+    /// The number of frames in the pump (`>= 1`).
+    pub len: usize,
+}
+
+/// The Tauri event name carrying [`PositionPayload`] (#31).
+const SOURCE_POSITION_EVENT: &str = "source-position";
 
 /// The single active preview stream: a caller-supplied id, its stop flag, the
 /// command channel to its render thread, and the current pane size (so a
@@ -104,6 +121,7 @@ impl PreviewState {
 /// frontend parses the documented header and blits to a `<canvas>`.
 #[tauri::command]
 pub fn start_preview_stream(
+    app: AppHandle,
     state: State<'_, PreviewState>,
     channel: Channel<InvokeResponseBody>,
     stream_id: String,
@@ -124,19 +142,44 @@ pub fn start_preview_stream(
         viewport: (width, height),
     });
 
-    std::thread::spawn(move || match RenderSource::new(width, height, rx) {
-        Ok(source) => pump_frames(&channel, source, &running, FRAME_PERIOD),
-        Err(err) => {
-            eprintln!("preview: renderer unavailable, no frames will stream: {err}");
-            running.store(false, Ordering::Relaxed);
+    // Source-position event forwarding (#31): the render thread does NOT hold the
+    // `AppHandle`, so it reports `PositionUpdate`s on a channel and a small
+    // forwarder thread (which does hold the handle) emits the `source-position`
+    // event. The render loop is never blocked on emission. The forwarder exits
+    // when the render thread drops its sender (stream stopped).
+    let (pos_tx, pos_rx) = mpsc::channel::<PositionUpdate>();
+    let forward_running = running.clone();
+    std::thread::spawn(move || {
+        for update in pos_rx {
+            // A dropped/closed webview makes emit fail — keep forwarding; the loop
+            // ends when the render thread's sender is dropped.
+            let _ = app.emit(
+                SOURCE_POSITION_EVENT,
+                PositionPayload {
+                    index: update.index,
+                    len: update.len,
+                },
+            );
+        }
+        forward_running.store(false, Ordering::Relaxed);
+    });
+
+    std::thread::spawn(move || {
+        match RenderSource::with_position_sink(width, height, rx, Some(pos_tx)) {
+            Ok(source) => pump_frames(&channel, source, &running, FRAME_PERIOD),
+            Err(err) => {
+                eprintln!("preview: renderer unavailable, no frames will stream: {err}");
+                running.store(false, Ordering::Relaxed);
+            }
         }
     });
 }
 
-/// Load the preview **source image**. With a path, decodes that file; with
-/// `None`, uses the built-in checkerboard test pattern sized to the pane. The
-/// decoded image is handed to the render thread; rendering continues
-/// asynchronously.
+/// Load the preview **source image** as a still-image pump (#31). With a path,
+/// decodes that file; with `None`, uses the built-in checkerboard test pattern
+/// sized to the pane. The decoded image is handed to the render thread as a
+/// 1-frame [`SourceSpec`]; rendering continues asynchronously. File IO happens
+/// here (in the command), off the render loop.
 #[tauri::command]
 pub fn load_source(
     state: State<'_, PreviewState>,
@@ -149,7 +192,81 @@ pub fn load_source(
             source::test_pattern(width, height)
         }
     };
-    state.send(RenderCommand::SetSource(frame))
+    state.send(RenderCommand::LoadSourcePump(SourceSpec::StillImage(frame)))
+}
+
+/// Load a **built-in test pattern** as the source pump (#31). `pattern` is one of
+/// `smpte_bars` / `checkerboard` / `gradient` / `motion_sweep`; it is rendered at
+/// the current pane size. `motion_sweep` is animated (a multi-frame pump that
+/// `play`/`step`/`seek` drive); the others are static 1-frame pumps.
+#[tauri::command]
+pub fn load_test_pattern(state: State<'_, PreviewState>, pattern: String) -> Result<(), String> {
+    let pattern = parse_test_pattern(&pattern)?;
+    let (width, height) = state.viewport().ok_or("no active preview stream")?;
+    state.send(RenderCommand::LoadSourcePump(SourceSpec::TestPattern {
+        pattern,
+        width,
+        height,
+    }))
+}
+
+/// Load a **PNG sequence** from a numbered directory as the source pump (#31).
+/// The directory is enumerated and every numbered PNG is **decoded here, in the
+/// command** (off the render loop), then the decoded `Vec<Frame>` is shipped to
+/// the render thread — so the render loop never touches the disk. The sequence
+/// starts paused at frame 0; drive it with `play`/`pause`/`step`/`seek`/`set_fps`.
+#[tauri::command]
+pub fn load_source_sequence(state: State<'_, PreviewState>, dir: String) -> Result<(), String> {
+    // Decode the whole sequence up front (acceptable for v1, see PngSequencePump),
+    // then ship the decoded `Vec<Frame>` over IPC so the render thread never
+    // touches the disk.
+    let frames = source::PngSequencePump::load(std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())?
+        .into_frames();
+    state.send(RenderCommand::LoadSourcePump(SourceSpec::PngSequence(
+        frames,
+    )))
+}
+
+/// Parse the JS-facing test-pattern name into the engine enum (#31).
+fn parse_test_pattern(name: &str) -> Result<TestPattern, String> {
+    match name {
+        "smpte_bars" | "smpte" => Ok(TestPattern::SmpteBars),
+        "checkerboard" | "checker" => Ok(TestPattern::Checkerboard),
+        "gradient" => Ok(TestPattern::Gradient),
+        "motion_sweep" | "motion" => Ok(TestPattern::MotionSweep),
+        other => Err(format!("unknown test pattern {other:?}")),
+    }
+}
+
+/// Start advancing the source pump at its fps (#31).
+#[tauri::command]
+pub fn play(state: State<'_, PreviewState>) -> Result<(), String> {
+    state.send(RenderCommand::Play)
+}
+
+/// Pause the source pump, holding the current frame (#31).
+#[tauri::command]
+pub fn pause(state: State<'_, PreviewState>) -> Result<(), String> {
+    state.send(RenderCommand::Pause)
+}
+
+/// Advance the source pump exactly one frame, even when paused (#31).
+#[tauri::command]
+pub fn step(state: State<'_, PreviewState>) -> Result<(), String> {
+    state.send(RenderCommand::Step)
+}
+
+/// Seek the source pump to a frame index (#31): jumps + resets history & feedback.
+#[tauri::command]
+pub fn seek(state: State<'_, PreviewState>, index: usize) -> Result<(), String> {
+    state.send(RenderCommand::Seek(index))
+}
+
+/// Set the source pump's advance rate in frames per second (#31).
+#[tauri::command]
+pub fn set_fps(state: State<'_, PreviewState>, fps: f32) -> Result<(), String> {
+    state.send(RenderCommand::SetFps(fps))
 }
 
 /// Load the preview **shader**. With a path, reads and compiles that `.slang`

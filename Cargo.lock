@@ -63,6 +63,7 @@ dependencies = [
  "ir",
  "preset-io",
  "preview-engine",
+ "serde",
  "slang-compile",
  "source",
  "tauri",
