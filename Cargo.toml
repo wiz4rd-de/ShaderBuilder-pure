@@ -26,6 +26,7 @@ slang-compile = { path = "crates/slang-compile" }
 preview-engine = { path = "crates/preview-engine" }
 source = { path = "crates/source" }
 preset-io = { path = "crates/preset-io" }
+testing = { path = "crates/testing" }
 
 # Third-party crates shared across the workspace.
 serde = { version = "1", features = ["derive"] }

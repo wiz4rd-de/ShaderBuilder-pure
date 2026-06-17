@@ -132,6 +132,29 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # Golden-image regression harness (#32): the corpus fuzzer over the local
+      # fixtures + the self-oracle goldens + the determinism gate. Run explicitly
+      # with `--test-threads=1` (concurrent wgpu device creation can SIGSEGV on
+      # multi-adapter boxes; serialized here to be safe). The `testing` crate's
+      # tests also run under the workspace `Test` step above; this dedicated step
+      # makes the fidelity-gate machinery visible as its own check and is where the
+      # diff-artifact upload below attaches. See docs/golden-image-harness.md —
+      # the RetroArch *reference* comparison remains a documented MANUAL gate (no
+      # RetroArch capture is possible on the headless runner).
+      - name: Golden-image harness (testing crate)
+        run: cargo test -p testing --locked -- --test-threads=1
+
+      # On a golden divergence the harness writes the rendered output + an
+      # amplified diff so a render regression is inspectable from the run.
+      - name: Upload golden diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diff-artifacts
+          path: target/golden-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Capture the rendered curvature snapshot (and passthrough control) the
       # e2e test writes, so a render regression is inspectable from the run.
       - name: Upload e2e render artifacts

@@ -1,0 +1,27 @@
+# Self-oracle fixture (#32): a multi-pass preset exercising the Phase-2 chain
+# resource graph — a `scaleN`, an `aliasN`, and a later pass sampling that alias
+# AND the original via `<alias>` / `Source`.
+#
+# This is a LOCAL fixture, NOT a RetroArch reference. Combined-sampler form
+# (`uniform sampler2D`) is used throughout to exercise the corpus path (real
+# slang-shaders use the combined form, which slang_compile splits for wgpu).
+#
+# Chain:
+#   pass 0  (alias FIRST)  scale source x2  -> inverts the source into a 2x-FBO
+#   pass 1  (final)        reads <FIRST> and Source, averages them
+#
+# pass1 = 0.5 * invert(Source) + 0.5 * Source. Per channel that is a constant
+# 0.5 (127) regardless of the source — a stable, easy-to-eyeball golden that
+# still proves the alias bound pass 0's output (not the original) and that the
+# x2 intermediate FBO fed the final pass.
+
+shaders = 2
+
+shader0 = invert.slang
+alias0 = FIRST
+scale_type0 = source
+scale0 = 2.0
+filter_linear0 = false
+
+shader1 = blend.slang
+filter_linear1 = true

@@ -1,0 +1,23 @@
+# Self-oracle fixture (#32): a feedback preset — a single pass that reads its
+# OWN previous-frame output via `PassFeedback0` and blends it with the source.
+# This is the classic decay/accumulate loop that the Phase-2 feedback
+# double-buffer (#24, §4) implements.
+#
+# LOCAL fixture, NOT a RetroArch reference. Uses the SEPARATE texture2D + sampler
+# form (the other fixtures use combined `sampler2D`) so the harness proves both
+# binding shapes through the corpus path.
+#
+# `feedback_pass = 0` opts pass 0 into double-buffering via the preset key; the
+# engine ALSO auto-detects feedback from the `PassFeedback0` reference, so this
+# fixture exercises the union of both opt-in paths.
+#
+# out_N = 0.5 * Source + 0.5 * out_{N-1}, out_{-1} = black. So a golden rendered
+# at frame_index N is deterministic in N: at N=0 it is ~0.5*Source; later frames
+# accumulate monotonically toward Source. The golden test renders at a FIXED
+# frame index, so the value is fixed.
+
+shaders = 1
+feedback_pass = 0
+
+shader0 = accumulate.slang
+filter_linear0 = false
