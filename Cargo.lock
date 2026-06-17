@@ -3242,6 +3242,7 @@ name = "slang-compile"
 version = "0.1.0"
 dependencies = [
  "core-model",
+ "naga",
  "tempfile",
 ]
 

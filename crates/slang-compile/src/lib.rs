@@ -10,12 +10,17 @@
 pub mod cache;
 mod glslang;
 pub mod preprocess;
+pub mod reflect;
 
 use std::path::Path;
 
 pub use core_model::Parameter;
 pub use glslang::{Diagnostic, GlslangError};
 pub use preprocess::{PreprocessError, Preprocessed, Reflection, Stage};
+pub use reflect::{
+    reflect, BlockBinding, MemberKind, ReflectError, ResourceBinding, ScalarType, SpirvReflection,
+    UniformBlock, UniformMember,
+};
 
 /// Crate identity marker (kept from the Phase 0 scaffold so dependent crates'
 /// smoke tests keep the dependency edge live).
