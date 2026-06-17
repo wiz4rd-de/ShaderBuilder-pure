@@ -158,6 +158,11 @@ pub struct Pass {
     pub wrap_mode: WrapMode,
     /// `mipmap_inputN` (#23). Generate a mip chain for this pass's input.
     pub mipmap_input: bool,
+
+    // ---- Builtin semantics (consumed by #28). ----
+    /// `frame_count_modN` (#28). When `> 0`, the `FrameCount` this pass sees is
+    /// pre-wrapped: `frame_count % mod` (§6). `0` (the default) means no wrap.
+    pub frame_count_mod: u32,
 }
 
 impl Pass {
@@ -173,6 +178,7 @@ impl Pass {
             filter_linear: true,
             wrap_mode: WrapMode::default(),
             mipmap_input: false,
+            frame_count_mod: 0,
         }
     }
 

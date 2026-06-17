@@ -27,8 +27,8 @@
 //! not GLSL's combined `sampler2D` (the conversion happens in `slang-compile`).
 
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
-use crate::uniforms::{self, BuiltinUniforms};
-use slang_compile::CompiledShader;
+use crate::uniforms::{self, BuiltinValues};
+use slang_compile::{CompiledShader, UniformBlock};
 use source::Frame;
 
 /// The offscreen color format. Linear RGBA8 so a passthrough shader reproduces
@@ -145,6 +145,14 @@ struct PassResources {
     param_buffer: wgpu::Buffer,
     /// This pass's builtin UBO (per-pass because `*Size` differs per pass).
     ubo: wgpu::Buffer,
+    /// The reflected builtin uniform block this pass declares (#28): member
+    /// names → byte offsets, discovered from the SPIR-V so builtins can be
+    /// declared in any order/subset. `None` if the pass declares no builtin
+    /// block (e.g. a constant-color pass); then the UBO is a zero-filled vec4.
+    builtin_block: Option<UniformBlock>,
+    /// `frame_count_modN` (#28): the `FrameCount` this pass sees is pre-wrapped
+    /// by this modulus (`0` = no wrap).
+    frame_count_mod: u32,
     /// This pass's **input** sampler (binding 2): filter/wrap/mip per the pass's
     /// `filter_linear`/`wrap_mode`/`mipmap_input` (#23). Built once at
     /// [`Renderer::build_pass`].
@@ -210,6 +218,9 @@ pub struct Renderer {
     source_size: Option<(u32, u32)>,
     /// Frames rendered so far; written into `FrameCount` and bumped per frame.
     frame_count: u32,
+    /// `FrameDirection` (#28): `+1` forward, `-1` rewinding. Settable so rewind
+    /// (#31) can flip it; `+1` for now.
+    frame_direction: i32,
 
     source_view: Option<wgpu::TextureView>,
     /// The ordered pass chain. Empty until [`Renderer::set_shader`]/`set_chain`.
@@ -227,8 +238,11 @@ struct MipGen {
     pipelines: std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
-/// Size of the builtin UBO (std140; see [`BuiltinUniforms`]).
-const UBO_SIZE: u64 = std::mem::size_of::<BuiltinUniforms>() as u64;
+/// Fallback builtin-UBO size when a pass declares no builtin block (#28): one
+/// std140 vec4 of zero storage, since a bound UBO needs at least one vec4 even
+/// when unused (mirrors `pack_parameters`' minimum). When a builtin block *is*
+/// reflected, the UBO is sized to the reflected block instead.
+const UBO_FALLBACK_SIZE: u64 = 16;
 
 impl Renderer {
     /// Initialize a headless wgpu device and the static resources.
@@ -336,6 +350,7 @@ impl Renderer {
             offscreen,
             source_size: None,
             frame_count: 0,
+            frame_direction: 1,
             source_view: None,
             passes: Vec::new(),
         })
@@ -465,9 +480,23 @@ impl Renderer {
         });
         self.queue.write_buffer(&param_buffer, 0, &params);
 
+        // Reflect the SPIR-V to discover the builtin block's member offsets (#28)
+        // so builtins can be declared in any order/subset. A reflection failure
+        // is non-fatal: fall back to no builtin block (zero-filled UBO) rather
+        // than refusing to build the pass.
+        let builtin_block = slang_compile::reflect(shader)
+            .ok()
+            .and_then(|r| uniforms::builtin_block(&r).cloned());
+        // Size the builtin UBO to the reflected block (a 16-byte multiple), or
+        // to one vec4 when there is no builtin block.
+        let ubo_size = builtin_block
+            .as_ref()
+            .map(|b| b.size as u64)
+            .unwrap_or(UBO_FALLBACK_SIZE)
+            .max(UBO_FALLBACK_SIZE);
         let ubo = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
-            size: UBO_SIZE,
+            size: ubo_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -545,6 +574,8 @@ impl Renderer {
             pipeline,
             param_buffer,
             ubo,
+            builtin_block,
+            frame_count_mod: pass.frame_count_mod,
             sampler,
             target_format,
             scale: pass.scale,
@@ -709,23 +740,52 @@ impl Renderer {
         }
     }
 
-    /// Compute and upload each pass's builtin UBO for the current frame. A pass's
+    /// Compute and upload each pass's builtin UBO for the current frame (#28),
+    /// reflection-driven: for each pass we compute every currently-computable
+    /// builtin semantic, then pack each into the offset of the same-named member
+    /// the pass's SPIR-V actually declares (so order/subset are free). A pass's
     /// `Source`/`Original`/`Output` sizes follow the §2 chaining: pass 0's input
     /// is the source image (== `Original`); pass i's input is FBO i-1; the output
-    /// is the pass's own target size.
+    /// is the pass's own target size. `FinalViewportSize` is the pane; each pass
+    /// also sees the output sizes of all *earlier* passes via `PassKSize` /
+    /// `PassOutputKSize` (§7).
     fn write_uniforms(&self) {
         let original = self.source_size.unwrap_or((self.width, self.height));
         let viewport = (self.width, self.height);
         let mut input_size = original;
+        // Earlier passes' output sizes, grown as we walk the chain so pass i sees
+        // passes 0..i (causal — §7).
+        let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
+
         for res in &self.passes {
             // After `rebuild_chain`, an intermediate pass always has its FBO.
             let output_size = match (res.intermediate, &res.fbo) {
                 (true, Some(fbo)) => fbo.size,
                 _ => viewport,
             };
-            let builtins =
-                BuiltinUniforms::new_full(input_size, original, output_size, self.frame_count);
-            self.queue.write_buffer(&res.ubo, 0, builtins.as_bytes());
+
+            // No builtin block declared -> nothing to pack (the fallback vec4 UBO
+            // stays zero), but still advance the running sizes.
+            if let Some(block) = &res.builtin_block {
+                let values = BuiltinValues {
+                    mvp: uniforms::ortho_mvp(),
+                    source_size: uniforms::size_vec(input_size.0, input_size.1),
+                    original_size: uniforms::size_vec(original.0, original.1),
+                    output_size: uniforms::size_vec(output_size.0, output_size.1),
+                    final_viewport_size: uniforms::size_vec(viewport.0, viewport.1),
+                    frame_count: uniforms::apply_frame_count_mod(
+                        self.frame_count,
+                        res.frame_count_mod,
+                    ),
+                    frame_direction: self.frame_direction,
+                    rotation: 0,
+                    pass_output_sizes: pass_output_sizes.clone(),
+                };
+                let bytes = uniforms::pack_builtins(block, &values);
+                self.queue.write_buffer(&res.ubo, 0, &bytes);
+            }
+
+            pass_output_sizes.push(uniforms::size_vec(output_size.0, output_size.1));
             input_size = output_size;
         }
     }
@@ -915,6 +975,17 @@ impl Renderer {
     /// Frames rendered so far (the next `render` writes this as `FrameCount`).
     pub fn frame_count(&self) -> u32 {
         self.frame_count
+    }
+
+    /// The current `FrameDirection` (#28): `+1` forward, `-1` rewinding.
+    pub fn frame_direction(&self) -> i32 {
+        self.frame_direction
+    }
+
+    /// Set `FrameDirection` (#28/#31): `+1` forward, `-1` rewinding. Any nonzero
+    /// value is taken as its sign; `0` is treated as forward.
+    pub fn set_frame_direction(&mut self, direction: i32) {
+        self.frame_direction = if direction < 0 { -1 } else { 1 };
     }
 
     /// Read the offscreen target (the final pass's output) back into a CPU

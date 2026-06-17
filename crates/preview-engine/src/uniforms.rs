@@ -1,34 +1,29 @@
 //! Builtin + parameter uniform computation for a single preview pass
-//! (Architecture §D). This is the Phase 1 slice: just enough of RetroArch's
-//! builtin-semantics set for a one-pass curvature/warp shader — `MVP`, the
-//! `*Size` family, and `FrameCount` — plus the `#pragma parameter` defaults
-//! packed into their own UBO. Full semantic coverage and live slider updates are
-//! Phase 2 (Specification §4).
+//! (Architecture §D, `docs/retroarch-slang-runtime.md` §6).
 //!
-//! ## Layout convention
+//! ## Reflection-driven packing (#28)
 //!
-//! These structs/functions assume the canonical Phase 1 UBO layout that the
-//! fixture shaders declare. Real RetroArch shaders declare members in arbitrary
-//! order and the offsets are discovered by reflecting the SPIR-V; doing that is a
-//! Phase 2 import concern. Here both sides agree on a fixed std140 layout:
-//!
-//! ```glsl
-//! layout(std140, set = 0, binding = 0) uniform UBO {
-//!     mat4 MVP;          // offset 0
-//!     vec4 SourceSize;   // offset 64
-//!     vec4 OriginalSize; // offset 80
-//!     vec4 OutputSize;   // offset 96
-//!     uint FrameCount;   // offset 112
-//! } global;
-//! layout(std140, set = 0, binding = 3) uniform Params {
-//!     float P0; float P1; ...   // in #pragma parameter declaration order
-//! } params;
-//! ```
+//! Real RetroArch shaders declare the builtin block members in arbitrary order
+//! and as arbitrary subsets, so the byte offsets cannot be assumed. The renderer
+//! reflects each pass's SPIR-V (`slang_compile::reflect`) to discover the
+//! builtin block's member names → offsets, then [`pack_builtins`] writes each
+//! [`BuiltinValues`] semantic at the offset of the same-named member. The member
+//! *order* in the shader is irrelevant; a member matching no known semantic
+//! (e.g. a `#pragma parameter` in a shared block — #29 — or a not-yet-wired
+//! resource size) is left at its zero initialization. This is the same
+//! offset-by-name mechanism #29 will reuse for live parameter values.
 //!
 //! Each `*Size` vec4 is `[w, h, 1/w, 1/h]` — the RetroArch convention that lets a
 //! shader fetch both a dimension and its reciprocal without a divide.
+//!
+//! ## Legacy fixed-layout struct
+//!
+//! [`BuiltinUniforms`] is the Phase 1 fixed-layout `#[repr(C)]` mirror of the
+//! canonical block (`MVP`, `SourceSize`, `OriginalSize`, `OutputSize`,
+//! `FrameCount`). It is retained for unit testing the std140 offsets the
+//! reflection path must reproduce; the renderer no longer writes it directly.
 
-use slang_compile::Parameter;
+use slang_compile::{Parameter, SpirvReflection, UniformBlock};
 
 /// The builtin uniforms for one pass, laid out to match the canonical std140 UBO
 /// block (see the module docs). `#[repr(C)]` + field order/padding make the byte
@@ -126,6 +121,176 @@ pub fn pack_parameters(params: &[Parameter]) -> Vec<u8> {
     bytes
 }
 
+// ============================================================================
+// Reflection-driven builtin semantics (#28)
+// ============================================================================
+
+/// Every currently-computable RetroArch builtin semantic value for one pass
+/// (`docs/retroarch-slang-runtime.md` §6). A shader declares whichever of these
+/// it wants, in any order or subset, inside its builtin UBO/push block; the
+/// renderer reflects that block's member offsets (#28 infra in `slang-compile`)
+/// and [`pack_builtins`] writes each value at the offset of the member whose
+/// **name matches the semantic**. This is the same offset-by-name mechanism #29
+/// will use for `#pragma parameter` values.
+///
+/// Semantics whose backing resource doesn't exist yet (`PassFeedbackNSize`,
+/// `OriginalHistoryNSize`, LUT `<NAME>Size`) are simply absent here: a member
+/// referencing one is left untouched (zero-initialized), which is the graceful
+/// "write zeros / skip" the spec asks for — those land in #24/#25/#27.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuiltinValues {
+    /// `MVP` — the fullscreen-pass orthographic matrix (column-major mat4).
+    pub mvp: [f32; 16],
+    /// `SourceSize` — this pass's input size, `[w,h,1/w,1/h]`.
+    pub source_size: [f32; 4],
+    /// `OriginalSize` — the chain's pass-0 input size.
+    pub original_size: [f32; 4],
+    /// `OutputSize` — this pass's render-target size.
+    pub output_size: [f32; 4],
+    /// `FinalViewportSize` — the simulated final viewport / pane size.
+    pub final_viewport_size: [f32; 4],
+    /// `FrameCount` (uint) — already wrapped by this pass's `frame_count_mod`.
+    pub frame_count: u32,
+    /// `FrameDirection` (int) — `+1` forward, `-1` rewinding (#31).
+    pub frame_direction: i32,
+    /// `Rotation` (uint) — content rotation 0..3 (0 for now).
+    pub rotation: u32,
+    /// Earlier passes' output sizes, indexed by pass number. `pass_output_sizes[k]`
+    /// is pass `k`'s output `[w,h,1/w,1/h]`, available to pass `i` for `k < i`
+    /// (causal — §7). Backs both spellings `PassOutputKSize` and `PassKSize`.
+    pub pass_output_sizes: Vec<[f32; 4]>,
+}
+
+impl Default for BuiltinValues {
+    fn default() -> Self {
+        Self {
+            mvp: ortho_mvp(),
+            source_size: [0.0; 4],
+            original_size: [0.0; 4],
+            output_size: [0.0; 4],
+            final_viewport_size: [0.0; 4],
+            frame_count: 0,
+            frame_direction: 1,
+            rotation: 0,
+            pass_output_sizes: Vec::new(),
+        }
+    }
+}
+
+impl BuiltinValues {
+    /// Resolve a builtin member `name` to its packed little-endian bytes, or
+    /// `None` if `name` is not a semantic this engine computes (the member is
+    /// then left untouched — e.g. a `#pragma parameter`, handled by #29, or a
+    /// not-yet-wired resource size).
+    ///
+    /// Both `PassOutputKSize` and the `PassKSize` alias resolve to the same
+    /// pass-`K` output size (§7 / §11 ⚠ — both spellings are accepted). An index
+    /// past the known passes (a not-yet-run later pass, or feedback/history)
+    /// returns `None` so the member stays zero.
+    pub fn member_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        let vec4 = |v: &[f32; 4]| Some(v.iter().flat_map(|f| f.to_le_bytes()).collect());
+        match name {
+            "MVP" => Some(self.mvp.iter().flat_map(|f| f.to_le_bytes()).collect()),
+            "SourceSize" => vec4(&self.source_size),
+            "OriginalSize" => vec4(&self.original_size),
+            "OutputSize" => vec4(&self.output_size),
+            "FinalViewportSize" => vec4(&self.final_viewport_size),
+            "FrameCount" => Some(self.frame_count.to_le_bytes().to_vec()),
+            "FrameDirection" => Some(self.frame_direction.to_le_bytes().to_vec()),
+            "Rotation" => Some(self.rotation.to_le_bytes().to_vec()),
+            _ => {
+                // `PassOutputKSize` (and the `PassKSize` alias) — pass K's output
+                // size, K < this pass (causal). Anything else is unknown here.
+                let idx = parse_pass_size_index(name)?;
+                self.pass_output_sizes.get(idx).and_then(vec4)
+            }
+        }
+    }
+}
+
+/// Parse a per-pass output-size semantic name into its pass index, accepting
+/// both spellings RetroArch uses (§7/§11): `PassOutputKSize` and the `PassKSize`
+/// alias. Returns `None` for any other name (including `PassFeedbackKSize`,
+/// which is a *different*, not-yet-wired semantic — #24).
+fn parse_pass_size_index(name: &str) -> Option<usize> {
+    let digits = name
+        .strip_prefix("PassOutput")
+        .or_else(|| name.strip_prefix("Pass"))?
+        .strip_suffix("Size")?;
+    // Must be all digits (rejects e.g. `PassFeedback…Size`, `PassOutputSize`).
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Pack the builtin semantics into the byte image of one reflected uniform block
+/// (#28): for every member of `block`, if its name matches a semantic in
+/// `values`, write that value's bytes at the member's reflected offset. Members
+/// matching no semantic (a `#pragma parameter` in a shared block — #29 — or a
+/// not-yet-wired resource size) are left at their zero initialization.
+///
+/// The returned buffer is exactly `block.size` bytes (the std140 block size, a
+/// 16-byte multiple), zero-filled where no semantic wrote — ready to upload to
+/// the block's UBO/push binding. This is layout-driven: the member *order* in
+/// the shader is irrelevant; only the reflected offsets matter.
+pub fn pack_builtins(block: &UniformBlock, values: &BuiltinValues) -> Vec<u8> {
+    let mut bytes = vec![0u8; block.size as usize];
+    for m in &block.members {
+        let Some(src) = values.member_bytes(&m.name) else {
+            continue;
+        };
+        let start = m.offset as usize;
+        // Never write past the member's reflected size or the block end (guards
+        // against a type/semantic mismatch — e.g. a vec4 semantic into a vec2).
+        let max = (m.size as usize).min(src.len());
+        let end = (start + max).min(bytes.len());
+        if start < bytes.len() {
+            bytes[start..end].copy_from_slice(&src[..end - start]);
+        }
+    }
+    bytes
+}
+
+/// Choose the pass's **builtin** uniform block from a reflection: the block that
+/// declares a recognizable builtin semantic member (`MVP`, an `*Size`,
+/// `FrameCount`, …). Returns `None` if the shader declares no builtin block
+/// (e.g. a constant-color pass). The parameter block (only `#pragma parameter`
+/// members) is intentionally not matched here — that is #29's concern.
+pub fn builtin_block(reflection: &SpirvReflection) -> Option<&UniformBlock> {
+    reflection
+        .blocks
+        .iter()
+        .find(|b| b.members.iter().any(|m| is_builtin_semantic(&m.name)))
+}
+
+/// Whether a member name is a builtin semantic this engine recognizes (a scalar
+/// semantic, an `*Size`, or a per-pass `PassKSize`/`PassOutputKSize`). Used to
+/// distinguish the builtin block from a pure parameter block.
+fn is_builtin_semantic(name: &str) -> bool {
+    matches!(
+        name,
+        "MVP"
+            | "SourceSize"
+            | "OriginalSize"
+            | "OutputSize"
+            | "FinalViewportSize"
+            | "FrameCount"
+            | "FrameDirection"
+            | "Rotation"
+    ) || name.ends_with("Size") && parse_pass_size_index(name).is_some()
+}
+
+/// Apply a pass's `frame_count_mod` to the raw frame counter, per §6:
+/// `mod > 0 ? frame_count % mod : frame_count`.
+pub fn apply_frame_count_mod(frame_count: u32, frame_count_mod: u32) -> u32 {
+    if frame_count_mod > 0 {
+        frame_count % frame_count_mod
+    } else {
+        frame_count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +371,179 @@ mod tests {
     fn no_parameters_still_yields_one_vec4() {
         // A bound UBO needs storage even when the shader declares no parameters.
         assert_eq!(pack_parameters(&[]), vec![0u8; 16]);
+    }
+
+    // ---- Reflection-driven builtin packing (#28; no GPU). ----
+
+    use slang_compile::{BlockBinding, MemberKind, ScalarType, UniformBlock, UniformMember};
+
+    fn member(name: &str, offset: u32, size: u32, kind: MemberKind) -> UniformMember {
+        UniformMember {
+            name: name.to_string(),
+            offset,
+            size,
+            kind,
+        }
+    }
+
+    fn vec4_kind() -> MemberKind {
+        MemberKind::Vector {
+            scalar: ScalarType::Float,
+            len: 4,
+        }
+    }
+
+    fn block(size: u32, members: Vec<UniformMember>) -> UniformBlock {
+        UniformBlock {
+            name: Some("UBO".into()),
+            binding: BlockBinding::Uniform { set: 0, binding: 0 },
+            size,
+            members,
+        }
+    }
+
+    fn f32x4(b: &[u8], off: usize) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let s = off + i * 4;
+            *slot = f32::from_le_bytes([b[s], b[s + 1], b[s + 2], b[s + 3]]);
+        }
+        out
+    }
+
+    #[test]
+    fn apply_frame_count_mod_wraps_only_when_positive() {
+        assert_eq!(apply_frame_count_mod(7, 0), 7); // mod 0 -> unmodified
+        assert_eq!(apply_frame_count_mod(7, 4), 3); // 7 % 4
+        assert_eq!(apply_frame_count_mod(8, 4), 0); // wraps to 0
+    }
+
+    #[test]
+    fn parse_pass_size_index_accepts_both_spellings() {
+        assert_eq!(parse_pass_size_index("Pass0Size"), Some(0));
+        assert_eq!(parse_pass_size_index("PassOutput0Size"), Some(0));
+        assert_eq!(parse_pass_size_index("Pass12Size"), Some(12));
+        assert_eq!(parse_pass_size_index("PassOutput3Size"), Some(3));
+        // Not a pass-output size: feedback is a distinct (deferred) semantic.
+        assert_eq!(parse_pass_size_index("PassFeedback0Size"), None);
+        // No index / no Size suffix.
+        assert_eq!(parse_pass_size_index("PassOutputSize"), None);
+        assert_eq!(parse_pass_size_index("Pass0"), None);
+        assert_eq!(parse_pass_size_index("SourceSize"), None);
+    }
+
+    #[test]
+    fn pack_builtins_writes_each_semantic_at_its_reflected_offset() {
+        // A NON-canonical order + subset: FrameCount before the sizes, no MVP.
+        let blk = block(
+            48,
+            vec![
+                member("FrameCount", 0, 4, MemberKind::Scalar(ScalarType::Uint)),
+                member("OutputSize", 16, 16, vec4_kind()),
+                member("SourceSize", 32, 16, vec4_kind()),
+            ],
+        );
+        let values = BuiltinValues {
+            source_size: size_vec(320, 240),
+            output_size: size_vec(640, 480),
+            frame_count: 9,
+            ..Default::default()
+        };
+        let bytes = pack_builtins(&blk, &values);
+        assert_eq!(bytes.len(), 48);
+        // FrameCount at offset 0.
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            9
+        );
+        // OutputSize at 16, SourceSize at 32 — proves offset-by-name, not order.
+        assert_eq!(f32x4(&bytes, 16), size_vec(640, 480));
+        assert_eq!(f32x4(&bytes, 32), size_vec(320, 240));
+    }
+
+    #[test]
+    fn pack_builtins_leaves_unknown_members_zero() {
+        // A member matching no semantic (a #pragma parameter living in a shared
+        // block — #29's concern) must be left untouched.
+        let blk = block(
+            32,
+            vec![
+                member("OutputSize", 0, 16, vec4_kind()),
+                member("USER_PARAM", 16, 4, MemberKind::Scalar(ScalarType::Float)),
+            ],
+        );
+        let values = BuiltinValues {
+            output_size: size_vec(100, 50),
+            ..Default::default()
+        };
+        let bytes = pack_builtins(&blk, &values);
+        assert_eq!(f32x4(&bytes, 0), size_vec(100, 50));
+        // The parameter slot stays zero (untouched by builtin packing).
+        assert_eq!(&bytes[16..20], &[0u8; 4]);
+    }
+
+    #[test]
+    fn pack_builtins_handles_pass_output_size_both_spellings() {
+        let values = BuiltinValues {
+            pass_output_sizes: vec![size_vec(64, 64), size_vec(128, 96)],
+            ..Default::default()
+        };
+        // `Pass0Size` and `PassOutput1Size` resolve to passes 0 and 1.
+        let blk = block(
+            32,
+            vec![
+                member("Pass0Size", 0, 16, vec4_kind()),
+                member("PassOutput1Size", 16, 16, vec4_kind()),
+            ],
+        );
+        let bytes = pack_builtins(&blk, &values);
+        assert_eq!(f32x4(&bytes, 0), size_vec(64, 64));
+        assert_eq!(f32x4(&bytes, 16), size_vec(128, 96));
+
+        // A PassNSize past the known passes stays zero (causal / not-yet-run).
+        let blk2 = block(16, vec![member("Pass5Size", 0, 16, vec4_kind())]);
+        assert_eq!(pack_builtins(&blk2, &values), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn member_bytes_resolves_known_semantics_and_rejects_unknown() {
+        let values = BuiltinValues {
+            frame_direction: -1,
+            rotation: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            values.member_bytes("FrameDirection"),
+            Some((-1i32).to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            values.member_bytes("Rotation"),
+            Some(2u32.to_le_bytes().to_vec())
+        );
+        assert!(values.member_bytes("MVP").is_some());
+        // Not-yet-wired / unknown semantics return None (member left zero).
+        assert!(values.member_bytes("OriginalHistory1Size").is_none());
+        assert!(values.member_bytes("SomeUserParam").is_none());
+    }
+
+    #[test]
+    fn builtin_block_picks_the_block_with_a_builtin_member() {
+        use slang_compile::SpirvReflection;
+        let builtin = block(16, vec![member("OutputSize", 0, 16, vec4_kind())]);
+        let params = UniformBlock {
+            name: Some("Params".into()),
+            binding: BlockBinding::Uniform { set: 0, binding: 3 },
+            size: 16,
+            members: vec![member("LEVEL", 0, 4, MemberKind::Scalar(ScalarType::Float))],
+        };
+        let reflection = SpirvReflection {
+            blocks: vec![params.clone(), builtin.clone()],
+            ..Default::default()
+        };
+        // The builtin block is found; the pure-parameter block is not mistaken
+        // for it.
+        let found = builtin_block(&reflection).expect("builtin block");
+        assert!(found.member("OutputSize").is_some());
+        assert!(found.member("LEVEL").is_none());
     }
 }

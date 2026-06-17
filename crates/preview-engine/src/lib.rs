@@ -20,7 +20,7 @@ pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
 pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
 pub use renderer::{Renderer, RendererError, OFFSCREEN_FORMAT};
-pub use uniforms::BuiltinUniforms;
+pub use uniforms::{BuiltinUniforms, BuiltinValues};
 
 /// Crate identity marker. See `core_model::NAME`.
 pub const NAME: &str = "preview-engine";
