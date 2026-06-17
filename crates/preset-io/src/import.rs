@@ -43,8 +43,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::params::{reconcile_parameters, scan_parameters, ParamWarning};
 use crate::scan::scan_references;
-use crate::slangp::{Pass, Preset, ScaleType, WrapMode};
+use crate::slangp::{LutEntry, Pass, Preset, ScaleType, WrapMode};
+use core_model::Parameter;
 
 /// The severity of an [`ImportDiagnostic`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +153,10 @@ pub fn import_parsed_preset(
         .collect();
     let lut_names: BTreeSet<String> = preset.luts.iter().map(|l| l.name.clone()).collect();
 
+    // Per-pass `#pragma parameter` declarations, collected during the pass loop
+    // and reconciled into the project-level parameter set afterwards (#35).
+    let mut per_pass_params: Vec<Vec<Parameter>> = Vec::with_capacity(preset.passes.len());
+
     let mut passes = Vec::with_capacity(preset.passes.len());
     for (n, pass) in preset.passes.iter().enumerate() {
         // Read the `.slang` BYTE-FOR-BYTE with no normalization (line endings,
@@ -178,6 +184,20 @@ pub fn import_parsed_preset(
         // wiring + the LUT cross-check below. NOT a parse of the pass body.
         let references = scan_references(&source, &alias_names, &lut_names);
 
+        // Tolerant `#pragma parameter` scan (#35): malformed pragma lines warn
+        // (with the pass index) rather than failing the import. These per-pass
+        // declarations carry onto the `Pass` (raw) and feed reconciliation below.
+        let mut param_warnings = Vec::new();
+        let parameters = scan_parameters(&source, &mut param_warnings);
+        for w in &param_warnings {
+            if let ParamWarning::Malformed { line } = w {
+                diagnostics.push(ImportDiagnostic::warning(format!(
+                    "pass {n}: malformed `#pragma parameter` ignored: `{line}`"
+                )));
+            }
+        }
+        per_pass_params.push(parameters.clone());
+
         let name = pass.alias.clone().unwrap_or_else(|| format!("Pass {n}"));
 
         passes.push(core_model::Pass {
@@ -190,7 +210,7 @@ pub fn import_parsed_preset(
                 filename,
                 opaque: true,
             },
-            parameters: Vec::new(),
+            parameters,
             settings: map_settings(pass),
             references,
         });
@@ -198,6 +218,28 @@ pub fn import_parsed_preset(
 
     let pipeline = build_pipeline_metadata(preset, &passes);
     cross_check_references(&passes, &pipeline, &lut_names, &mut diagnostics);
+
+    // Reconcile the per-pass `#pragma parameter` declarations into ONE project
+    // parameter per id and apply the `.slangp` per-parameter overrides (the
+    // preset value wins). Cross-pass definition conflicts become diagnostics.
+    let mut param_conflicts = Vec::new();
+    let parameters = reconcile_parameters(
+        &per_pass_params,
+        &preset.parameter_overrides,
+        &mut param_conflicts,
+    );
+    for w in &param_conflicts {
+        if let ParamWarning::Conflict { id, detail } = w {
+            diagnostics.push(ImportDiagnostic::warning(format!(
+                "parameter `{id}` is declared with conflicting definitions across passes \
+                 ({detail}); keeping the first declaration"
+            )));
+        }
+    }
+
+    // Map the parsed LUT family into the model with resolved paths + per-texture
+    // sampler settings (#35).
+    let luts = preset.luts.iter().map(map_lut).collect();
 
     let feedback_pass = map_feedback_pass(preset.feedback_pass);
 
@@ -207,8 +249,58 @@ pub fn import_parsed_preset(
         passes,
         feedback_pass,
         pipeline,
+        parameters,
+        luts,
     };
     (project, ImportDiagnostics { diagnostics })
+}
+
+/// Map a parsed [`LutEntry`] into a [`core_model::Lut`] (#35): the path is already
+/// resolved against the preset directory by the parser (`base_dir.join(rel)`).
+/// Here it is **lexically normalized** ([`normalize_lexical`]) so a relative LUT
+/// that points outside the preset dir (e.g. `../shared/foo.png`) or into a nested
+/// subdirectory collapses to a clean path — without touching the filesystem (the
+/// file need not exist at import time). The `PathBuf` is rendered to a `String`
+/// for the serde/TS model; lossy UTF-8 conversion is acceptable as `.slangp`
+/// paths are UTF-8 text.
+fn map_lut(lut: &LutEntry) -> core_model::Lut {
+    core_model::Lut {
+        name: lut.name.clone(),
+        path: normalize_lexical(&lut.path).to_string_lossy().into_owned(),
+        filter_linear: lut.linear,
+        wrap_mode: lut.wrap_mode.map(map_wrap_mode),
+        mipmap: lut.mipmap,
+    }
+}
+
+/// Lexically normalize a path: collapse `.` components and resolve `..` against
+/// the preceding **normal** component, **without** consulting the filesystem (so
+/// it works for paths whose targets do not yet exist, and never resolves symlinks
+/// — purely textual). A leading `..` with no preceding normal component (the path
+/// genuinely escapes its base, e.g. `/presets/../shared/x.png` → `/shared/x.png`,
+/// or a relative `../shared/x.png` kept as-is) is preserved.
+///
+/// This is the `path-clean`-style algorithm; we implement it locally to avoid a
+/// new dependency for a few lines.
+fn normalize_lexical(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                // Pop a preceding normal component (a real dir name).
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // Can't pop a root or another `..`; keep the `..` (the path
+                // legitimately steps above its base — outside-the-preset-dir case).
+                _ => out.push(comp),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
 }
 
 /// Reconstruct the chain's wiring as [`core_model::PipelineMetadata`] (#34):
@@ -757,5 +849,274 @@ mystery_setting = banana
             "GhostPass resolves to pass 0: {:?}",
             diags.diagnostics
         );
+    }
+
+    // ---- #35: parameter extraction + reconciliation ------------------------
+
+    #[test]
+    fn pragma_parameters_become_project_parameters_with_override() {
+        // ACCEPTANCE (#35): pragma params appear with correct default/min/max/step;
+        // a `.slangp` override takes effect on the default.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.slang"),
+            "#version 450\n\
+             #pragma parameter BRIGHT \"Brightness\" 1.0 0.0 2.0 0.01\n\
+             #pragma parameter CONTRAST \"Contrast\" 1.0 0.5 1.5\n\
+             void main(){}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             parameters = \"BRIGHT;CONTRAST\"\n\
+             BRIGHT = 1.5\n", // overrides BRIGHT's default
+        )
+        .unwrap();
+
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+        assert!(
+            !diags.has_warnings(),
+            "clean import: {:?}",
+            diags.diagnostics
+        );
+
+        let by = |id: &str| project.parameters.iter().find(|p| p.name == id).cloned();
+        let bright = by("BRIGHT").expect("BRIGHT present");
+        // Override applied to default; range/step/label from the pragma.
+        assert_eq!(bright.default, 1.5, "preset override wins");
+        assert_eq!(bright.min, 0.0);
+        assert_eq!(bright.max, 2.0);
+        assert_eq!(bright.step, 0.01);
+        assert_eq!(bright.label, "Brightness");
+
+        let contrast = by("CONTRAST").expect("CONTRAST present");
+        assert_eq!(contrast.default, 1.0, "no override -> pragma initial");
+        assert_eq!(contrast.step, 0.0, "step omitted -> 0.0");
+
+        // The raw declarations also live on the pass.
+        assert_eq!(project.passes[0].parameters.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_param_across_passes_collapses_with_conflict_diagnostic() {
+        // ACCEPTANCE (#35): a duplicate id across passes collapses to ONE project
+        // parameter (first declaration wins) and a conflict diagnostic is emitted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.slang"),
+            "#pragma parameter GAMMA \"Gamma\" 2.2 1.0 3.0 0.1\nvoid main(){}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.slang"),
+            // Same id, DIFFERENT max — must keep pass 0's value and warn.
+            "#pragma parameter GAMMA \"Gamma\" 2.2 1.0 4.0 0.1\nvoid main(){}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 2\nshader0 = a.slang\nshader1 = b.slang\n",
+        )
+        .unwrap();
+
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+        // Collapsed to one knob, keeping the FIRST (pass 0) declaration's max.
+        let gammas: Vec<_> = project
+            .parameters
+            .iter()
+            .filter(|p| p.name == "GAMMA")
+            .collect();
+        assert_eq!(gammas.len(), 1, "duplicate ids collapse to one parameter");
+        assert_eq!(gammas[0].max, 3.0, "first declaration wins");
+        // A conflict diagnostic mentions the id and the diverging field.
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("GAMMA")
+                    && d.message.contains("conflicting")
+                    && d.message.contains("max")),
+            "conflict diagnostic emitted: {:?}",
+            diags.diagnostics
+        );
+    }
+
+    #[test]
+    fn identical_param_across_passes_collapses_silently() {
+        // Same id declared identically in two passes -> one knob, no conflict.
+        let dir = tempfile::tempdir().unwrap();
+        let body = "#pragma parameter X \"X\" 0.5 0.0 1.0 0.01\nvoid main(){}\n";
+        std::fs::write(dir.path().join("a.slang"), body).unwrap();
+        std::fs::write(dir.path().join("b.slang"), body).unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 2\nshader0 = a.slang\nshader1 = b.slang\n",
+        )
+        .unwrap();
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+        assert_eq!(
+            project.parameters.iter().filter(|p| p.name == "X").count(),
+            1
+        );
+        assert!(
+            !diags
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conflicting")),
+            "identical declarations don't conflict: {:?}",
+            diags.diagnostics
+        );
+    }
+
+    #[test]
+    fn malformed_pragma_parameter_warns_but_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.slang"),
+            "#pragma parameter BROKEN\n\
+             #pragma parameter OK \"Ok\" 0.0 0.0 1.0\nvoid main(){}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 1\nshader0 = a.slang\n",
+        )
+        .unwrap();
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+        // The good one still extracts.
+        assert!(project.parameters.iter().any(|p| p.name == "OK"));
+        assert!(!project.parameters.iter().any(|p| p.name == "BROKEN"));
+        // The malformed one warns with the pass index.
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("malformed")
+                    && d.message.contains("pass 0")),
+            "malformed pragma warns: {:?}",
+            diags.diagnostics
+        );
+    }
+
+    // ---- #35: LUT import ---------------------------------------------------
+
+    #[test]
+    fn luts_import_with_resolved_paths_and_sampler_settings() {
+        // ACCEPTANCE (#35): all declared LUTs import with correct resolved paths +
+        // per-texture filter/wrap/mipmap. Two LUTs with DIFFERING sampler settings.
+        let preset = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = \"BORDER;OVERLAY\"\n\
+             BORDER = luts/border.png\n\
+             BORDER_linear = true\n\
+             BORDER_wrap_mode = clamp_to_edge\n\
+             BORDER_mipmap = true\n\
+             OVERLAY = luts/overlay.png\n\
+             OVERLAY_linear = false\n\
+             OVERLAY_wrap_mode = repeat\n",
+            Path::new("/presets"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+
+        assert_eq!(project.luts.len(), 2, "both LUTs imported");
+        let lut = |name: &str| project.luts.iter().find(|l| l.name == name).cloned();
+
+        let border = lut("BORDER").expect("BORDER imported");
+        assert_eq!(border.path, "/presets/luts/border.png");
+        assert_eq!(border.filter_linear, Some(true));
+        assert_eq!(border.wrap_mode, Some(MWrap::ClampToEdge));
+        assert_eq!(border.mipmap, Some(true));
+
+        let overlay = lut("OVERLAY").expect("OVERLAY imported");
+        assert_eq!(overlay.path, "/presets/luts/overlay.png");
+        // Differing sampler settings from BORDER.
+        assert_eq!(overlay.filter_linear, Some(false));
+        assert_eq!(overlay.wrap_mode, Some(MWrap::Repeat));
+        assert_eq!(
+            overlay.mipmap, None,
+            "unset mipmap -> None (engine default)"
+        );
+    }
+
+    #[test]
+    fn lut_outside_preset_dir_resolves() {
+        // ACCEPTANCE (#35): a relative LUT path pointing OUTSIDE the preset dir
+        // (`../shared/foo.png`) resolves to a clean lexically-normalized path.
+        let preset = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = SHARED\n\
+             SHARED = ../shared/foo.png\n",
+            Path::new("/presets/crt"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+        // /presets/crt + ../shared/foo.png -> /presets/shared/foo.png (normalized).
+        assert_eq!(project.luts[0].path, "/presets/shared/foo.png");
+    }
+
+    #[test]
+    fn lut_in_nested_subdirectory_resolves() {
+        // ACCEPTANCE (#35): a nested-subdirectory LUT resolves correctly.
+        let preset = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = DEEP\n\
+             DEEP = resources/luts/deep/grade.png\n",
+            Path::new("/presets/crt"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+        assert_eq!(
+            project.luts[0].path,
+            "/presets/crt/resources/luts/deep/grade.png"
+        );
+    }
+
+    #[test]
+    fn absolute_lut_path_is_preserved() {
+        let preset = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = ABS\n\
+             ABS = /opt/shared/lut.png\n",
+            Path::new("/presets"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+        assert_eq!(project.luts[0].path, "/opt/shared/lut.png");
+    }
+
+    #[test]
+    fn normalize_lexical_collapses_dot_and_parent() {
+        use std::path::PathBuf;
+        assert_eq!(
+            normalize_lexical(Path::new("/presets/crt/../shared/foo.png")),
+            PathBuf::from("/presets/shared/foo.png")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/presets/./a/./b.png")),
+            PathBuf::from("/presets/a/b.png")
+        );
+        // A relative path that escapes its base keeps the leading `..`.
+        assert_eq!(
+            normalize_lexical(Path::new("../shared/foo.png")),
+            PathBuf::from("../shared/foo.png")
+        );
+    }
+
+    #[test]
+    fn no_luts_or_params_means_empty_project_vecs() {
+        let preset =
+            parse_slangp_str("shaders = 1\nshader0 = a.slang\n", Path::new("/p")).expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+        assert!(project.luts.is_empty());
+        assert!(project.parameters.is_empty());
     }
 }
