@@ -496,13 +496,33 @@ fn is_structural_key(key: &str, pass_count: usize, luts: &[LutEntry]) -> bool {
 
 /// Resolve a (possibly relative) path against the preset directory. Absolute
 /// paths are returned unchanged.
+///
+/// Windows-style backslash separators are normalized to forward slashes for the
+/// relative portion BEFORE constructing the `Path` (B3): RetroArch presets are
+/// frequently authored on Windows and write `shader0 = shaders\first.slang`. On a
+/// Unix host `\` is NOT a path separator, so without this the whole value becomes
+/// one mangled component (`shaders\first.slang`) — the file read then fails (empty
+/// source + warning) and the stored filename is wrong. RetroArch itself treats
+/// `\` and `/` interchangeably, so we normalize to match.
 fn resolve(base_dir: &Path, rel: &str) -> PathBuf {
-    let p = Path::new(rel);
+    let normalized = normalize_separators(rel);
+    let p = Path::new(&normalized);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
         base_dir.join(p)
     }
+}
+
+/// Normalize Windows-style backslash separators to forward slashes (B3). On a
+/// non-Windows host this lets a Windows-authored preset's `shaders\first.slang`
+/// resolve as the two components `shaders` + `first.slang` instead of a single
+/// mangled component. On Windows `\` is already a separator, so this is a no-op
+/// for resolution there; we still apply it unconditionally for consistent stored
+/// paths. A literal backslash is not a legal char in slang/LUT file names, so this
+/// is unambiguous.
+fn normalize_separators(rel: &str) -> String {
+    rel.replace('\\', "/")
 }
 
 /// Look up a required key and parse it, erroring if absent or unparseable.
@@ -820,6 +840,38 @@ CONTRAST = 0.75
         assert_eq!(p.feedback_pass, None);
         assert!(p.luts.is_empty());
         assert!(p.parameter_overrides.is_empty());
+    }
+
+    #[test]
+    fn backslash_separators_are_normalized() {
+        // B3: a Windows-authored preset writes `shaders\first.slang`. On a Unix
+        // host `\` is NOT a separator, so without normalization the value becomes
+        // one mangled component and the read fails. The relative portion must be
+        // normalized to forward slashes so the path resolves correctly — and the
+        // same applies to a backslash LUT path via `resolve`.
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = shaders\\first.slang\n\
+             textures = LUT\n\
+             LUT = textures\\sub\\grade.png\n",
+            Path::new("/base"),
+        )
+        .expect("parses");
+        assert_eq!(
+            p.passes[0].shader,
+            PathBuf::from("/base/shaders/first.slang"),
+            "backslash shader path resolves component-wise"
+        );
+        assert_eq!(
+            p.luts[0].path,
+            PathBuf::from("/base/textures/sub/grade.png"),
+            "backslash LUT path resolves component-wise"
+        );
+        // The basename is clean (not a mangled `shaders\first.slang`).
+        assert_eq!(
+            p.passes[0].shader.file_name().and_then(|s| s.to_str()),
+            Some("first.slang")
+        );
     }
 
     #[test]
