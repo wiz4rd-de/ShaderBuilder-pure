@@ -322,13 +322,10 @@ fn type_size(module: &naga::Module, inner: &TypeInner) -> u32 {
     match inner {
         TypeInner::Scalar(s) => s.width as u32,
         TypeInner::Vector { size, scalar } => *size as u32 * scalar.width as u32,
-        TypeInner::Matrix {
-            columns,
-            rows,
-            scalar,
-        } => *columns as u32 * *rows as u32 * scalar.width as u32,
-        // Fall back to naga's own size accounting for anything else (arrays,
-        // nested structs).
+        // A matrix's std140 size is column-aligned, NOT `cols*rows*width`: each
+        // column is padded up to a vec4, so `mat3` is `3*16 = 48` (not 36) and
+        // `mat4` is `4*16 = 64`. Defer to naga's own size accounting (which knows
+        // the column stride) rather than a hand-rolled formula (#28).
         other => other.size(module.to_ctx()),
     }
 }
@@ -468,6 +465,34 @@ void main() {
         ] {
             assert!(block.member(name).is_some(), "{name} present after merge");
         }
+    }
+
+    #[test]
+    fn mat3_reports_column_aligned_std140_size() {
+        // std140: a `mat3` is three column vectors each padded to a vec4, so its
+        // size is `3*16 = 48` (NOT `3*3*4 = 36`), and the following member is
+        // column-aligned (#28). A hand-rolled `cols*rows*width` would report 36
+        // and mis-place everything after it.
+        let src = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat3 ColorMat;   // offset 0,  std140 size 48
+    vec4 Tint;       // offset 48 (column-aligned right after the mat3)
+} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+void main() { gl_Position = global.ColorMat[0].xyzx + Position; }
+#pragma stage fragment
+layout(location = 0) out vec4 FragColor;
+void main() { FragColor = global.Tint; }
+";
+        let shader = compile_slang(src, None).expect("compile");
+        let r = reflect(&shader).expect("reflect");
+        let (_, m) = r.find_member("ColorMat").expect("ColorMat reflected");
+        assert_eq!(m.kind, MemberKind::Matrix { cols: 3, rows: 3 });
+        assert_eq!(m.size, 48, "mat3 std140 size is column-aligned (3*16)");
+        let (_, tint) = r.find_member("Tint").expect("Tint reflected");
+        assert_eq!(tint.offset, 48, "member after a mat3 is column-aligned");
     }
 
     #[test]
