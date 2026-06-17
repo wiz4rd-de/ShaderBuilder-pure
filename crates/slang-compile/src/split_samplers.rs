@@ -148,6 +148,12 @@ pub fn split_combined_samplers(words: &[u32]) -> Result<Vec<u32>, SplitError> {
         return Ok(words.to_vec());
     }
 
+    // 2b. Reject combined samplers used by anything other than an inline OpLoad
+    // (e.g. passed to a function) BEFORE retyping — otherwise the body rewrite would
+    // emit corrupt SPIR-V (a caller/callee type mismatch) instead of a clear error
+    // (#32 review finding 1).
+    validate_combined_var_uses(&module, &combined_vars)?;
+
     // 3. Allocate the new ids and the supporting types/variables, retype each
     // combined variable to an image, and record the per-variable (image-type,
     // sampler-var, sampler-type) mapping the body rewrite needs.
@@ -255,12 +261,18 @@ struct TypeIndex {
     sampled_image_to_image: HashMap<u32, u32>,
     /// All `OpTypeSampler` ids present (we reuse one rather than always adding).
     sampler_type_ids: Vec<u32>,
+    /// Aggregate type id → the component type ids it references (array/runtime-array
+    /// element, struct members). Used to detect a sampled image hidden inside an
+    /// array/struct so it can be rejected with a clear error (#32 review) rather
+    /// than silently skipped (which would leave combined SPIR-V naga can't parse).
+    component_types: HashMap<u32, Vec<u32>>,
 }
 
 impl TypeIndex {
     fn build(module: &dr::Module) -> Self {
         let mut sampled_image_to_image = HashMap::new();
         let mut sampler_type_ids = Vec::new();
+        let mut component_types: HashMap<u32, Vec<u32>> = HashMap::new();
         for inst in &module.types_global_values {
             match inst.class.opcode {
                 Op::TypeSampledImage => {
@@ -275,13 +287,50 @@ impl TypeIndex {
                         sampler_type_ids.push(id);
                     }
                 }
+                // Aggregates that can wrap a sampled image: array/runtime-array
+                // (element is operand 0), struct (every operand is a member type).
+                Op::TypeArray | Op::TypeRuntimeArray | Op::TypeStruct => {
+                    if let Some(id) = inst.result_id {
+                        let members: Vec<u32> = inst
+                            .operands
+                            .iter()
+                            .filter_map(|o| match o {
+                                Operand::IdRef(r) => Some(*r),
+                                _ => None,
+                            })
+                            .collect();
+                        component_types.insert(id, members);
+                    }
+                }
                 _ => {}
             }
         }
         Self {
             sampled_image_to_image,
             sampler_type_ids,
+            component_types,
         }
+    }
+
+    /// Whether `type_id` is, or transitively (through arrays/structs) contains, a
+    /// combined `OpTypeSampledImage` — used to reject an array/aggregate of combined
+    /// samplers with a clear error (#32 review) instead of a silent no-op. A small
+    /// visited set guards against any pathological cycle.
+    fn contains_sampled_image(&self, type_id: u32) -> bool {
+        let mut stack = vec![type_id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.sampled_image_to_image.contains_key(&id) {
+                return true;
+            }
+            if let Some(components) = self.component_types.get(&id) {
+                stack.extend(components.iter().copied());
+            }
+        }
+        false
     }
 }
 
@@ -340,8 +389,12 @@ fn find_combined_variables(
         let Some((_, pointee)) = pointer_pointee.get(&ptr_type_id) else {
             continue;
         };
-        // Only split when the pointee is a sampled-image TYPE. A pointee that is
-        // itself an array/struct wrapping a sampled image is not handled.
+        // Only split when the pointee is a sampled-image TYPE directly. A pointee
+        // that is itself an array/struct WRAPPING a sampled image (e.g.
+        // `uniform sampler2D Tex[2]`) is NOT handled: silently skipping it would
+        // leave combined SPIR-V that naga can't parse (an opaque `invalid id`
+        // downstream — the exact failure this transform exists to prevent), so
+        // reject it with a clear, actionable error instead (#32 review finding 2).
         if let Some(&image_type_id) = types.sampled_image_to_image.get(pointee) {
             let _ = ptr_type_id; // the pointer type is replaced via the variable id
             out.push(CombinedVar {
@@ -349,9 +402,53 @@ fn find_combined_variables(
                 sampled_image_type_id: *pointee,
                 image_type_id,
             });
+        } else if types.contains_sampled_image(*pointee) {
+            return Err(SplitError::UnsupportedDeclaration(format!(
+                "global variable %{var_id} is an array/aggregate of combined \
+                 image-samplers (pointee type %{pointee}); the sampler-splitting \
+                 transform only handles a scalar `sampler2D` global"
+            )));
         }
     }
     Ok(out)
+}
+
+/// Validate that every reference to a combined-sampler variable is the pointer
+/// operand of an `OpLoad` (#32 review finding 1). glslang loads a combined sampler
+/// inline at each use, so the variable id should appear ONLY as operand 0 of an
+/// `OpLoad`. If it instead flows into an `OpFunctionCall` (a `sampler2D` function
+/// parameter), an `OpAccessChain`, an `OpCopyObject`, a store, etc., the body
+/// rewrite would retype the variable to a pointer-to-image while the consuming
+/// instruction's expected type stays pointer-to-sampled-image — producing **corrupt
+/// SPIR-V** that only fails far downstream. The transform's contract is to reject
+/// such forms with a clear error rather than mis-handle them, so enforce that here
+/// before any retyping happens.
+fn validate_combined_var_uses(
+    module: &dr::Module,
+    combined: &[CombinedVar],
+) -> Result<(), SplitError> {
+    let ids: std::collections::HashSet<u32> = combined.iter().map(|c| c.var_id).collect();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let is_load = inst.class.opcode == Op::Load;
+                for (i, op) in inst.operands.iter().enumerate() {
+                    if let Operand::IdRef(id) = op {
+                        if ids.contains(id) && !(is_load && i == 0) {
+                            return Err(SplitError::UnsupportedDeclaration(format!(
+                                "combined image-sampler variable %{id} is used by {:?} \
+                                 (operand {i}); only an inline `OpLoad` of a scalar \
+                                 `sampler2D` global is supported — it was likely passed \
+                                 to a function or aliased through a pointer",
+                                inst.class.opcode
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Hands out fresh, never-before-used SPIR-V result ids. Seeded from the module's
@@ -955,6 +1052,74 @@ void main() { FragColor = texture(Source, vTexCoord); }
         // a sampled-image pointer type anymore — checked by the no-combined-variable
         // re-split identity above. We only assert the sampler type was introduced.
         let _ = has_sampled_image_type;
+    }
+
+    /// #32 review finding 1: a combined sampler passed to a GLSL function (glslang
+    /// passes the variable POINTER as an `OpFunctionCall` arg, never loading it in
+    /// the caller) must be REJECTED with a clear error — not silently rewritten into
+    /// corrupt SPIR-V (a caller/callee type mismatch that only fails far downstream).
+    #[test]
+    fn combined_sampler_passed_to_function_is_rejected() {
+        let err = crate::compile_slang(
+            "\
+#version 450
+layout(set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform sampler2D Source;
+vec4 doit(sampler2D s, vec2 uv) { return texture(s, uv); }
+void main() { FragColor = doit(Source, vTexCoord); }
+",
+            None,
+        )
+        .expect_err("a combined sampler passed to a function must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::CompileError::SplitSamplers {
+                    source: SplitError::UnsupportedDeclaration(_),
+                    ..
+                }
+            ),
+            "expected SplitSamplers/UnsupportedDeclaration, got {err:?}"
+        );
+    }
+
+    /// #32 review finding 2: an array of combined samplers (`sampler2D Tex[2]`) must
+    /// be REJECTED with a clear error — not silently left untouched (which would ship
+    /// combined SPIR-V naga can't parse, failing with an opaque `invalid id`).
+    #[test]
+    fn array_of_combined_samplers_is_rejected() {
+        let err = crate::compile_slang(
+            "\
+#version 450
+layout(set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform sampler2D Tex[2];
+void main() { FragColor = texture(Tex[0], vTexCoord) + texture(Tex[1], vTexCoord); }
+",
+            None,
+        )
+        .expect_err("an array of combined samplers must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::CompileError::SplitSamplers {
+                    source: SplitError::UnsupportedDeclaration(_),
+                    ..
+                }
+            ),
+            "expected SplitSamplers/UnsupportedDeclaration, got {err:?}"
+        );
     }
 
     /// The transform's output must pass `spirv-val` (the canonical validator).
