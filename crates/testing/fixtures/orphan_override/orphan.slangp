@@ -1,0 +1,30 @@
+# Orphan parameter-override round-trip fixture (FINDING A1, Phase-3 EXIT-GATE-1).
+#
+# This preset carries a bare `id = value` override (HEADER_KNOB) whose
+# `#pragma parameter` declaration does NOT appear in the pass body. In real
+# crt-royale-class presets that pragma lives in an `#include`d header the importer
+# deliberately does not resolve; the fixture body simply omits it (so the body
+# still compiles through the fuzz/golden harness). Either way the import-side
+# pragma scan sees nothing for HEADER_KNOB and the override is an "orphan".
+#
+# Before the fix, such an override was silently dropped on import -> export and
+# the user's tuned value vanished, violating gate #1 (lossless round trip) with
+# ZERO diagnostic. The importer now synthesizes a project parameter carrying the
+# value (so it round-trips) AND emits an info diagnostic. This fixture exercises
+# that path and must round-trip losslessly under the strengthened oracle.
+#
+# A SECOND override (REAL_KNOB) DOES have its pragma in the body, so the two
+# override kinds (reconciled-pragma vs orphan) are covered together.
+#
+# LOCAL fixture, NOT a RetroArch reference. The harness reads the `.slang` as
+# BYTES (never compiles it) — this proves the file format round-trips.
+
+shaders = 1
+
+shader0 = orphan.slang
+
+# REAL_KNOB's pragma is in the body (a normal reconciled override).
+# HEADER_KNOB's pragma is NOT — it is the orphan whose value must still survive.
+parameters = "REAL_KNOB;HEADER_KNOB"
+REAL_KNOB = 0.75
+HEADER_KNOB = 0.625

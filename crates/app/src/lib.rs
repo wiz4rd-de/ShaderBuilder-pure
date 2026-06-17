@@ -8,7 +8,9 @@
 //! wgpu renderer behind the same [`preview_engine::FrameSource`] seam **without
 //! touching this transport**.
 
+mod export;
 mod preview;
+mod project;
 
 /// The workspace engine crates wired into the app. Phase 0 keeps the
 /// `app` → all dependency edges (Architecture §B) live and referenced until
@@ -55,6 +57,9 @@ pub fn run() {
             preview::step,
             preview::seek,
             preview::set_fps,
+            export::export_preset,
+            project::save_project,
+            project::load_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");

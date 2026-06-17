@@ -68,6 +68,7 @@ dependencies = [
  "source",
  "tauri",
  "tauri-build",
+ "tempfile",
 ]
 
 [[package]]
@@ -3762,6 +3763,7 @@ dependencies = [
 name = "testing"
 version = "0.1.0"
 dependencies = [
+ "core-model",
  "image",
  "preset-io",
  "preview-engine",

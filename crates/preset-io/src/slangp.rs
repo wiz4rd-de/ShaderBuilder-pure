@@ -186,7 +186,23 @@ pub struct Preset {
     /// Bare `id = value` parameter overrides (§8). Captured but not consumed yet;
     /// these override a `#pragma parameter` initial value at runtime.
     pub parameter_overrides: BTreeMap<String, f32>,
+    /// Every key the parser did **not** recognize as a structural key *and* could
+    /// not interpret as a float parameter override — retained verbatim so import
+    /// never silently drops data (the importer surfaces these as diagnostics).
+    /// This is distinct from [`Preset::parameter_overrides`]: a key lands in
+    /// exactly one of the two (structural keys go into typed fields instead).
+    pub extras: BTreeMap<String, String>,
 }
+
+/// Upper bound on the declared `shaders` pass count we will accept (B1). The
+/// `shaders` value comes from an untrusted preset file fed to a registered Tauri
+/// command (`load_preset`), so it must be validated before it is used to size a
+/// `Vec`: an absurd count (e.g. `shaders = 8800000000000`) would otherwise make
+/// `Vec::with_capacity` request terabytes and `SIGABRT` the whole process — an
+/// allocation abort that `catch_unwind` does NOT contain. RetroArch's
+/// `GFX_MAX_SHADERS` is 26; we use a generous-but-sane cap so any real preset
+/// passes while a hostile/garbage count fails cleanly with a [`ParseError`].
+const MAX_PASSES: usize = 64;
 
 /// Errors parsing a `.slangp` preset.
 #[derive(Debug)]
@@ -201,6 +217,9 @@ pub enum ParseError {
     BadScaleType(String),
     /// A LUT named in `textures` has no `<NAME> = path` entry.
     MissingLut(String),
+    /// The declared `shaders` count exceeds [`MAX_PASSES`] — refused rather than
+    /// trusted, so an untrusted preset cannot drive an unbounded allocation (B1).
+    TooManyPasses { declared: usize, max: usize },
 }
 
 impl std::fmt::Display for ParseError {
@@ -216,6 +235,10 @@ impl std::fmt::Display for ParseError {
                 "unknown scale type `{s}` (expected source/viewport/absolute)"
             ),
             ParseError::MissingLut(n) => write!(f, "LUT `{n}` listed in `textures` has no path"),
+            ParseError::TooManyPasses { declared, max } => write!(
+                f,
+                "preset declares {declared} passes, which exceeds the maximum of {max}"
+            ),
         }
     }
 }
@@ -242,14 +265,26 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
 
     let shaders: usize = require_parse(&map, "shaders")?;
 
-    let mut passes = Vec::with_capacity(shaders);
+    // VALIDATE the untrusted count BEFORE using it to size anything (B1). A
+    // hostile preset (`shaders = 8800000000000`) would otherwise make
+    // `Vec::with_capacity` request terabytes and `SIGABRT` the whole process —
+    // an allocation abort `catch_unwind` cannot contain. Refuse anything above
+    // the sane cap; `Vec::new()` then grows as real `shaderN` keys are found.
+    if shaders > MAX_PASSES {
+        return Err(ParseError::TooManyPasses {
+            declared: shaders,
+            max: MAX_PASSES,
+        });
+    }
+
+    let mut passes = Vec::new();
     for n in 0..shaders {
         passes.push(parse_pass(&map, n, base_dir)?);
     }
 
     let feedback_pass = opt_parse::<i32>(&map, "feedback_pass")?;
     let luts = parse_luts(&map, base_dir)?;
-    let parameter_overrides = parse_parameter_overrides(&map, &passes, &luts);
+    let (parameter_overrides, extras) = parse_overrides_and_extras(&map, &passes, &luts);
 
     Ok(Preset {
         base_dir: base_dir.to_path_buf(),
@@ -257,6 +292,7 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
         feedback_pass,
         luts,
         parameter_overrides,
+        extras,
     })
 }
 
@@ -360,12 +396,12 @@ fn parse_luts(
     let Some(list) = map.get("textures") else {
         return Ok(Vec::new());
     };
-    let mut luts = Vec::new();
+    let mut luts: Vec<LutEntry> = Vec::new();
     for name in list.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let path_rel = map
             .get(name)
             .ok_or_else(|| ParseError::MissingLut(name.to_string()))?;
-        luts.push(LutEntry {
+        let entry = LutEntry {
             name: name.to_string(),
             path: resolve(base_dir, path_rel),
             linear: opt_bool(map, &format!("{name}_linear"))?,
@@ -373,29 +409,54 @@ fn parse_luts(
                 .get(&format!("{name}_wrap_mode"))
                 .map(|s| WrapMode::parse(s)),
             mipmap: opt_bool(map, &format!("{name}_mipmap"))?,
-        });
+        };
+        // De-duplicate by bind name (B4): a `textures = "L;L"` list naming the same
+        // LUT twice must NOT produce two model entries — a real RetroArch load keeps
+        // only the LAST `L = path` (its config is a flat map). All `L`/`L_*` keys
+        // resolve to the same value here (BTreeMap = last wins) so the two entries
+        // are identical; we keep a single entry at the LAST listed position to match
+        // RetroArch's ordering. Without this, export would emit `textures = "L;L"`
+        // of which a re-load silently keeps one.
+        if let Some(existing) = luts.iter_mut().find(|l| l.name == entry.name) {
+            *existing = entry;
+        } else {
+            luts.push(entry);
+        }
     }
     Ok(luts)
 }
 
-/// Collect bare `id = value` parameter overrides (§8). Any key that is not a
-/// recognized structural key (and parses as a float) is treated as an override.
-/// The informational `parameters = "..."` list is *not* required for this.
-fn parse_parameter_overrides(
+/// Partition every non-structural key into parameter overrides vs. preserved
+/// extras, so **no key in the preset is silently lost** (the importer surfaces
+/// the extras as diagnostics).
+///
+/// A key that is not a recognized structural key (those become typed fields) is:
+/// - a **parameter override** (§8) if its value parses as a float — these
+///   override a `#pragma parameter` initial value at runtime; or
+/// - an **extra** otherwise — retained verbatim in [`Preset::extras`].
+///
+/// The informational `parameters = "..."` list is *not* required for either.
+fn parse_overrides_and_extras(
     map: &BTreeMap<String, String>,
     passes: &[Pass],
     luts: &[LutEntry],
-) -> BTreeMap<String, f32> {
-    let mut out = BTreeMap::new();
+) -> (BTreeMap<String, f32>, BTreeMap<String, String>) {
+    let mut overrides = BTreeMap::new();
+    let mut extras = BTreeMap::new();
     for (key, value) in map {
         if is_structural_key(key, passes.len(), luts) {
             continue;
         }
-        if let Ok(v) = value.parse::<f32>() {
-            out.insert(key.clone(), v);
+        match value.parse::<f32>() {
+            Ok(v) => {
+                overrides.insert(key.clone(), v);
+            }
+            Err(_) => {
+                extras.insert(key.clone(), value.clone());
+            }
         }
     }
-    out
+    (overrides, extras)
 }
 
 /// Whether `key` is a structural preset key (vs. a bare parameter override).
@@ -447,13 +508,33 @@ fn is_structural_key(key: &str, pass_count: usize, luts: &[LutEntry]) -> bool {
 
 /// Resolve a (possibly relative) path against the preset directory. Absolute
 /// paths are returned unchanged.
+///
+/// Windows-style backslash separators are normalized to forward slashes for the
+/// relative portion BEFORE constructing the `Path` (B3): RetroArch presets are
+/// frequently authored on Windows and write `shader0 = shaders\first.slang`. On a
+/// Unix host `\` is NOT a path separator, so without this the whole value becomes
+/// one mangled component (`shaders\first.slang`) — the file read then fails (empty
+/// source + warning) and the stored filename is wrong. RetroArch itself treats
+/// `\` and `/` interchangeably, so we normalize to match.
 fn resolve(base_dir: &Path, rel: &str) -> PathBuf {
-    let p = Path::new(rel);
+    let normalized = normalize_separators(rel);
+    let p = Path::new(&normalized);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
         base_dir.join(p)
     }
+}
+
+/// Normalize Windows-style backslash separators to forward slashes (B3). On a
+/// non-Windows host this lets a Windows-authored preset's `shaders\first.slang`
+/// resolve as the two components `shaders` + `first.slang` instead of a single
+/// mangled component. On Windows `\` is already a separator, so this is a no-op
+/// for resolution there; we still apply it unconditionally for consistent stored
+/// paths. A literal backslash is not a legal char in slang/LUT file names, so this
+/// is unambiguous.
+fn normalize_separators(rel: &str) -> String {
+    rel.replace('\\', "/")
 }
 
 /// Look up a required key and parse it, erroring if absent or unparseable.
@@ -626,6 +707,31 @@ CONTRAST = 0.75
     }
 
     #[test]
+    fn duplicate_lut_names_are_deduped() {
+        // B4: a `textures` list naming the same LUT twice must collapse to ONE
+        // model entry — a real RetroArch load keeps only the last `L = path` (flat
+        // map), and export would otherwise emit `textures = "L;L"` of which a
+        // re-load silently keeps one.
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = \"L;OTHER;L\"\n\
+             L = luts/l.png\n\
+             L_linear = true\n\
+             OTHER = luts/other.png\n",
+            Path::new("/p"),
+        )
+        .expect("parses");
+        // Exactly one `L` and one `OTHER`.
+        assert_eq!(p.luts.len(), 2, "duplicate `L` de-duped: {:?}", p.luts);
+        assert_eq!(p.luts.iter().filter(|l| l.name == "L").count(), 1);
+        let l = p.luts.iter().find(|l| l.name == "L").unwrap();
+        assert_eq!(l.path, PathBuf::from("/p/luts/l.png"));
+        assert_eq!(l.linear, Some(true));
+        assert!(p.luts.iter().any(|l| l.name == "OTHER"));
+    }
+
+    #[test]
     fn captures_parameter_overrides() {
         let p = parse_fixture();
         assert_eq!(p.parameter_overrides.get("BRIGHT"), Some(&1.5));
@@ -635,6 +741,78 @@ CONTRAST = 0.75
         assert!(!p.parameter_overrides.contains_key("shaders"));
         assert!(!p.parameter_overrides.contains_key("BORDER"));
         assert!(!p.parameter_overrides.contains_key("frame_count_mod1"));
+        // The fixture has no unknown keys -> nothing preserved as extras.
+        assert!(p.extras.is_empty(), "fixture has no unrecognized keys");
+    }
+
+    #[test]
+    fn unrecognized_keys_preserved_as_extras() {
+        // Non-structural, non-float keys are kept verbatim in `extras` (not
+        // dropped, and not mistaken for parameter overrides).
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             some_future_key = some_string_value\n\
+             vendor_flag = on\n\
+             GAMMA = 2.2\n",
+            Path::new("/p"),
+        )
+        .expect("preset with unknown keys parses");
+        // Float-valued unknowns are parameter overrides; non-float unknowns are extras.
+        assert_eq!(p.parameter_overrides.get("GAMMA"), Some(&2.2));
+        assert_eq!(
+            p.extras.get("some_future_key").map(String::as_str),
+            Some("some_string_value")
+        );
+        assert_eq!(p.extras.get("vendor_flag").map(String::as_str), Some("on"));
+        // A key lands in exactly one bucket.
+        assert!(!p.extras.contains_key("GAMMA"));
+        assert!(!p.parameter_overrides.contains_key("some_future_key"));
+    }
+
+    #[test]
+    fn no_key_is_silently_lost() {
+        // The contract: every key in the raw INI body is accounted for — it is
+        // either structural (consumed into a typed field), a float parameter
+        // override, or a preserved extra. Nothing is dropped.
+        let text = "shaders = 1\n\
+             shader0 = a.slang\n\
+             scale_type0 = source\n\
+             scale0 = 2.0\n\
+             alias0 = MAIN\n\
+             filter_linear0 = true\n\
+             feedback_pass = 0\n\
+             textures = LUT\n\
+             LUT = lut.png\n\
+             LUT_linear = true\n\
+             parameters = \"P;Q\"\n\
+             P = 1.0\n\
+             Q = 0.5\n\
+             custom_unknown = hello world\n\
+             another_unknown = 42\n";
+        let raw = parse_ini(text);
+        let p = parse_slangp_str(text, Path::new("/p")).expect("parses");
+
+        for key in raw.keys() {
+            let structural = is_structural_key(key, p.passes.len(), &p.luts);
+            let is_override = p.parameter_overrides.contains_key(key);
+            let is_extra = p.extras.contains_key(key);
+            assert!(
+                structural || is_override || is_extra,
+                "key `{key}` was silently lost (not structural, override, or extra)"
+            );
+            // And it lands in exactly one non-structural bucket.
+            assert!(
+                !(is_override && is_extra),
+                "key `{key}` is in both overrides and extras"
+            );
+        }
+        // Sanity: the unknowns ended up where expected.
+        assert_eq!(
+            p.extras.get("custom_unknown").map(String::as_str),
+            Some("hello world")
+        );
+        assert_eq!(p.parameter_overrides.get("another_unknown"), Some(&42.0));
     }
 
     #[test]
@@ -702,6 +880,38 @@ CONTRAST = 0.75
     }
 
     #[test]
+    fn backslash_separators_are_normalized() {
+        // B3: a Windows-authored preset writes `shaders\first.slang`. On a Unix
+        // host `\` is NOT a separator, so without normalization the value becomes
+        // one mangled component and the read fails. The relative portion must be
+        // normalized to forward slashes so the path resolves correctly — and the
+        // same applies to a backslash LUT path via `resolve`.
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = shaders\\first.slang\n\
+             textures = LUT\n\
+             LUT = textures\\sub\\grade.png\n",
+            Path::new("/base"),
+        )
+        .expect("parses");
+        assert_eq!(
+            p.passes[0].shader,
+            PathBuf::from("/base/shaders/first.slang"),
+            "backslash shader path resolves component-wise"
+        );
+        assert_eq!(
+            p.luts[0].path,
+            PathBuf::from("/base/textures/sub/grade.png"),
+            "backslash LUT path resolves component-wise"
+        );
+        // The basename is clean (not a mangled `shaders\first.slang`).
+        assert_eq!(
+            p.passes[0].shader.file_name().and_then(|s| s.to_str()),
+            Some("first.slang")
+        );
+    }
+
+    #[test]
     fn missing_shaders_key_errors() {
         let err = parse_slangp_str("shader0 = a.slang\n", Path::new("/p")).unwrap_err();
         assert!(matches!(err, ParseError::MissingKey(k) if k == "shaders"));
@@ -712,6 +922,32 @@ CONTRAST = 0.75
         let err =
             parse_slangp_str("shaders = 2\nshader0 = a.slang\n", Path::new("/p")).unwrap_err();
         assert!(matches!(err, ParseError::MissingKey(k) if k == "shader1"));
+    }
+
+    #[test]
+    fn absurd_shader_count_errors_cleanly_without_aborting() {
+        // B1: a hostile/garbage `shaders` count must NOT be trusted to pre-size a
+        // Vec (which would request terabytes and SIGABRT the whole process — an
+        // allocation abort `catch_unwind` does not contain). It must return a
+        // clean Err instead, so `load_preset` (a Tauri command on a frontend path)
+        // cannot take down the app.
+        let err = parse_slangp_str("shaders = 8800000000000\n", Path::new("/p")).unwrap_err();
+        assert!(
+            matches!(err, ParseError::TooManyPasses { declared, max }
+                if declared == 8_800_000_000_000 && max == MAX_PASSES),
+            "huge shader count must error as TooManyPasses, got {err:?}"
+        );
+
+        // A count just over the cap is also refused (boundary), and the cap itself
+        // is accepted up to the point a `shaderN` key is actually missing.
+        let err = parse_slangp_str(&format!("shaders = {}\n", MAX_PASSES + 1), Path::new("/p"))
+            .unwrap_err();
+        assert!(matches!(err, ParseError::TooManyPasses { .. }));
+        // At the cap, the count is allowed through to normal per-pass parsing
+        // (which then fails on the first missing `shaderN`, NOT on allocation).
+        let err =
+            parse_slangp_str(&format!("shaders = {MAX_PASSES}\n"), Path::new("/p")).unwrap_err();
+        assert!(matches!(err, ParseError::MissingKey(k) if k == "shader0"));
     }
 
     #[test]

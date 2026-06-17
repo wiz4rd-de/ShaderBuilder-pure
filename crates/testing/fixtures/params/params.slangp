@@ -1,0 +1,36 @@
+# Parameter extraction + multi-LUT import fixture (#35).
+#
+# The single pass (grade.slang) declares four `#pragma parameter` knobs. This
+# preset OVERRIDES two of their initial values via bare `id = value` lines
+# (BRIGHTNESS, GAMMA) and leaves the other two (CONTRAST, SATURATION) at their
+# pragma defaults — exercising the importer's reconcile-with-overrides path
+# (the preset value wins over the pragma initial; range/step stay from the pragma).
+#
+# It also declares TWO LUTs with DIFFERING sampler settings:
+#   GRADE  — linear filtering, repeat wrap, mipmaps on
+#   BORDER — nearest filtering, clamp_to_edge wrap, mipmaps off
+# proving per-texture filter/wrap/mipmap import (#35) for multiple LUTs.
+#
+# LOCAL fixture, NOT a RetroArch reference. Both LUTs reuse the committed 2x2 PNG.
+
+shaders = 1
+
+shader0 = grade.slang
+filter_linear0 = true
+
+# Two LUTs, differing sampler settings.
+textures = "GRADE;BORDER"
+GRADE = grade.png
+GRADE_linear = true
+GRADE_wrap_mode = repeat
+GRADE_mipmap = true
+BORDER = border.png
+BORDER_linear = false
+BORDER_wrap_mode = clamp_to_edge
+BORDER_mipmap = false
+
+# Parameter overrides (bare `id = value`): the preset value wins over the
+# pragma initial. CONTRAST and SATURATION are intentionally NOT overridden.
+parameters = "BRIGHTNESS;CONTRAST;SATURATION;GAMMA"
+BRIGHTNESS = 1.25
+GAMMA = 2.4
