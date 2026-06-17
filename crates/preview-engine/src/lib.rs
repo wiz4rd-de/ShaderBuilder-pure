@@ -813,3 +813,227 @@ layout(set = 0, binding = 2) uniform sampler Smp;
         );
     }
 }
+
+#[cfg(test)]
+mod builtin_semantics_tests {
+    //! Full builtin-semantics + reflection-driven-packing tests (#28). These run
+    //! on the real GPU and read a center pixel back; they prove the renderer
+    //! packs every computable semantic at the *reflected* offset (not a fixed
+    //! layout), applies per-pass `frame_count_mod`, and threads the size family
+    //! (`OutputSize`, `FinalViewportSize`, `PassNSize`) through a chain.
+    use super::{Pass, Renderer};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    /// A vertex stage that just applies MVP (kept identical across fixtures so
+    /// only the fragment body / UBO declaration varies).
+    const VS: &str = "\
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+";
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&rgba);
+        }
+        Frame::new(width, height, data)
+    }
+
+    /// Center pixel of a read-back frame (avoids border/edge effects).
+    fn center(f: &Frame) -> [u8; 4] {
+        let i = (((f.height / 2) * f.width + f.width / 2) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2], f.rgba[i + 3]]
+    }
+
+    fn render_chain(passes: &[Pass], frame: &Frame, out: (u32, u32)) -> Frame {
+        let mut r = Renderer::new(out.0, out.1).expect("wgpu device");
+        r.set_source(frame);
+        r.set_chain(passes).expect("set chain");
+        r.render().expect("render");
+        r.read_back().expect("read back")
+    }
+
+    /// Reflection-driven proof: declare the builtin UBO members in a
+    /// NON-canonical order AND as a subset (no SourceSize/OriginalSize), and read
+    /// back a value derived from each declared semantic. If packing were
+    /// fixed-layout rather than offset-by-name, the reordered members would carry
+    /// the wrong bytes and the assertions would fail.
+    #[test]
+    fn non_canonical_subset_builtins_each_reach_the_shader() {
+        // Members deliberately scrambled: FrameCount, then OutputSize, then MVP.
+        let src = format!(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{
+    uint FrameCount;
+    vec4 OutputSize;
+    vec4 FinalViewportSize;
+    mat4 MVP;
+}} global;
+{VS}void main() {{
+    // R = OutputSize.x/255, G = FinalViewportSize.x/255, B = FrameCount/255.
+    FragColor = vec4(
+        global.OutputSize.x / 255.0,
+        global.FinalViewportSize.x / 255.0,
+        float(global.FrameCount) / 255.0,
+        1.0);
+}}
+"
+        );
+        let shader = compile_slang(&src, None).expect("compile");
+        // Output pane = 200 wide; render 6 frames so FrameCount = 5 on the last.
+        let mut r = Renderer::new(200, 100).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&shader);
+        for _ in 0..6 {
+            r.render().expect("render");
+        }
+        let out = r.read_back().expect("read back");
+        let c = center(&out);
+        // OutputSize.x == 200 (the pane) -> R ~= 200.
+        assert!((c[0] as i32 - 200).abs() <= 3, "OutputSize.x: got {c:?}");
+        // FinalViewportSize.x == 200 too -> G ~= 200.
+        assert!(
+            (c[1] as i32 - 200).abs() <= 3,
+            "FinalViewportSize.x: got {c:?}"
+        );
+        // FrameCount on the 6th frame was 5 -> B ~= 5.
+        assert!((c[2] as i32 - 5).abs() <= 2, "FrameCount: got {c:?}");
+    }
+
+    /// `frame_count_mod = 4`: across ~10 frames the shader-visible FrameCount
+    /// must cycle 0,1,2,3,0,1,… (output through the R channel).
+    #[test]
+    fn frame_count_mod_wraps_the_visible_counter() {
+        let src = format!(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; uint FrameCount; }} global;
+{VS}void main() {{ FragColor = vec4(float(global.FrameCount) / 255.0, 0.0, 0.0, 1.0); }}
+"
+        );
+        let shader = compile_slang(&src, None).expect("compile");
+        let mut pass = Pass::new(shader);
+        pass.frame_count_mod = 4;
+
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_chain(std::slice::from_ref(&pass)).expect("set chain");
+
+        // Frame i is rendered with raw FrameCount = i, visible = i % 4.
+        for i in 0..10u32 {
+            r.render().expect("render");
+            let out = r.read_back().expect("read back");
+            let visible = center(&out)[0] as u32;
+            assert_eq!(visible, i % 4, "frame {i}: visible FrameCount should wrap");
+        }
+    }
+
+    /// A constant-color pass writing R = OutputSize.x/255 into its FBO at a known
+    /// scale, so a later pass can read it back. Used to seed `Pass0`'s size.
+    fn output_size_writer() -> CompiledShader {
+        let src = format!(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; vec4 OutputSize; }} global;
+{VS}void main() {{ FragColor = vec4(global.OutputSize.x / 255.0, global.OutputSize.y / 255.0, 0.0, 1.0); }}
+"
+        );
+        compile_slang(&src, None).expect("compile")
+    }
+
+    /// Multi-pass: pass 1 reads `PassOutput0Size` (the spelling RetroArch
+    /// canonicalizes to) and `FinalViewportSize`, proving an earlier pass's size
+    /// and the pane reach a later pass. Pass 0 is an absolute-scaled intermediate
+    /// so its OutputSize is a known value distinct from the pane.
+    #[test]
+    fn pass_output_size_and_final_viewport_reach_a_later_pass() {
+        use super::{AxisScale, ScaleConfig, ScaleType};
+        // Pass 1's UBO declares PassOutput0Size + FinalViewportSize (+ MVP).
+        let src = format!(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{
+    mat4 MVP;
+    vec4 PassOutput0Size;
+    vec4 FinalViewportSize;
+}} global;
+{VS}void main() {{
+    FragColor = vec4(
+        global.PassOutput0Size.x / 255.0,
+        global.PassOutput0Size.y / 255.0,
+        global.FinalViewportSize.x / 255.0,
+        1.0);
+}}
+"
+        );
+        let reader = compile_slang(&src, None).expect("compile");
+
+        // Pass 0: absolute 120x90 intermediate; pass 1 (final) reads its size.
+        let scale = ScaleConfig {
+            x: AxisScale {
+                ty: ScaleType::Absolute,
+                factor: 120.0,
+            },
+            y: AxisScale {
+                ty: ScaleType::Absolute,
+                factor: 90.0,
+            },
+        };
+        let pass0 = Pass::new(output_size_writer()).with_scale(scale);
+        let pass1 = Pass::new(reader);
+        // Pane (FinalViewportSize) = 220 wide.
+        let out = render_chain(&[pass0, pass1], &solid(8, 8, [0, 0, 0, 255]), (220, 64));
+        let c = center(&out);
+        // PassOutput0Size = (120, 90); FinalViewportSize.x = 220.
+        assert!(
+            (c[0] as i32 - 120).abs() <= 3,
+            "PassOutput0Size.x should be 120, got {c:?}"
+        );
+        assert!(
+            (c[1] as i32 - 90).abs() <= 3,
+            "PassOutput0Size.y should be 90, got {c:?}"
+        );
+        assert!(
+            (c[2] as i32 - 220).abs() <= 3,
+            "FinalViewportSize.x should be the pane (220), got {c:?}"
+        );
+    }
+
+    /// The `PassNSize` alias (without `Output`) resolves to the same pass-output
+    /// size as `PassOutputNSize` (§7/§11 — both spellings accepted).
+    #[test]
+    fn pass_n_size_alias_matches_pass_output_n_size() {
+        use super::{AxisScale, ScaleConfig, ScaleType};
+        let src = format!(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; vec4 Pass0Size; }} global;
+{VS}void main() {{ FragColor = vec4(global.Pass0Size.x / 255.0, global.Pass0Size.y / 255.0, 0.0, 1.0); }}
+"
+        );
+        let reader = compile_slang(&src, None).expect("compile");
+        let scale = ScaleConfig {
+            x: AxisScale {
+                ty: ScaleType::Absolute,
+                factor: 100.0,
+            },
+            y: AxisScale {
+                ty: ScaleType::Absolute,
+                factor: 60.0,
+            },
+        };
+        let pass0 = Pass::new(output_size_writer()).with_scale(scale);
+        let pass1 = Pass::new(reader);
+        let out = render_chain(&[pass0, pass1], &solid(8, 8, [0, 0, 0, 255]), (128, 128));
+        let c = center(&out);
+        assert!(
+            (c[0] as i32 - 100).abs() <= 3 && (c[1] as i32 - 60).abs() <= 3,
+            "Pass0Size alias should equal pass 0's output (100x60), got {c:?}"
+        );
+    }
+}

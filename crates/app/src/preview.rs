@@ -217,6 +217,11 @@ fn compile_preset_chain(preset: &preset_io::Preset) -> Result<Vec<preview_engine
         if let Some(v) = p.mipmap_input {
             pass.mipmap_input = v;
         }
+        // `frame_count_modN` (#28): the FrameCount this pass sees is pre-wrapped
+        // mod this value. Absent -> 0 (no wrap).
+        if let Some(v) = p.frame_count_mod {
+            pass.frame_count_mod = v;
+        }
         passes.push(pass);
     }
     Ok(passes)
