@@ -186,6 +186,12 @@ pub struct Preset {
     /// Bare `id = value` parameter overrides (§8). Captured but not consumed yet;
     /// these override a `#pragma parameter` initial value at runtime.
     pub parameter_overrides: BTreeMap<String, f32>,
+    /// Every key the parser did **not** recognize as a structural key *and* could
+    /// not interpret as a float parameter override — retained verbatim so import
+    /// never silently drops data (the importer surfaces these as diagnostics).
+    /// This is distinct from [`Preset::parameter_overrides`]: a key lands in
+    /// exactly one of the two (structural keys go into typed fields instead).
+    pub extras: BTreeMap<String, String>,
 }
 
 /// Errors parsing a `.slangp` preset.
@@ -249,7 +255,7 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
 
     let feedback_pass = opt_parse::<i32>(&map, "feedback_pass")?;
     let luts = parse_luts(&map, base_dir)?;
-    let parameter_overrides = parse_parameter_overrides(&map, &passes, &luts);
+    let (parameter_overrides, extras) = parse_overrides_and_extras(&map, &passes, &luts);
 
     Ok(Preset {
         base_dir: base_dir.to_path_buf(),
@@ -257,6 +263,7 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
         feedback_pass,
         luts,
         parameter_overrides,
+        extras,
     })
 }
 
@@ -378,24 +385,37 @@ fn parse_luts(
     Ok(luts)
 }
 
-/// Collect bare `id = value` parameter overrides (§8). Any key that is not a
-/// recognized structural key (and parses as a float) is treated as an override.
-/// The informational `parameters = "..."` list is *not* required for this.
-fn parse_parameter_overrides(
+/// Partition every non-structural key into parameter overrides vs. preserved
+/// extras, so **no key in the preset is silently lost** (the importer surfaces
+/// the extras as diagnostics).
+///
+/// A key that is not a recognized structural key (those become typed fields) is:
+/// - a **parameter override** (§8) if its value parses as a float — these
+///   override a `#pragma parameter` initial value at runtime; or
+/// - an **extra** otherwise — retained verbatim in [`Preset::extras`].
+///
+/// The informational `parameters = "..."` list is *not* required for either.
+fn parse_overrides_and_extras(
     map: &BTreeMap<String, String>,
     passes: &[Pass],
     luts: &[LutEntry],
-) -> BTreeMap<String, f32> {
-    let mut out = BTreeMap::new();
+) -> (BTreeMap<String, f32>, BTreeMap<String, String>) {
+    let mut overrides = BTreeMap::new();
+    let mut extras = BTreeMap::new();
     for (key, value) in map {
         if is_structural_key(key, passes.len(), luts) {
             continue;
         }
-        if let Ok(v) = value.parse::<f32>() {
-            out.insert(key.clone(), v);
+        match value.parse::<f32>() {
+            Ok(v) => {
+                overrides.insert(key.clone(), v);
+            }
+            Err(_) => {
+                extras.insert(key.clone(), value.clone());
+            }
         }
     }
-    out
+    (overrides, extras)
 }
 
 /// Whether `key` is a structural preset key (vs. a bare parameter override).
@@ -635,6 +655,78 @@ CONTRAST = 0.75
         assert!(!p.parameter_overrides.contains_key("shaders"));
         assert!(!p.parameter_overrides.contains_key("BORDER"));
         assert!(!p.parameter_overrides.contains_key("frame_count_mod1"));
+        // The fixture has no unknown keys -> nothing preserved as extras.
+        assert!(p.extras.is_empty(), "fixture has no unrecognized keys");
+    }
+
+    #[test]
+    fn unrecognized_keys_preserved_as_extras() {
+        // Non-structural, non-float keys are kept verbatim in `extras` (not
+        // dropped, and not mistaken for parameter overrides).
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             some_future_key = some_string_value\n\
+             vendor_flag = on\n\
+             GAMMA = 2.2\n",
+            Path::new("/p"),
+        )
+        .expect("preset with unknown keys parses");
+        // Float-valued unknowns are parameter overrides; non-float unknowns are extras.
+        assert_eq!(p.parameter_overrides.get("GAMMA"), Some(&2.2));
+        assert_eq!(
+            p.extras.get("some_future_key").map(String::as_str),
+            Some("some_string_value")
+        );
+        assert_eq!(p.extras.get("vendor_flag").map(String::as_str), Some("on"));
+        // A key lands in exactly one bucket.
+        assert!(!p.extras.contains_key("GAMMA"));
+        assert!(!p.parameter_overrides.contains_key("some_future_key"));
+    }
+
+    #[test]
+    fn no_key_is_silently_lost() {
+        // The contract: every key in the raw INI body is accounted for — it is
+        // either structural (consumed into a typed field), a float parameter
+        // override, or a preserved extra. Nothing is dropped.
+        let text = "shaders = 1\n\
+             shader0 = a.slang\n\
+             scale_type0 = source\n\
+             scale0 = 2.0\n\
+             alias0 = MAIN\n\
+             filter_linear0 = true\n\
+             feedback_pass = 0\n\
+             textures = LUT\n\
+             LUT = lut.png\n\
+             LUT_linear = true\n\
+             parameters = \"P;Q\"\n\
+             P = 1.0\n\
+             Q = 0.5\n\
+             custom_unknown = hello world\n\
+             another_unknown = 42\n";
+        let raw = parse_ini(text);
+        let p = parse_slangp_str(text, Path::new("/p")).expect("parses");
+
+        for key in raw.keys() {
+            let structural = is_structural_key(key, p.passes.len(), &p.luts);
+            let is_override = p.parameter_overrides.contains_key(key);
+            let is_extra = p.extras.contains_key(key);
+            assert!(
+                structural || is_override || is_extra,
+                "key `{key}` was silently lost (not structural, override, or extra)"
+            );
+            // And it lands in exactly one non-structural bucket.
+            assert!(
+                !(is_override && is_extra),
+                "key `{key}` is in both overrides and extras"
+            );
+        }
+        // Sanity: the unknowns ended up where expected.
+        assert_eq!(
+            p.extras.get("custom_unknown").map(String::as_str),
+            Some("hello world")
+        );
+        assert_eq!(p.parameter_overrides.get("another_unknown"), Some(&42.0));
     }
 
     #[test]
