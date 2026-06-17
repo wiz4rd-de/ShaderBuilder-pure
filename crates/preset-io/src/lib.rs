@@ -9,7 +9,11 @@
 //! Phase 3 adds the **import bridge** ([`import_preset`]): it lowers a parsed
 //! [`Preset`] into the canonical [`core_model::Project`] — carrying every
 //! RetroArch per-pass + preset-level setting onto the model — and returns
-//! [`ImportDiagnostics`] (preserved unknown keys, unreadable shaders).
+//! [`ImportDiagnostics`] (preserved unknown keys, unreadable shaders). The inverse
+//! **export bundle writer** ([`export_preset`]) serializes a
+//! [`core_model::Project`] back into a RetroArch-conventional bundle directory
+//! (`preset.slangp` + per-pass `.slang` + `textures/` LUT PNGs) using relative
+//! paths and inline parameter defaults, ready to run in RetroArch.
 //!
 //! The parser is intentionally **forward-looking**: it captures the *full*
 //! documented per-pass key set as typed `Option` fields now, even though #22
@@ -18,6 +22,7 @@
 //! `docs/retroarch-slang-runtime.md` §1 for the authoritative key list and
 //! defaults (we follow RetroArch C where it and librashader diverge).
 
+mod export;
 mod import;
 mod params;
 mod scan;
@@ -25,6 +30,7 @@ mod slangp;
 
 use std::path::{Path, PathBuf};
 
+pub use export::{export_preset, ExportError, ExportReport, PRESET_FILENAME, TEXTURES_DIR};
 pub use import::{
     import_parsed_preset, import_preset, ImportDiagnostic, ImportDiagnostics, Severity,
 };
