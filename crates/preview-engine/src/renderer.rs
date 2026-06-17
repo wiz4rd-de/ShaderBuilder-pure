@@ -3,15 +3,17 @@
 //! §D/§F). No window — renders to an offscreen RGBA8 target and reads it back.
 //!
 //! SPIR-V from `slang-compile` is ingested via `wgpu::ShaderSource::SpirV` (no
-//! WGSL hop). The bind group is the minimal one-pass set: a uniform buffer
-//! (`MVP` here; the full builtin set is added in #19), the source `texture2D`,
-//! and a `sampler`.
+//! WGSL hop). The bind group is the one-pass set: the builtin uniform buffer
+//! (`MVP`, the `*Size` family, `FrameCount` — see [`crate::uniforms`]), the
+//! source `texture2D`, a `sampler`, and the parameter UBO (`#pragma parameter`
+//! defaults).
 //!
 //! Note on samplers: wgpu's binding model uses **separate** texture + sampler,
 //! not GLSL's combined `sampler2D`. Phase 1 fixtures therefore use separate
 //! samplers; converting real RetroArch combined-`sampler2D` shaders is a Phase 2
 //! import concern.
 
+use crate::uniforms::{self, BuiltinUniforms};
 use slang_compile::CompiledShader;
 use source::Frame;
 
@@ -27,15 +29,18 @@ struct Vertex {
     uv: [f32; 2],
 }
 
-/// Two triangles covering the viewport. UVs are set so the image's top-left
+/// Two triangles covering the viewport. Positions are in RetroArch's `[0,1]`
+/// quad space — the MVP (an orthographic `[0,1]→[-1,1]` map, see
+/// [`uniforms::ortho_mvp`]) projects them to clip space, exactly as a real slang
+/// vertex shader's `MVP * Position` does. UVs are set so the image's top-left
 /// lands at the framebuffer's top-left (wgpu NDC is y-up; texture row 0 is top).
 const QUAD: [Vertex; 6] = [
     Vertex {
-        pos: [-1.0, -1.0, 0.0, 1.0],
+        pos: [0.0, 0.0, 0.0, 1.0],
         uv: [0.0, 1.0],
     },
     Vertex {
-        pos: [1.0, -1.0, 0.0, 1.0],
+        pos: [1.0, 0.0, 0.0, 1.0],
         uv: [1.0, 1.0],
     },
     Vertex {
@@ -43,7 +48,7 @@ const QUAD: [Vertex; 6] = [
         uv: [1.0, 0.0],
     },
     Vertex {
-        pos: [-1.0, -1.0, 0.0, 1.0],
+        pos: [0.0, 0.0, 0.0, 1.0],
         uv: [0.0, 1.0],
     },
     Vertex {
@@ -51,7 +56,7 @@ const QUAD: [Vertex; 6] = [
         uv: [1.0, 0.0],
     },
     Vertex {
-        pos: [-1.0, 1.0, 0.0, 1.0],
+        pos: [0.0, 1.0, 0.0, 1.0],
         uv: [0.0, 0.0],
     },
 ];
@@ -87,7 +92,7 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     vertex_buffer: wgpu::Buffer,
-    /// Uniform buffer (MVP for now; grown to the full builtin set in #19).
+    /// Builtin uniform buffer ([`BuiltinUniforms`]): `MVP`, `*Size`, `FrameCount`.
     ubo: wgpu::Buffer,
     sampler: wgpu::Sampler,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -96,13 +101,20 @@ pub struct Renderer {
     height: u32,
     offscreen: wgpu::Texture,
 
+    /// Size of the uploaded source image, for the `*Size` uniforms.
+    source_size: Option<(u32, u32)>,
+    /// Frames rendered so far; written into `FrameCount` and bumped per frame.
+    frame_count: u32,
+
     source_view: Option<wgpu::TextureView>,
+    /// Parameter UBO (`#pragma parameter` defaults); built in [`Renderer::set_shader`].
+    param_buffer: Option<wgpu::Buffer>,
     pipeline: Option<wgpu::RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
 }
 
-/// Bytes the UBO holds in Phase 1: a single `mat4 MVP`. (#19 grows this.)
-const UBO_SIZE: u64 = 64;
+/// Size of the builtin UBO (std140; see [`BuiltinUniforms`]).
+const UBO_SIZE: u64 = std::mem::size_of::<BuiltinUniforms>() as u64;
 
 impl Renderer {
     /// Initialize a headless wgpu device and the static resources.
@@ -185,6 +197,18 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Parameter UBO. Present even for shaders that declare no
+                // parameters: a layout may carry bindings the shader doesn't use.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -200,7 +224,10 @@ impl Renderer {
             width,
             height,
             offscreen,
+            source_size: None,
+            frame_count: 0,
             source_view: None,
+            param_buffer: None,
             pipeline: None,
             bind_group: None,
         })
@@ -255,11 +282,23 @@ impl Renderer {
             size,
         );
         self.source_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.source_size = Some((frame.width, frame.height));
         self.rebuild_bind_group();
     }
 
-    /// Build the render pipeline from the compiled SPIR-V modules.
+    /// Build the render pipeline from the compiled SPIR-V modules and the
+    /// parameter UBO from the shader's reflected `#pragma parameter` defaults.
     pub fn set_shader(&mut self, shader: &CompiledShader) {
+        let params = uniforms::pack_parameters(&shader.reflection.parameters);
+        let param_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("parameters"),
+            size: params.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&param_buffer, 0, &params);
+        self.param_buffer = Some(param_buffer);
+
         let vs = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -326,22 +365,22 @@ impl Renderer {
                 cache: None,
             });
         self.pipeline = Some(pipeline);
+        self.rebuild_bind_group();
     }
 
-    /// Write the current uniforms (identity MVP in Phase 1; #19 fills the rest).
+    /// Compute and upload the builtin uniforms for the current frame. `OutputSize`
+    /// is the offscreen viewport; `Source`/`Original` are the uploaded image.
     fn write_uniforms(&self) {
-        let identity: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        self.queue
-            .write_buffer(&self.ubo, 0, bytemuck::cast_slice(&identity));
+        let source = self.source_size.unwrap_or((self.width, self.height));
+        let builtins = BuiltinUniforms::new(source, (self.width, self.height), self.frame_count);
+        self.queue.write_buffer(&self.ubo, 0, builtins.as_bytes());
     }
 
+    /// (Re)build the bind group once both the source texture and the parameter
+    /// UBO exist (they arrive via [`Renderer::set_source`] / [`Renderer::set_shader`]
+    /// in either order).
     fn rebuild_bind_group(&mut self) {
-        let Some(view) = &self.source_view else {
+        let (Some(view), Some(params)) = (&self.source_view, &self.param_buffer) else {
             self.bind_group = None;
             return;
         };
@@ -360,6 +399,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
                 },
             ],
         });
@@ -404,7 +447,14 @@ impl Renderer {
             pass.draw(0..QUAD.len() as u32, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
+        // Advance the animation clock for the next frame (Phase 2 pumps this).
+        self.frame_count = self.frame_count.wrapping_add(1);
         Ok(())
+    }
+
+    /// Frames rendered so far (the next `render` writes this as `FrameCount`).
+    pub fn frame_count(&self) -> u32 {
+        self.frame_count
     }
 
     /// Read the offscreen target back into a CPU [`Frame`] (RGBA8).
