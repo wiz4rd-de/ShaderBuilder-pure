@@ -1,0 +1,61 @@
+//! `testing` — the golden-image regression harness (#32; Architecture §G.2/§G.3,
+//! Specification §5, `docs/retroarch-slang-runtime.md`).
+//!
+//! This crate stands up the **machinery** of the Phase-2 fidelity gate: a way to
+//! render a `.slangp` preset through the real [`preview_engine`] runtime to a PNG
+//! deterministically, diff two images with a numeric metric + a visual diff
+//! artifact, and import-and-render a whole *directory* of presets as a
+//! smoke/fidelity fuzzer that reports per-preset failures without aborting the
+//! run.
+//!
+//! ## What this proves — and what it deliberately does NOT
+//!
+//! The committed goldens under `goldens/` are a **self-oracle**: they were
+//! produced by *this* engine, not captured from RetroArch. Re-rendering and
+//! diffing them proves (a) determinism — same inputs give byte-identical output —
+//! and (b) that the whole compile → chain → feedback/history → LUT → render →
+//! read-back path runs end-to-end and that the diff / re-baseline flow works.
+//!
+//! They do **not** prove fidelity *versus RetroArch*. The Phase-2 fidelity exit
+//! gate ("CRT-Royale, an NTSC preset, and a feedback shader render within
+//! threshold of RetroArch reference images") needs real RetroArch reference PNGs,
+//! which cannot be captured in this headless CI/dev environment. That capture is
+//! documented as a **manual gate** in `docs/golden-image-harness.md`; the diff
+//! functions here are exactly what wires those references in once captured.
+//!
+//! ## Modules
+//! * [`render`] — [`render::render_preset_to_image`]: parse a `.slangp`, compile
+//!   each pass, build the engine chain, decode/register LUTs, advance the source
+//!   pump to a fixed frame index (so feedback + history are deterministic), render
+//!   to an [`image::RgbaImage`].
+//! * [`diff`] — [`diff::diff_images`] / [`diff::DiffReport`] (the pass/fail
+//!   metric) and [`diff::diff_image`] (the amplified visual diff artifact).
+//! * [`fuzz`] — [`fuzz::fuzz_presets`] / [`fuzz::PresetResult`]: walk a directory
+//!   of `.slangp` and import-and-render each, catching errors per preset.
+
+pub mod diff;
+pub mod fuzz;
+pub mod render;
+
+pub use diff::{diff_image, diff_images, DiffReport};
+pub use fuzz::{fuzz_presets, PresetResult};
+pub use render::{render_preset_to_image, HarnessError};
+
+/// Crate identity marker (kept consistent with the other workspace crates' smoke
+/// tests so the dependency edges stay live).
+pub const NAME: &str = "testing";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        assert_eq!(NAME, "testing");
+        // The harness → engine / preset-io / source / slang-compile edges are real.
+        assert_eq!(preview_engine::NAME, "preview-engine");
+        assert_eq!(preset_io::NAME, "preset-io");
+        assert_eq!(source::NAME, "source");
+        assert_eq!(slang_compile::NAME, "slang-compile");
+    }
+}

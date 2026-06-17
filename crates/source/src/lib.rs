@@ -1,7 +1,14 @@
-//! `source` — the preview's frame pump. Phase 1 ships the minimum the render
-//! slice needs: a still-image loader and a built-in test pattern, both producing
-//! a CPU [`Frame`] of RGBA8 pixels ready to upload to a wgpu texture. PNG
-//! sequences, video, and richer patterns are Phase 2 (Architecture §D).
+//! `source` — the preview's frame pump. Phase 1 shipped the minimum the render
+//! slice needed: a still-image loader and a built-in test pattern, both producing
+//! a CPU [`Frame`] of RGBA8 pixels ready to upload to a wgpu texture. Phase 2
+//! (#31, Architecture §D) adds the [`pump`] module: a [`pump::FramePump`]
+//! abstraction with still-image, procedural test-pattern, and **in-core PNG-
+//! sequence** producers (no ffmpeg — decoding goes through the `image` crate).
+//! Video and richer sources remain a later, pluggable concern.
+
+pub mod pump;
+
+pub use pump::{FramePump, PngSequencePump, StillImage, TestPattern, TestPatternPump};
 
 use std::path::Path;
 
@@ -39,13 +46,15 @@ impl Frame {
     }
 }
 
-/// Errors loading a source image.
+/// Errors loading a source image or sequence.
 #[derive(Debug)]
 pub enum SourceError {
     /// The file could not be read.
     Io(std::io::Error),
     /// The image bytes could not be decoded.
     Decode(image::ImageError),
+    /// A PNG-sequence directory contained no numbered PNG frames (#31).
+    NoFrames,
 }
 
 impl std::fmt::Display for SourceError {
@@ -53,6 +62,7 @@ impl std::fmt::Display for SourceError {
         match self {
             SourceError::Io(e) => write!(f, "could not read image: {e}"),
             SourceError::Decode(e) => write!(f, "could not decode image: {e}"),
+            SourceError::NoFrames => write!(f, "no numbered PNG frames found in the directory"),
         }
     }
 }

@@ -23,6 +23,8 @@ tauri-build = { version = "2", features = [] }
 # `app` is the top of the dependency graph: it wires together every other crate.
 [dependencies]
 tauri = { version = "2", features = [] }
+# `#[derive(Serialize)]` for the `source-position` event payload (#31).
+serde = { workspace = true }
 core-model = { workspace = true }
 ir = { workspace = true }
 codegen-slang = { workspace = true }

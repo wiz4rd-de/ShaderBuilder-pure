@@ -63,6 +63,7 @@ dependencies = [
  "ir",
  "preset-io",
  "preview-engine",
+ "serde",
  "slang-compile",
  "source",
  "tauri",
@@ -716,7 +717,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -1320,7 +1321,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2910,6 +2911,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rspirv"
+version = "0.13.0+sdk-1.4.341.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
+dependencies = [
+ "rustc-hash 1.1.0",
+ "spirv",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3242,6 +3253,8 @@ name = "slang-compile"
 version = "0.1.0"
 dependencies = [
  "core-model",
+ "naga",
+ "rspirv",
  "tempfile",
 ]
 
@@ -3743,6 +3756,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "testing"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "preset-io",
+ "preview-engine",
+ "slang-compile",
+ "source",
+ "tempfile",
 ]
 
 [[package]]

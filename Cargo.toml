@@ -26,11 +26,15 @@ slang-compile = { path = "crates/slang-compile" }
 preview-engine = { path = "crates/preview-engine" }
 source = { path = "crates/source" }
 preset-io = { path = "crates/preset-io" }
+testing = { path = "crates/testing" }
 
 # Third-party crates shared across the workspace.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ts-rs = "10"
+# Binary SPIR-V reflection (#28). Pinned to the version already in the tree via
+# wgpu so the lockfile stays single-versioned. `spv-in` is the SPIR-V front end.
+naga = { version = "29", features = ["spv-in"] }
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 

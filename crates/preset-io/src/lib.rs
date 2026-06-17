@@ -1,11 +1,25 @@
 //! `preset-io` — `.slangp`/`.slang` import + export bundle writer (Architecture §B).
 //!
-//! Phase 1 provides only the minimum the render slice needs: loading a single
-//! `.slang` file into the string `slang-compile` consumes, plus the base
-//! directory for resolving its `#include`s. Full `.slangp` pipeline
-//! reconstruction, parameters, LUTs, and export bundles are Phase 3.
+//! Phase 1 shipped only the minimum the render slice needed: loading a single
+//! `.slang` file into the string `slang-compile` consumes. Phase 2 adds the
+//! **`.slangp` multi-pass preset parser** ([`parse_slangp`] / [`Preset`]) — the
+//! foundation the multi-pass resource graph (#22) and every later Phase-2 ticket
+//! (#23 formats/samplers, #24 feedback, #27 LUTs) builds on.
+//!
+//! The parser is intentionally **forward-looking**: it captures the *full*
+//! documented per-pass key set as typed `Option` fields now, even though #22
+//! consumes only the scale/shader keys. Later tickets read the already-parsed
+//! fields rather than re-touching the parser. See
+//! `docs/retroarch-slang-runtime.md` §1 for the authoritative key list and
+//! defaults (we follow RetroArch C where it and librashader diverge).
+
+mod slangp;
 
 use std::path::{Path, PathBuf};
+
+pub use slangp::{
+    parse_slangp, parse_slangp_str, LutEntry, ParseError, Pass, Preset, ScaleType, WrapMode,
+};
 
 /// Crate identity marker (kept from the Phase 0 scaffold so dependent crates'
 /// smoke tests keep the dependency edge live).
@@ -23,7 +37,7 @@ pub struct SlangSource {
 
 /// Read a `.slang` file from disk into a [`SlangSource`]. Returns the file's I/O
 /// error (e.g. `NotFound`) if it can't be read. No `.slangp` pipeline
-/// reconstruction — that's Phase 3.
+/// reconstruction — use [`parse_slangp`] for that.
 pub fn load_slang_file(path: impl AsRef<Path>) -> std::io::Result<SlangSource> {
     let path = path.as_ref();
     let source = std::fs::read_to_string(path)?;

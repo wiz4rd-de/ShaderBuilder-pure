@@ -177,6 +177,30 @@ pub struct Vec2 {
     pub y: f32,
 }
 
+/// The simulated viewport the final pass renders into (#30, Architecture §D,
+/// Spec §4, `docs/retroarch-slang-runtime.md` §2/§9): the output resolution
+/// RetroArch would target, with an optional integer-scale toggle.
+///
+/// This is the resolution `FinalViewportSize` reports and `viewport`-scaled FBOs
+/// multiply — distinct from the preview *pane* size (the read-back/stream target).
+/// The engine computes the effective content rectangle from this and the source
+/// size (aspect-correct fit, or — when `integer_scale` is set — the largest
+/// integer multiple of the source that fits), letterboxing the remainder. See
+/// `preview_engine::viewport::ViewportConfig` for the canonical math.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Viewport {
+    /// Output resolution width in pixels.
+    pub width: u32,
+    /// Output resolution height in pixels.
+    pub height: u32,
+    /// When `true`, snap the content rectangle to the largest integer multiple
+    /// of the source size that fits the output resolution (letterboxing the
+    /// remainder). When `false`, aspect-correct fit preserving the source ratio.
+    pub integer_scale: bool,
+}
+
 impl Project {
     /// A new, empty project at the current schema version.
     pub fn empty(name: impl Into<String>) -> Self {
