@@ -1,16 +1,22 @@
-//! Preview frame transport: a `tauri::ipc::Channel` streaming raw RGBA frames
-//! from Rust to the webview `<canvas>` (Architecture §E/§F, Decision Log #15).
+//! Preview frame transport + control: a `tauri::ipc::Channel` streaming raw RGBA
+//! frames from Rust to the webview `<canvas>` (Architecture §E/§F, Decision Log
+//! #15), plus the commands that drive what gets rendered.
 //!
-//! The transport is deliberately decoupled from what produces the frames. Phase
-//! 0 drives it with [`preview_engine::GradientSource`] (a dummy animated
-//! gradient); Phase 1 swaps in the offscreen wgpu renderer behind the same
-//! [`preview_engine::FrameSource`] trait — **nothing in this file changes**.
+//! The transport ([`pump_frames`]) is decoupled from the producer behind
+//! [`preview_engine::FrameSource`]. Phase 0 drove it with a dummy gradient;
+//! Phase 1 spawns a render thread owning a [`preview_engine::RenderSource`] (the
+//! offscreen wgpu renderer) and feeds it live [`RenderCommand`]s over an mpsc
+//! channel. The Tauri commands [`load_source`], [`load_shader`], and
+//! [`set_viewport`] do the file IO / slang compile here, then hand the decoded
+//! image / compiled shader to the render thread — so they return quickly and
+//! frames keep flowing asynchronously over the channel.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use preview_engine::{FrameSource, GradientSource};
+use preview_engine::{FrameSource, RenderCommand, RenderSource};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::State;
 
@@ -21,10 +27,14 @@ const DEFAULT_PREVIEW_HEIGHT: u32 = 384;
 /// Frame period for ~60 fps.
 const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
 
-/// The single active preview stream: a caller-supplied id and its stop flag.
+/// The single active preview stream: a caller-supplied id, its stop flag, the
+/// command channel to its render thread, and the current pane size (so a
+/// `load_source` with no path can size the built-in test pattern to the pane).
 struct ActiveStream {
     id: String,
     running: Arc<AtomicBool>,
+    commands: Sender<RenderCommand>,
+    viewport: (u32, u32),
 }
 
 /// Managed state holding the single active preview stream, if any.
@@ -55,11 +65,40 @@ impl PreviewState {
                 .store(false, Ordering::Relaxed);
         }
     }
+
+    /// Send a render command to the active stream's render thread.
+    fn send(&self, command: RenderCommand) -> Result<(), String> {
+        let guard = self.active.lock().unwrap();
+        let stream = guard.as_ref().ok_or("no active preview stream")?;
+        stream
+            .commands
+            .send(command)
+            .map_err(|_| "preview render thread is gone".to_string())
+    }
+
+    /// The active stream's current pane size, if any.
+    fn viewport(&self) -> Option<(u32, u32)> {
+        self.active.lock().unwrap().as_ref().map(|s| s.viewport)
+    }
+
+    /// Record a new pane size on the active stream (so later `load_source`
+    /// defaults track it).
+    fn set_viewport_size(&self, width: u32, height: u32) {
+        if let Some(stream) = self.active.lock().unwrap().as_mut() {
+            stream.viewport = (width, height);
+        }
+    }
 }
 
 /// Start streaming preview frames over `channel` at ~60 fps. Any previously
 /// running stream is stopped first, so at most one producer runs at a time.
 /// `stream_id` correlates this stream with its later `stop_preview_stream` call.
+///
+/// The render thread is spawned immediately and returns; the wgpu device is
+/// created on that thread (not here), so this command never blocks the UI. Until
+/// a `load_source` + `load_shader` arrive, the stream emits a solid "waiting"
+/// frame. If no wgpu adapter is available the thread logs and exits — no frames,
+/// but the app stays up.
 ///
 /// Frames are sent as raw binary ([`InvokeResponseBody::Raw`]), not JSON; the
 /// frontend parses the documented header and blits to a `<canvas>`.
@@ -73,21 +112,74 @@ pub fn start_preview_stream(
 ) {
     state.stop_any();
 
+    let width = width.unwrap_or(DEFAULT_PREVIEW_WIDTH).max(1);
+    let height = height.unwrap_or(DEFAULT_PREVIEW_HEIGHT).max(1);
+
     let running = Arc::new(AtomicBool::new(true));
+    let (commands, rx) = mpsc::channel();
     *state.active.lock().unwrap() = Some(ActiveStream {
         id: stream_id,
         running: running.clone(),
+        commands,
+        viewport: (width, height),
     });
 
-    let width = width.unwrap_or(DEFAULT_PREVIEW_WIDTH);
-    let height = height.unwrap_or(DEFAULT_PREVIEW_HEIGHT);
-
-    std::thread::spawn(move || {
-        // --- Dummy producer (Phase 0). Swapped for the wgpu renderer in Phase 1. ---
-        let producer = GradientSource::new(width, height);
-        // ---------------------------------------------------------------------------
-        pump_frames(&channel, producer, &running, FRAME_PERIOD);
+    std::thread::spawn(move || match RenderSource::new(width, height, rx) {
+        Ok(source) => pump_frames(&channel, source, &running, FRAME_PERIOD),
+        Err(err) => {
+            eprintln!("preview: renderer unavailable, no frames will stream: {err}");
+            running.store(false, Ordering::Relaxed);
+        }
     });
+}
+
+/// Load the preview **source image**. With a path, decodes that file; with
+/// `None`, uses the built-in checkerboard test pattern sized to the pane. The
+/// decoded image is handed to the render thread; rendering continues
+/// asynchronously.
+#[tauri::command]
+pub fn load_source(
+    state: State<'_, PreviewState>,
+    source_path: Option<String>,
+) -> Result<(), String> {
+    let frame = match source_path {
+        Some(path) => source::load_image(&path).map_err(|e| e.to_string())?,
+        None => {
+            let (width, height) = state.viewport().ok_or("no active preview stream")?;
+            source::test_pattern(width, height)
+        }
+    };
+    state.send(RenderCommand::SetSource(frame))
+}
+
+/// Load the preview **shader**. With a path, reads and compiles that `.slang`
+/// file (resolving `#include`s from its directory); with `None`, compiles the
+/// built-in passthrough ([`preview_engine::DEFAULT_SHADER`]). A compile error is
+/// returned to the caller and the previous shader keeps running.
+#[tauri::command]
+pub fn load_shader(
+    state: State<'_, PreviewState>,
+    shader_path: Option<String>,
+) -> Result<(), String> {
+    let (source, base_dir) = match shader_path {
+        Some(path) => {
+            let loaded = preset_io::load_slang_file(&path).map_err(|e| e.to_string())?;
+            (loaded.source, loaded.base_dir)
+        }
+        None => (preview_engine::DEFAULT_SHADER.to_string(), None),
+    };
+    let compiled =
+        slang_compile::compile_slang(&source, base_dir.as_deref()).map_err(|e| e.to_string())?;
+    state.send(RenderCommand::SetShader(compiled))
+}
+
+/// Resize the preview pane (and thus the offscreen target frames downsample to).
+#[tauri::command]
+pub fn set_viewport(state: State<'_, PreviewState>, width: u32, height: u32) -> Result<(), String> {
+    let width = width.max(1);
+    let height = height.max(1);
+    state.set_viewport_size(width, height);
+    state.send(RenderCommand::SetViewport(width, height))
 }
 
 /// Drive a [`FrameSource`], sending each rendered frame over `channel` as raw
@@ -140,7 +232,7 @@ pub fn stop_preview_stream(state: State<'_, PreviewState>, stream_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use preview_engine::{FRAME_HEADER_LEN, FRAME_MAGIC};
+    use preview_engine::{GradientSource, FRAME_HEADER_LEN, FRAME_MAGIC};
 
     /// End-to-end transport check, no Tauri runtime: a `Channel` built from a
     /// collecting closure receives exactly the raw frames the producer sends.
@@ -186,5 +278,64 @@ mod tests {
             // Frame index is written little-endian at offset 16.
             assert_eq!(frame[16] as usize, i, "frame {i} index in header");
         }
+    }
+
+    /// Integration check through the real command → render path (everything
+    /// below the Tauri State/IPC marshaling, which can't run headlessly):
+    /// commands feed a `RenderSource` over its mpsc channel exactly as the
+    /// Tauri commands do, and the streamed frames come out downsampled to the
+    /// pane size. Requires a wgpu adapter (as the other render tests do).
+    #[test]
+    fn command_path_streams_pane_sized_frames() {
+        // Pane 24x18; source 200x200 -> frames must be pane-sized, not source-sized.
+        const PANE: (u32, u32) = (24, 18);
+        let (commands, rx) = mpsc::channel();
+        let source = RenderSource::new(PANE.0, PANE.1, rx).expect("wgpu device");
+
+        // Drive it exactly like load_shader(None) + load_source(None) would.
+        let shader = slang_compile::compile_slang(preview_engine::DEFAULT_SHADER, None)
+            .expect("compile default shader");
+        commands.send(RenderCommand::SetShader(shader)).unwrap();
+        commands
+            .send(RenderCommand::SetSource(source::test_pattern(200, 200)))
+            .unwrap();
+
+        let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let sink = frames.clone();
+        let stop = running.clone();
+        let channel = Channel::new(move |body: InvokeResponseBody| {
+            let InvokeResponseBody::Raw(bytes) = body else {
+                panic!("expected a raw binary frame");
+            };
+            let mut got = sink.lock().unwrap();
+            got.push(bytes);
+            if got.len() >= 3 {
+                stop.store(false, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+
+        pump_frames(&channel, source, &running, Duration::ZERO);
+
+        let frames = frames.lock().unwrap();
+        assert!(frames.len() >= 3, "expected streamed frames");
+        for frame in frames.iter() {
+            assert_eq!(&frame[0..4], &FRAME_MAGIC, "frame magic");
+            let w = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]);
+            let h = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
+            assert_eq!((w, h), PANE, "frames are downsampled to the pane");
+            assert_eq!(
+                frame.len(),
+                FRAME_HEADER_LEN + (PANE.0 * PANE.1 * 4) as usize
+            );
+        }
+        // The render is real (the test pattern is not a solid fill).
+        let last = frames.last().unwrap();
+        let px = &last[FRAME_HEADER_LEN..];
+        assert!(
+            px.chunks_exact(4).any(|p| p != &px[0..4]),
+            "expected varied pixels from a real render"
+        );
     }
 }

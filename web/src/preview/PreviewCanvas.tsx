@@ -8,8 +8,10 @@ const PREVIEW_HEIGHT = 384;
 
 /**
  * Hosts the preview `<canvas>` and drives the Rust → webview binary frame
- * stream (Architecture §F). Phase 0 renders a dummy animated gradient; the
- * transport is unchanged when the real wgpu renderer lands in Phase 1.
+ * stream (Architecture §F). The frames are the offscreen wgpu render read back
+ * and downsampled to the pane: `load_shader` + `load_source` (null paths => the
+ * built-in passthrough over a test pattern) kick the real render once the
+ * stream is up. File pickers that pass real `.slang`/image paths arrive later.
  */
 export function PreviewCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -71,6 +73,16 @@ export function PreviewCanvas() {
       width: PREVIEW_WIDTH,
       height: PREVIEW_HEIGHT,
     });
+
+    // Kick a real render: the built-in passthrough shader over the built-in
+    // test pattern (null paths). This replaces Phase 0's fake-gradient trigger;
+    // until these land the stream shows a solid "waiting" frame.
+    invoke("load_shader", { shaderPath: null }).catch((e) =>
+      console.error("load_shader failed", e),
+    );
+    invoke("load_source", { sourcePath: null }).catch((e) =>
+      console.error("load_source failed", e),
+    );
 
     return () => {
       cancelled = true;

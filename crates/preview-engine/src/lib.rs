@@ -11,10 +11,12 @@
 //! swaps in a wgpu-backed `FrameSource` without changing the `app` transport.
 
 pub mod frame;
+pub mod render_source;
 pub mod renderer;
 pub mod uniforms;
 
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
+pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
 pub use renderer::{Renderer, RendererError, OFFSCREEN_FORMAT};
 pub use uniforms::BuiltinUniforms;
 
