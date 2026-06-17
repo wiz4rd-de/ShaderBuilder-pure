@@ -18,9 +18,11 @@ gate.
 > with a working software GL** — `crt-geom`, `scanline`, and an NTSC preset match
 > RetroArch within calibrated thresholds (metrics in §3). They are `#[ignore]`d
 > opt-in suites (they need the external corpus clone and were calibrated on this
-> box's llvmpipe), so CI stays green without the corpus. What remains un-closed is
-> documented in §4: multi-pass `crt-royale` (a parser gap), feedback fidelity (a
-> known engine divergence), and ~30% of the corpus (the failure-mode worklist).
+> box's llvmpipe), so CI stays green without the corpus. `crt-geom`, `scanline`,
+> an NTSC preset, and (after the #32 `PassFeedbackSize0` fix) `feedback` match
+> RetroArch within calibrated thresholds (metrics in §3). What remains un-closed is
+> documented in §4: `crt-royale` now compiles + renders (after the #32 inlining
+> fix) but diverges in fidelity, and part of the corpus (the failure-mode worklist).
 
 ---
 
@@ -153,26 +155,34 @@ FUZZ_CORPUS_DIR=/path/to/slang-shaders FUZZ_CORPUS_MAX=300 ...
 
 ### Results on this box (curated categories, 246 presets)
 
-After the #32 fixes (push-constant→UBO + the cross-stage binding fix + packing
-builtins into both blocks), **171 / 246 (69.5 %)** import-and-render without error
-— up from **10 / 246 (4 %)** before #32. Per category:
+After the #32 `spirv-opt` function-inlining fix (§3.7), **211 / 246 (85.8 %)**
+import-and-render without error — up from **171 / 246 (69.5 %)** before inlining
+(itself up from **10 / 246 (4 %)** before #32's push-constant→UBO work). The +40
+presets are the formerly-rejected sampler-in-function shaders. Per category
+(rendered ok, before-inlining → after-inlining):
 
-| Category | total | rendered ok |
-| --- | --- | --- |
-| crt | 131 | 75 |
-| ntsc | 32 | 28 |
-| interpolation | 44 | 41 |
-| scanlines | 9 | 9 |
-| blurs | 17 | 8 |
-| denoisers | 7 | 6 |
-| sharpen | 6 | 4 |
+| Category | total | before | after |
+| --- | --- | --- | --- |
+| crt | 131 | 75 | 103 |
+| ntsc | 32 | 28 | 29 |
+| interpolation | 44 | 41 | 42 |
+| scanlines | 9 | 9 | 9 |
+| blurs | 17 | 8 | 17 |
+| denoisers | 7 | 6 | 6 |
+| sharpen | 6 | 4 | 5 |
 
-The remaining 75 fail in a small number of distinct ways — the **engine-gap
+The 38-strong "sampler passed to a function" failure category is now **entirely
+gone** from the grouped failure report; the 35 remaining failures are all other
+kinds (nested `#reference` presets with no `shaders` key, naga function/entry-point
+shapes, missing `#include` files, non-UTF-8 sources, one `float_framebuffer`
+parser edge case) — the worklist for future tickets.
+
+The remaining failures fall in a small number of distinct ways — the **engine-gap
 worklist for future tickets** (none crash the run; each is caught per preset):
 
 | Failures | Kind | Cause |
 | --- | --- | --- |
-| 38 | sampler passed to a function | `split_samplers` only rewrites an inline `OpLoad` of a `sampler2D` global; a shader that passes a combined sampler to a helper function is rejected (won't blindly rewrite). |
+| 38 → **0** | sampler passed to a function | **CLOSED (#32):** `spirv-opt --merge-return --inline-entry-points-exhaustive` inlines the helper into the entry point before `split_samplers`, so only the inline `OpLoad` form (which it handles) remains. |
 | 10 | `missing required preset key shaders` | `#reference`-style nested presets the parser doesn't follow. |
 | 6 | pipeline interface mismatch | a stage's varyings/bindings don't match across VS/FS as our pipeline expects. |
 | ~8 | naga `Function … is invalid` | naga rejects a SPIR-V function shape (`testPattern(vf2;`, `ratios(`, `slot(vf2;`, some `main`) — a front-end limitation. |
@@ -275,15 +285,51 @@ SLANG_SHADERS_DIR=/path/to/slang-shaders \
 | `crt/crt-geom.slangp` | **MATCH** (near-exact) | 4 / 0.001 | max_abs **2**, mean 0.001, 0 % over tol |
 | `scanlines/scanline.slangp` | **MATCH** | 16 / 0.02 | max_abs 12, mean 0.155, 0.01 % over tol 8 |
 | `ntsc/ntsc-256px-svideo-scanline.slangp` | **MATCH** | 24 / 0.05 | max_abs 53, mean 0.166, 0.73 % over tol 16 |
-| `test/feedback.slangp` | **DIVERGES** (no test) | — | our output accumulates to white (51→92→125→189→… per frame) where RA converges to the source. Suspected sRGB/gamma mismatch in the feedback read-back path: the previous-frame FBO is read without the inverse of the encode applied, amplifying each frame. A real engine bug — future ticket. |
-| `crt/crt-royale.slangp` | **NOT RENDERED** (no test) | — | `.slangp` parse fails on an inline `# …` comment after a value (`scale_y5 = "0.0625" # Safe for …`) and a quoted bool — a parser gap, not a render gap. |
-| `crt/crt-aperture.slangp` | **NOT RENDERED** (no test) | — | `split_samplers` rejects a combined sampler passed to a helper function (same gap as ~38 corpus presets). |
+| `test/feedback.slangp` | **MATCH** (converged) | 4 / 0.001 | max_abs **4**, mean 0.67, 0 % over tol 4 at frame 60 |
+| `crt/crt-royale.slangp` | **RENDERS, DIVERGES** (no test) | — | compiles all 12 passes + renders after the spirv-opt inlining fix, but max_abs **205**, mean 81.6, 85 % over tol 4 vs RA — our output is systematically brighter. Suspected: the sRGB-framebuffer (10/12 passes) gamma encode/decode and/or the mask-resize scale chain don't match RA's exact tonal response. A multi-feature fidelity gap — future ticket. |
 
 The near-exact `crt-geom` match is because BOTH renderers ran on llvmpipe
 (software): same rasterizer, same rounding. That such a non-trivial CRT shader
 (curvature, vignette, dot-mask, interlace, gamma) lands within `max_abs = 2` is
 strong evidence the engine's uniform packing, scaling, sampler attribution, and
 fragment math are faithful to RetroArch.
+
+### 3.6 feedback — the `PassFeedbackSize0` builtin fix (#32)
+
+`test/feedback.slang` is `FragColor = mix(current, prev, 0.8)` =
+`0.2*Source + 0.8*PassFeedback0`, whose fixed point is the source: after ~60
+frames the previous-frame term has decayed and the output equals the source up
+to 8-bit accumulation rounding. RetroArch converges to `source − ~2` and so does
+our engine — they agree within `max_abs 4`.
+
+Closing this required a **real engine fix**, not just frame alignment. The
+shader snaps its sample coordinate with `floor(PassFeedbackSize0.xy * vTexCoord)`,
+but our `BuiltinValues::member_bytes` never populated `PassFeedbackSize0`: the
+size-member parser accepted only the alias spelling `PassFeedback0Size`, while
+RetroArch's `slang_process.cpp` builds the name as `"PassFeedbackSize"` **then**
+appends the index → `PassFeedbackSize0` (Size BEFORE the number). With the member
+left zero the shader did `floor(0 · uv) = 0` and sampled texel (0,0) everywhere —
+the source's white corner — so every pixel converged to ~253 ("accumulated to
+white"), which is exactly the divergence the earlier report saw. The same
+off-by-spelling affected `PassOutputSizeN` and `OriginalHistorySizeN` (the corpus
+uses the `…SizeN` spelling exclusively). `parse_indexed_size` in
+`crates/preview-engine/src/uniforms.rs` now accepts BOTH spellings RetroArch
+emits/accepts.
+
+### 3.7 crt-royale — the sampler-in-function inlining fix (#32)
+
+crt-royale (and ~38 other corpus presets) factor sampling through GLSL helper
+functions that take a `sampler2D` parameter. glslang lowers those to an
+`OpFunctionCall` carrying the combined-sampler variable, which `split_samplers`
+(handling only an inline `OpLoad` of a `sampler2D` global) correctly refused to
+rewrite. `slang_compile::spirv_opt::inline_functions` now runs `spirv-opt
+--merge-return --inline-entry-points-exhaustive --eliminate-dead-functions` as the
+FIRST normalization step, folding every helper into the entry point so only the
+inline form remains. (`--merge-return` is required: the inliner skips functions
+with an early/multiple return, which crt-royale's mask-apply pass has.) It
+degrades to a no-op skip when `spirv-opt` is absent. With it, all 12 crt-royale
+passes compile and the preset renders — but it **diverges** from RetroArch (§3.5),
+so no passing reference is committed; the divergence is the documented finding.
 
 ---
 
@@ -293,14 +339,20 @@ fragment math are faithful to RetroArch.
   diff + visual artifact; the corpus fuzzer over local fixtures; the self-oracle
   goldens (multi-pass, feedback, LUT); the re-baseline flow.
 - **Automated + demonstrated here (opt-in `#[ignore]`, needs the corpus clone):**
-  - the **real corpus fuzz** over `slang-shaders` — 63 % of a curated 246-preset
-    slice import-and-render, up from 4 %, with the failure modes catalogued (§2);
-  - **real RetroArch references**: `crt-geom`, `scanline`, and an NTSC preset
-    match RetroArch within calibrated thresholds (§3.5).
+  - the **real corpus fuzz** over `slang-shaders` — a curated 246-preset slice,
+    further improved by #32's `spirv-opt` inlining unblocking the 38
+    sampler-in-function presets (§2);
+  - **real RetroArch references**: `crt-geom`, `scanline`, an NTSC preset, **and
+    `feedback`** match RetroArch within calibrated thresholds (§3.5/§3.6).
+- **Closed by #32:**
+  - **feedback fidelity** — was a real engine bug (the `PassFeedbackSize0` builtin
+    was never populated; §3.6). Now matches RetroArch (`max_abs 4`).
+  - **`crt-royale` parse + compile** — the inline-comment `.slangp` parser gap and
+    the sampler-in-function compile gap are both fixed; crt-royale now renders all
+    12 passes (§3.7).
 - **Still open (documented findings, NOT forced to pass):**
-  - **`crt-royale`** — blocked by a `.slangp` parser gap (inline comments after
-    values); fix the parser, then capture + calibrate.
-  - **feedback fidelity** — a real engine divergence (accumulation blows out;
-    suspected sRGB/gamma in the feedback read path).
-  - **~37 % of the corpus** — the §2 worklist (sampler-in-function, nested
-    `#reference` presets, naga function shapes, parser edge cases).
+  - **`crt-royale` fidelity** — renders but diverges from RetroArch (`max_abs 205`,
+    systematically brighter; suspected sRGB-framebuffer gamma / mask-resize scale
+    chain — §3.5). A multi-feature gap for a future ticket.
+  - **the remaining corpus worklist** — nested `#reference` presets, naga function
+    shapes, and the other §2 failure kinds.

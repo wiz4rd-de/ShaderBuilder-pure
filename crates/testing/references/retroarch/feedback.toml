@@ -1,0 +1,53 @@
+# RetroArch reference capture metadata (#32, PART B).
+#
+# This PNG is an ACTUAL RetroArch screenshot — NOT a self-oracle golden from our
+# own engine. It is the final shader-output framebuffer RetroArch rendered for the
+# preset below over the committed source image, captured headlessly. The
+# references.rs test renders the SAME preset through our engine and diffs against
+# this PNG to prove fidelity vs RetroArch (see docs/golden-image-harness.md).
+#
+# The `test/feedback.slang` shader is `mix(current, prev, 0.8)` =
+# `0.2*Source + 0.8*PassFeedback0`, whose fixed point is the source: after ~60
+# frames the previous-frame term has decayed (0.8^60 ≈ 1.8e-6) and the output
+# equals the source up to 8-bit accumulation rounding. BOTH RetroArch and our
+# engine converge to source - ~2 units (a uniform offset from repeated round-down),
+# so they agree to within max_abs 4.
+#
+# Closing this required a real engine fix (#32): the `PassFeedbackSize0` builtin
+# was not being populated, because the size-member parser only accepted the alias
+# spelling `PassFeedback0Size` while RetroArch's slang_process.cpp emits
+# `PassFeedbackSize0` (Size BEFORE the index). With the member left zero the shader
+# did `floor(0 * vTexCoord) = 0` and sampled texel (0,0) everywhere, "accumulating
+# to white". The same off-by-spelling affected PassOutputSizeN / OriginalHistorySizeN.
+
+preset = "test/feedback.slangp"
+corpus = "slang-shaders"
+corpus_commit = "74bf541845e65cca7f09b3c6b3baeeea8f52afb3"
+source = "references/src/testcard_320x240.png"
+viewport_width = 320
+viewport_height = 240
+# Converged frame. RetroArch was captured with --max-frames=60; our engine renders
+# at frame_index = 60 to match. At convergence the shader is frame-independent
+# (the 0.8^N feedback term has vanished), so the exact converged index is not
+# delicate — any index past ~30 yields the same image.
+frame_index = 60
+retroarch_version = "1.22.2 (Git 69a4f0ea1e)"
+retroarch_video_driver = "glcore"   # slang backend; the GL driver only does GLSL
+gpu = "llvmpipe (software, LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe)"
+core = "imageviewer (built from libretro/RetroArch cores/libretro-imageviewer)"
+
+# The appendconfig forced for a predictable, full-frame 1:1 geometry:
+#   video_driver = glcore, video_shader_enable = true, menu_driver = null,
+#   video_scale_integer = false, aspect_ratio_index = 23 (custom),
+#   custom_viewport_{width,height} = 320,240, video_smooth = false,
+#   video_threaded = false, video_vsync = false.
+# Capture command:
+#   retroarch -L imageviewer_libretro.so testcard_320x240.png \
+#     --appendconfig=fidelity_320.cfg --set-shader=<preset> \
+#     --max-frames=60 --max-frames-ss --max-frames-ss-path=<out>.png
+
+# Calibrated diff thresholds (per-channel tolerance / max fraction over it).
+# feedback converges essentially exactly here: observed max_abs=4, mean_abs=0.67,
+# 0% of pixels over tolerance 4 (engine vs RetroArch).
+diff_tolerance = 4
+diff_max_fraction = 0.001

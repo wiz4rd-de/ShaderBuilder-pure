@@ -15,15 +15,22 @@
 //! ## Only MATCHING shaders are listed here
 //!
 //! Per #32, a reference is committed + asserted ONLY for a shader that achieved a
-//! meaningful match. Shaders that diverge (e.g. the `feedback` preset's
-//! accumulation, see the doc) are documented as findings, NOT given a passing
-//! test. The matching trio captured on this box:
+//! meaningful match. Shaders that diverge are documented as findings, NOT given a
+//! passing test. The matching set captured on this box:
 //!
 //! | Reference | Preset | Calibrated tol / max_fraction | Observed (engine vs RA) |
 //! |---|---|---|---|
 //! | `crt-geom` | `crt/crt-geom.slangp` | 4 / 0.001 | max_abs 2, mean 0.001, 0% over tol 4 |
 //! | `scanline` | `scanlines/scanline.slangp` | 16 / 0.02 | max_abs 12, mean 0.155, 0.01% over tol 8 |
 //! | `ntsc-256px-svideo-scanline` | `ntsc/ntsc-256px-svideo-scanline.slangp` | 24 / 0.05 | max_abs 53, mean 0.166, 0.73% over tol 16 |
+//! | `feedback` | `test/feedback.slangp` | 4 / 0.001 | max_abs 4, mean 0.67, 0% over tol 4 (converged at frame 60) |
+//!
+//! `feedback` was closed by a real engine fix: the `PassFeedbackSize0` builtin was
+//! not populated (the size-member parser only accepted the `PassFeedback0Size`
+//! alias spelling, while RetroArch emits `PassFeedbackSize0` — Size before the
+//! index), so the shader sampled texel (0,0) everywhere and "accumulated to white"
+//! instead of converging to the source. See `crates/preview-engine/src/uniforms.rs`
+//! (`parse_indexed_size`) and the `feedback.toml` sidecar.
 //!
 //! The near-exact `crt-geom` match is because BOTH renderers ran on llvmpipe
 //! (software). The CRT/NTSC tolerances absorb the sub-pixel sampling/rounding
@@ -58,7 +65,12 @@ use testing::{diff_image, diff_images, render_preset_to_image};
 /// Each committed RetroArch reference under `references/retroarch/`. The `.slangp`
 /// path is resolved against the external `slang-shaders` clone; everything else
 /// (source, viewport, frame, thresholds) comes from the reference's sidecar.
-const REFERENCES: &[&str] = &["crt-geom", "scanline", "ntsc-256px-svideo-scanline"];
+const REFERENCES: &[&str] = &[
+    "crt-geom",
+    "scanline",
+    "ntsc-256px-svideo-scanline",
+    "feedback",
+];
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
