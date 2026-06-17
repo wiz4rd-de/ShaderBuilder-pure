@@ -44,6 +44,7 @@ pub fn run() {
             preview::stop_preview_stream,
             preview::load_source,
             preview::load_shader,
+            preview::load_preset,
             preview::set_viewport,
         ])
         .run(tauri::generate_context!())

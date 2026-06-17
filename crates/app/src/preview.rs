@@ -173,6 +173,95 @@ pub fn load_shader(
     state.send(RenderCommand::SetShader(compiled))
 }
 
+/// Load a multi-pass **`.slangp` preset** (#22). Parses the preset, compiles
+/// each pass's `.slang` (resolving `#include`s from its directory), maps the
+/// parsed scale config to the engine's, and sends the chain to the render
+/// thread. A parse/compile error is returned to the caller and the previous
+/// chain keeps running.
+#[tauri::command]
+pub fn load_preset(state: State<'_, PreviewState>, preset_path: String) -> Result<(), String> {
+    let preset = preset_io::parse_slangp(&preset_path).map_err(|e| e.to_string())?;
+    let passes = compile_preset_chain(&preset)?;
+    state.send(RenderCommand::SetChain(passes))
+}
+
+/// Compile every pass of a parsed preset into an engine [`preview_engine::Pass`],
+/// mapping the parsed scale config (per axis, with the §2 combined/override
+/// resolution) to the engine's. `None` scale keys are left as `None` so the
+/// engine applies the position-dependent default.
+fn compile_preset_chain(preset: &preset_io::Preset) -> Result<Vec<preview_engine::Pass>, String> {
+    let mut passes = Vec::with_capacity(preset.passes.len());
+    for p in &preset.passes {
+        let loaded = preset_io::load_slang_file(&p.shader).map_err(|e| e.to_string())?;
+        let compiled = slang_compile::compile_slang(&loaded.source, loaded.base_dir.as_deref())
+            .map_err(|e| e.to_string())?;
+        let mut pass = preview_engine::Pass::new(compiled);
+        if let Some(scale) = scale_config(p) {
+            pass = pass.with_scale(scale);
+        }
+        // Carry the parsed format/sampler hints onto the engine descriptor for
+        // the later tickets that consume them (#23/#24); harmless to #22.
+        if let Some(v) = p.srgb_framebuffer {
+            pass.srgb_framebuffer = v;
+        }
+        if let Some(v) = p.float_framebuffer {
+            pass.float_framebuffer = v;
+        }
+        if let Some(v) = p.filter_linear {
+            pass.filter_linear = v;
+        }
+        if let Some(v) = p.mipmap_input {
+            pass.mipmap_input = v;
+        }
+        passes.push(pass);
+    }
+    Ok(passes)
+}
+
+/// Map a parsed pass's per-axis scale to an engine [`preview_engine::ScaleConfig`],
+/// or `None` if the pass declares no scale keys (engine applies the §2 default).
+fn scale_config(p: &preset_io::Pass) -> Option<preview_engine::ScaleConfig> {
+    if !p.has_scale() {
+        return None;
+    }
+    Some(preview_engine::ScaleConfig {
+        x: axis_scale(p.scale_type_x(), p.scale_factor_x()),
+        y: axis_scale(p.scale_type_y(), p.scale_factor_y()),
+    })
+}
+
+/// Build one engine axis-scale from a parsed (type, factor) pair. A missing type
+/// or factor for one axis defaults to `source × 1.0` (§2: an axis with no keys
+/// falls back to `source` × `1.0`).
+fn axis_scale(ty: Option<preset_io::ScaleType>, factor: Option<f32>) -> preview_engine::AxisScale {
+    match (ty, factor) {
+        (Some(ty), Some(factor)) => preview_engine::AxisScale {
+            ty: map_scale_type(ty),
+            factor,
+        },
+        // An axis with a type but no factor, or vice versa, defaults the missing
+        // half: factor 1.0, or type source (§2).
+        (Some(ty), None) => preview_engine::AxisScale {
+            ty: map_scale_type(ty),
+            factor: 1.0,
+        },
+        (None, Some(factor)) => preview_engine::AxisScale {
+            ty: preview_engine::ScaleType::Source,
+            factor,
+        },
+        (None, None) => preview_engine::AxisScale::SOURCE_1X,
+    }
+}
+
+/// Convert the preset parser's scale-type enum to the engine's.
+fn map_scale_type(ty: preset_io::ScaleType) -> preview_engine::ScaleType {
+    match ty {
+        preset_io::ScaleType::Source => preview_engine::ScaleType::Source,
+        preset_io::ScaleType::Viewport => preview_engine::ScaleType::Viewport,
+        preset_io::ScaleType::Absolute => preview_engine::ScaleType::Absolute,
+    }
+}
+
 /// Resize the preview pane (and thus the offscreen target frames downsample to).
 #[tauri::command]
 pub fn set_viewport(state: State<'_, PreviewState>, width: u32, height: u32) -> Result<(), String> {
@@ -232,7 +321,55 @@ pub fn stop_preview_stream(state: State<'_, PreviewState>, stream_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use preview_engine::{GradientSource, FRAME_HEADER_LEN, FRAME_MAGIC};
+    use preview_engine::{
+        GradientSource, ScaleType as EngineScaleType, FRAME_HEADER_LEN, FRAME_MAGIC,
+    };
+
+    // ---- Preset → engine scale-config mapping (#22; no GPU needed). ----
+
+    /// Parse a one-pass preset body and map pass 0's scale to the engine config.
+    fn scale_of(extra_keys: &str) -> Option<preview_engine::ScaleConfig> {
+        let body = format!("shaders = 1\nshader0 = a.slang\n{extra_keys}");
+        let preset =
+            preset_io::parse_slangp_str(&body, std::path::Path::new("/p")).expect("preset parses");
+        scale_config(&preset.passes[0])
+    }
+
+    #[test]
+    fn no_scale_keys_map_to_none() {
+        // The engine then applies the §2 position default.
+        assert!(scale_of("").is_none());
+    }
+
+    #[test]
+    fn combined_scale_maps_both_axes() {
+        let s = scale_of("scale_type0 = source\nscale0 = 2.0\n").expect("has scale");
+        assert_eq!(s.x.ty, EngineScaleType::Source);
+        assert_eq!(s.x.factor, 2.0);
+        assert_eq!(s.y.ty, EngineScaleType::Source);
+        assert_eq!(s.y.factor, 2.0);
+    }
+
+    #[test]
+    fn per_axis_scale_maps_independently() {
+        let s = scale_of(
+            "scale_type_x0 = absolute\nscale_x0 = 320\nscale_type_y0 = viewport\nscale_y0 = 1.0\n",
+        )
+        .expect("has scale");
+        assert_eq!(s.x.ty, EngineScaleType::Absolute);
+        assert_eq!(s.x.factor, 320.0);
+        assert_eq!(s.y.ty, EngineScaleType::Viewport);
+        assert_eq!(s.y.factor, 1.0);
+    }
+
+    #[test]
+    fn one_axis_only_defaults_the_other_to_source_1x() {
+        // Only scale_x given -> Y defaults to source × 1.0 (§2).
+        let s = scale_of("scale_type_x0 = viewport\nscale_x0 = 1.0\n").expect("has scale");
+        assert_eq!(s.x.ty, EngineScaleType::Viewport);
+        assert_eq!(s.y.ty, EngineScaleType::Source);
+        assert_eq!(s.y.factor, 1.0);
+    }
 
     /// End-to-end transport check, no Tauri runtime: a `Channel` built from a
     /// collecting closure receives exactly the raw frames the producer sends.
