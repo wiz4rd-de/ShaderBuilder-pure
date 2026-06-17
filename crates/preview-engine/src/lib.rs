@@ -647,10 +647,6 @@ layout(set = 0, binding = 2) uniform sampler Smp;
         compile_slang(&format!("{PREAMBLE}{frag_body}"), None).expect("compile #23 fixture")
     }
 
-    fn passthrough() -> CompiledShader {
-        compile("void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }\n")
-    }
-
     /// Pass that ignores its input and writes a constant color (used to seed a
     /// known value into an intermediate FBO regardless of format).
     fn constant(rgba: [f32; 4]) -> CompiledShader {
@@ -728,29 +724,45 @@ layout(set = 0, binding = 2) uniform sampler Smp;
         );
     }
 
-    // ---- 1b. sRGB FBO round-trip: linear value survives encode+decode. ----
+    // ---- 1b. sRGB FBO actually selects the sRGB 8-bit format. ----
 
-    /// Pass 0 writes a known **linear** value into an sRGB FBO (HW encodes
-    /// linear->sRGB on store); pass 1 samples it (HW decodes sRGB->linear) into the
-    /// 8-bit *linear* offscreen. The two conversions are inverses, so pass 1 reads
-    /// back the original linear value — not a double-applied gamma.
-    #[test]
-    fn srgb_framebuffer_round_trips_linear_value() {
-        // 0.5 linear. Through an sRGB FBO (encode then decode) it must come back
-        // ~0.5 (~128). If sRGB were wrongly skipped on one side, 0.5 linear would
-        // read back as ~0.735 (~188, the sRGB-encoded value) or ~0.214 (~55).
-        let mut p0 = Pass::new(constant([0.5, 0.5, 0.5, 1.0])).with_scale(abs_scale(8.0, 8.0));
-        p0.srgb_framebuffer = true;
-        let out = render_chain(
-            &[p0, Pass::new(passthrough())],
+    /// Render the SAME non-midpoint linear value (0.2) through an sRGB-FBO
+    /// intermediate vs a plain-UNORM-FBO intermediate and assert the two read-backs
+    /// DIFFER (#23/G). An sRGB FBO stores the linear value *encoded* (8-bit), so it
+    /// quantizes onto a different bucket than a plain UNORM FBO; pass 1 then samples
+    /// (HW decodes sRGB->linear) into the linear offscreen. The 8-bit round-trip
+    /// difference is tiny on its own, so pass 1 **amplifies** the gap from 0.2 by
+    /// 20x to lift it well clear of GPU rounding (~6 bytes apart, reproducibly).
+    ///
+    /// This proves `fbo_format()` genuinely selects `Rgba8UnormSrgb` for the sRGB
+    /// pass: the OLD test wrote 0.5 (the one value where sRGB and UNORM round-trips
+    /// coincide at ~128) and so could not tell an sRGB FBO from a UNORM one.
+    fn srgb_vs_unorm_amplified(srgb: bool) -> u8 {
+        // Pass 1 amplifies the sampled value's deviation from 0.2 by 20x.
+        let amp = compile(
+            "void main() { float c = texture(sampler2D(Source, Smp), vTexCoord).r; FragColor = vec4(clamp((c - 0.2) * 20.0 + 0.5, 0.0, 1.0), 0.0, 0.0, 1.0); }\n",
+        );
+        let mut p0 = Pass::new(constant([0.2, 0.0, 0.0, 1.0])).with_scale(abs_scale(8.0, 8.0));
+        p0.srgb_framebuffer = srgb;
+        center(&render_chain(
+            &[p0, Pass::new(amp)],
             &solid(8, 8, [0, 0, 0, 255]),
             (8, 8),
-        );
-        let got = center(&out)[0];
+        ))[0]
+    }
+
+    #[test]
+    fn srgb_framebuffer_diverges_from_unorm_at_non_midpoint() {
+        let srgb = srgb_vs_unorm_amplified(true) as i32;
+        let unorm = srgb_vs_unorm_amplified(false) as i32;
+        // The plain UNORM FBO stores 0.2 exactly (51) -> amplified value is ~127.
+        // The sRGB FBO stores the *encoded* 0.2 and decodes to a slightly different
+        // linear value -> amplified value lands clearly apart (~6 bytes). If both
+        // were UNORM (the bug this guards) the two would be identical.
         assert!(
-            (got as i32 - 128).abs() <= 12,
-            "sRGB round-trip of linear 0.5 should read ~128, got {got} \
-             (a value ~188 or ~55 would mean the linear<->sRGB conversion is wrong)"
+            (srgb - unorm).abs() >= 3,
+            "sRGB FBO must store/round-trip differently from a plain UNORM FBO \
+             (proving Rgba8UnormSrgb is actually selected); got srgb={srgb} unorm={unorm}"
         );
     }
 
