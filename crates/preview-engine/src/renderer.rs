@@ -1741,42 +1741,49 @@ impl Renderer {
                 None => viewport,
             };
 
-            // No builtin block declared -> nothing to pack (the fallback vec4 UBO
-            // stays zero), but still advance the running sizes. A block mixing
-            // builtins + `#pragma parameter`s packs both here: builtins first
-            // (offset-by-name), then the current param values overlaid at their
-            // own offsets — one unified path (#29).
+            // The builtin semantic values for this pass, shared by every uniform
+            // block (a shader may split builtins and parameters across two blocks —
+            // e.g. RetroArch's `UBO{MVP,…Size}` + `Push{FrameCount,params}` (#32),
+            // where the push block is rewritten to a UBO by `push_to_ubo`). Packing
+            // builtins THEN params into *each* block is the correct, layout-driven
+            // behavior: `pack_builtins` writes only recognized semantics at their
+            // reflected offsets, `pack_params` writes only `#pragma parameter`
+            // values (skipping builtin-named members), so a member always receives
+            // its own value regardless of which block carries it.
+            let values = BuiltinValues {
+                mvp: uniforms::ortho_mvp(),
+                source_size: uniforms::size_vec(input_size.0, input_size.1),
+                original_size: uniforms::size_vec(original.0, original.1),
+                output_size: uniforms::size_vec(output_size.0, output_size.1),
+                final_viewport_size: uniforms::size_vec(viewport.0, viewport.1),
+                frame_count: uniforms::apply_frame_count_mod(self.frame_count, res.frame_count_mod),
+                frame_direction: self.frame_direction,
+                rotation: 0,
+                pass_output_sizes: pass_output_sizes.clone(),
+                alias_sizes: alias_sizes.clone(),
+                pass_feedback_sizes: all_output_sizes.clone(),
+                alias_feedback_sizes: alias_feedback_sizes.clone(),
+                original_history_sizes: original_history_sizes.clone(),
+                lut_sizes: lut_sizes.clone(),
+            };
+
+            // Block A: the block carrying recognizable builtin semantics
+            // (`MVP`/`*Size`/`FrameCount`). No builtin block declared -> the
+            // fallback vec4 UBO stays zero, but the running sizes still advance.
             if let Some(block) = &res.builtin_block {
-                let values = BuiltinValues {
-                    mvp: uniforms::ortho_mvp(),
-                    source_size: uniforms::size_vec(input_size.0, input_size.1),
-                    original_size: uniforms::size_vec(original.0, original.1),
-                    output_size: uniforms::size_vec(output_size.0, output_size.1),
-                    final_viewport_size: uniforms::size_vec(viewport.0, viewport.1),
-                    frame_count: uniforms::apply_frame_count_mod(
-                        self.frame_count,
-                        res.frame_count_mod,
-                    ),
-                    frame_direction: self.frame_direction,
-                    rotation: 0,
-                    pass_output_sizes: pass_output_sizes.clone(),
-                    alias_sizes: alias_sizes.clone(),
-                    pass_feedback_sizes: all_output_sizes.clone(),
-                    alias_feedback_sizes: alias_feedback_sizes.clone(),
-                    original_history_sizes: original_history_sizes.clone(),
-                    lut_sizes: lut_sizes.clone(),
-                };
                 let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);
                 self.queue.write_buffer(&res.ubo, 0, &bytes);
             }
 
-            // The dedicated parameter block (binding 3): pack the current global
-            // values at their reflected offsets and re-upload (#29). Re-done every
-            // frame so a live `set_parameter` reaches the shader without a
-            // recompile. A zero-filled buffer when the pass has no param block.
+            // Block B: the second reflected block. Historically the dedicated
+            // `Params` UBO (binding 3), but for the standard RetroArch layout it is
+            // the former push-constant block, which ALSO holds builtins
+            // (`FrameCount`) alongside the parameters — so it gets the SAME
+            // builtins-then-params packing, not params alone. Re-done every frame so
+            // a live `set_parameter` reaches the shader without a recompile.
             if let Some(block) = &res.param_block {
-                let mut bytes = vec![0u8; block.size as usize];
+                let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);
                 self.queue.write_buffer(&res.param_buffer, 0, &bytes);
             }

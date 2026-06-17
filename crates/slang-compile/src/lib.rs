@@ -10,6 +10,7 @@
 pub mod cache;
 mod glslang;
 pub mod preprocess;
+pub mod push_to_ubo;
 pub mod reflect;
 pub mod split_samplers;
 
@@ -18,6 +19,7 @@ use std::path::Path;
 pub use core_model::Parameter;
 pub use glslang::{Diagnostic, GlslangError};
 pub use preprocess::{PreprocessError, Preprocessed, Reflection, Stage};
+pub use push_to_ubo::PushToUboError;
 pub use reflect::{
     reflect, BlockBinding, MemberKind, ReflectError, ResourceBinding, ScalarType, SpirvReflection,
     UniformBlock, UniformMember,
@@ -55,6 +57,14 @@ pub enum CompileError {
         /// The underlying split error.
         source: SplitError,
     },
+    /// The push-constant → UBO SPIR-V transform failed (unparseable SPIR-V — see
+    /// [`PushToUboError`]). Carries which stage hit it.
+    PushToUbo {
+        /// Which stage's SPIR-V failed to transform.
+        stage: Stage,
+        /// The underlying rewrite error.
+        source: PushToUboError,
+    },
 }
 
 impl From<PreprocessError> for CompileError {
@@ -77,6 +87,9 @@ impl std::fmt::Display for CompileError {
             CompileError::SplitSamplers { stage, source } => {
                 write!(f, "{stage:?} stage sampler split failed: {source}")
             }
+            CompileError::PushToUbo { stage, source } => {
+                write!(f, "{stage:?} stage push-constant rewrite failed: {source}")
+            }
         }
     }
 }
@@ -97,14 +110,34 @@ pub fn compile_slang(
 
 /// Compile already-preprocessed per-stage GLSL. Shared by [`compile_slang`] and
 /// the cache (which preprocesses once to form its key).
+///
+/// Both stages are compiled to SPIR-V, then normalized into the binding model the
+/// engine speaks (two SPIR-V→SPIR-V transforms):
+///
+/// 1. **push-constant → UBO** (#32): real slang shaders put their parameter block
+///    in a Vulkan `push_constant`, which wgpu/naga reject as the unsupported
+///    `IMMEDIATES` capability. The block is rewritten to an ordinary UBO at a
+///    binding chosen to be free across **both** stages (so the same block lands at
+///    the same binding in each stage — otherwise reflection sees it at two
+///    bindings, one colliding with a texture; see [`push_to_ubo`]).
+/// 2. **combined → separate samplers** (`split_samplers`): glslang emits
+///    `sampler2D` as a combined `OpTypeSampledImage` that naga cannot parse; it is
+///    split into the separate image + sampler form wgpu requires.
+///
+/// Both transforms are no-ops on SPIR-V that doesn't use the respective construct
+/// (the hand-written UBO / separate-sampler fixtures pass through verbatim). Each
+/// error is tagged with the failing stage.
 pub(crate) fn compile_preprocessed(pre: &Preprocessed) -> Result<CompiledShader, CompileError> {
-    // glslang emits Vulkan-GLSL `sampler2D` as a *combined* `OpTypeSampledImage`,
-    // which neither our naga-based reflection nor wgpu's naga ingestion can parse.
-    // Normalize each stage's SPIR-V into the *separate* image + sampler form the
-    // engine speaks (a no-op for shaders that already use `texture2D`+`sampler`)
-    // before anything downstream sees it. See [`split_samplers`].
-    let vertex_spirv = split_stage(Stage::Vertex, &pre.vertex)?;
-    let fragment_spirv = split_stage(Stage::Fragment, &pre.fragment)?;
+    let raw_vertex = glslang::compile_stage(Stage::Vertex, &pre.vertex)?;
+    let raw_fragment = glslang::compile_stage(Stage::Fragment, &pre.fragment)?;
+
+    // Pick ONE binding for the push-constant-turned-UBO that is free in BOTH
+    // stages, so the rewritten block is bound consistently (a per-stage choice
+    // would clash with a fragment-only texture — #32 corpus finding).
+    let push_binding = push_to_ubo::free_binding_across(&[&raw_vertex, &raw_fragment]);
+
+    let vertex_spirv = normalize_stage(Stage::Vertex, raw_vertex, push_binding)?;
+    let fragment_spirv = normalize_stage(Stage::Fragment, raw_fragment, push_binding)?;
     Ok(CompiledShader {
         vertex_spirv,
         fragment_spirv,
@@ -112,10 +145,17 @@ pub(crate) fn compile_preprocessed(pre: &Preprocessed) -> Result<CompiledShader,
     })
 }
 
-/// Compile one stage to SPIR-V, then split its combined image-samplers into the
-/// separate form. Tagging the [`SplitError`] with the failing stage.
-fn split_stage(stage: Stage, source: &str) -> Result<Vec<u32>, CompileError> {
-    let spirv = glslang::compile_stage(stage, source)?;
+/// Apply the push-constant→UBO and combined-sampler→separate transforms to one
+/// stage's raw glslang SPIR-V, tagging each error with the failing stage. The
+/// push rewrite runs first (so the sampler split and the final reflection see the
+/// normalized form), using the caller-chosen cross-stage `push_binding`.
+fn normalize_stage(
+    stage: Stage,
+    spirv: Vec<u32>,
+    push_binding: u32,
+) -> Result<Vec<u32>, CompileError> {
+    let spirv = push_to_ubo::push_constant_to_ubo(&spirv, push_binding)
+        .map_err(|source| CompileError::PushToUbo { stage, source })?;
     split_samplers::split_combined_samplers(&spirv)
         .map_err(|source| CompileError::SplitSamplers { stage, source })
 }
