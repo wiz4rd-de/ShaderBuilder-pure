@@ -68,6 +68,7 @@ dependencies = [
  "source",
  "tauri",
  "tauri-build",
+ "tempfile",
 ]
 
 [[package]]

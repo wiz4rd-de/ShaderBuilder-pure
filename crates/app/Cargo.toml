@@ -33,3 +33,7 @@ slang-compile = { workspace = true }
 preview-engine = { workspace = true }
 source = { workspace = true }
 preset-io = { workspace = true }
+
+[dev-dependencies]
+# Throwaway dirs for the `export_preset` command test (#36).
+tempfile = { workspace = true }

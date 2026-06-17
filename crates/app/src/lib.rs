@@ -8,6 +8,7 @@
 //! wgpu renderer behind the same [`preview_engine::FrameSource`] seam **without
 //! touching this transport**.
 
+mod export;
 mod preview;
 mod project;
 
@@ -56,6 +57,7 @@ pub fn run() {
             preview::step,
             preview::seek,
             preview::set_fps,
+            export::export_preset,
             project::save_project,
             project::load_project,
         ])
