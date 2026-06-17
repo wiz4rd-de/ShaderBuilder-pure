@@ -37,14 +37,20 @@
 //!   metric) and [`diff::diff_image`] (the amplified visual diff artifact).
 //! * [`fuzz`] — [`fuzz::fuzz_presets`] / [`fuzz::PresetResult`]: walk a directory
 //!   of `.slangp` and import-and-render each, catching errors per preset.
+//! * [`roundtrip`] — [`roundtrip::round_trip`] / [`roundtrip::compare_projects`]:
+//!   the lossless import → export → re-import harness (#37, Phase-3 EXIT gate),
+//!   with a canonicalized structural [`roundtrip::ProjectDiff`] and a readable
+//!   diff report on any divergence.
 
 pub mod diff;
 pub mod fuzz;
 pub mod render;
+pub mod roundtrip;
 
 pub use diff::{diff_image, diff_images, DiffReport};
 pub use fuzz::{fuzz_presets, PresetResult};
 pub use render::{render_preset_to_image, HarnessError};
+pub use roundtrip::{compare_projects, round_trip, ProjectDiff, RoundTrip, RoundTripError};
 
 /// Crate identity marker (kept consistent with the other workspace crates' smoke
 /// tests so the dependency edges stay live).

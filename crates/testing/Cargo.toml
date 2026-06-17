@@ -17,10 +17,10 @@ preset-io = { workspace = true }
 slang-compile = { workspace = true }
 source = { workspace = true }
 image = { workspace = true }
+# `core-model` is in the public surface of the round-trip harness (#37):
+# `compare_projects` / `RoundTrip` take and return `core_model::Project`.
+core-model = { workspace = true }
 
 [dev-dependencies]
-# `tempfile` backs the fuzzer's directory-walk unit tests.
+# `tempfile` backs the fuzzer's directory-walk + round-trip tests.
 tempfile = { workspace = true }
-# `core-model` is used by the #35 import test to assert the project model
-# (parameters + LUT sampler settings) the importer produces.
-core-model = { workspace = true }
