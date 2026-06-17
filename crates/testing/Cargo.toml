@@ -21,3 +21,6 @@ image = { workspace = true }
 [dev-dependencies]
 # `tempfile` backs the fuzzer's directory-walk unit tests.
 tempfile = { workspace = true }
+# `core-model` is used by the #35 import test to assert the project model
+# (parameters + LUT sampler settings) the importer produces.
+core-model = { workspace = true }
