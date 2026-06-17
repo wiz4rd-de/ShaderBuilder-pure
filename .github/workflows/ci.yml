@@ -71,6 +71,10 @@ jobs:
       # Tauri v2 Linux system dependencies (WebKitGTK 4.1 + friends) so the
       # `app` crate links, plus the toolchain the GPU/compile tests need:
       #   * glslang-tools — provides `glslangValidator`, the slang-compile backend;
+      #   * spirv-tools — provides `spirv-opt` (the function-inlining pass #32 runs
+      #     before split_samplers so sampler-in-helper-function shaders compile) and
+      #     `spirv-val` (the split_samplers validation test). Without it, inlining
+      #     degrades to a skip and crt-royale + ~38 corpus presets stop compiling;
       #   * mesa-vulkan-drivers — the lavapipe software Vulkan ICD wgpu renders on;
       #   * vulkan-tools — `vulkaninfo` for debugging adapter selection in logs.
       - name: Install Tauri system dependencies
@@ -84,6 +88,7 @@ jobs:
             libsoup-3.0-dev \
             build-essential \
             glslang-tools \
+            spirv-tools \
             mesa-vulkan-drivers \
             vulkan-tools
 

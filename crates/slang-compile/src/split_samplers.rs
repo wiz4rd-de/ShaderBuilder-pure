@@ -1054,14 +1054,22 @@ void main() { FragColor = texture(Source, vTexCoord); }
         let _ = has_sampled_image_type;
     }
 
-    /// #32 review finding 1: a combined sampler passed to a GLSL function (glslang
-    /// passes the variable POINTER as an `OpFunctionCall` arg, never loading it in
-    /// the caller) must be REJECTED with a clear error — not silently rewritten into
-    /// corrupt SPIR-V (a caller/callee type mismatch that only fails far downstream).
+    /// #32: a combined sampler passed to a GLSL helper function (glslang passes the
+    /// variable POINTER as an `OpFunctionCall` arg, never loading it in the caller)
+    /// is now UNBLOCKED by the `spirv-opt` function-inlining pass that runs before
+    /// `split_samplers` (see [`crate::spirv_opt`]): inlining folds the helper into
+    /// the entry point so only the inline `OpLoad` form survives, which this
+    /// transform handles — and the shader compiles.
+    ///
+    /// This was previously asserted to be *rejected* (the gap #32 closed). The
+    /// rejection path in [`validate_combined_var_uses`] still exists as a defensive
+    /// guarantee — it just no longer fires for this shape once inlining has run.
+    /// When `spirv-opt` is absent the inlining degrades to a skip and this shader
+    /// would again be rejected; we therefore only assert the unblocked outcome when
+    /// `spirv-opt` is available (the corpus/CI condition).
     #[test]
-    fn combined_sampler_passed_to_function_is_rejected() {
-        let err = crate::compile_slang(
-            "\
+    fn combined_sampler_passed_to_function_is_inlined_and_compiles() {
+        let src = "\
 #version 450
 layout(set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
 #pragma stage vertex
@@ -1073,20 +1081,41 @@ layout(location = 0) out vec4 FragColor;
 layout(set = 0, binding = 1) uniform sampler2D Source;
 vec4 doit(sampler2D s, vec2 uv) { return texture(s, uv); }
 void main() { FragColor = doit(Source, vTexCoord); }
-",
-            None,
+";
+        let spirv_opt_present = std::process::Command::new(
+            std::env::var("SPIRV_OPT").unwrap_or_else(|_| "spirv-opt".to_string()),
         )
-        .expect_err("a combined sampler passed to a function must be rejected");
-        assert!(
-            matches!(
-                err,
-                crate::CompileError::SplitSamplers {
-                    source: SplitError::UnsupportedDeclaration(_),
-                    ..
-                }
-            ),
-            "expected SplitSamplers/UnsupportedDeclaration, got {err:?}"
-        );
+        .arg("--version")
+        .output()
+        .is_ok();
+
+        match crate::compile_slang(src, None) {
+            Ok(shader) => {
+                assert!(!shader.fragment_spirv.is_empty());
+                // After inlining there must be no combined sampler left to split.
+                let again = split_combined_samplers(&shader.fragment_spirv)
+                    .expect("re-split the inlined output");
+                assert_eq!(again, shader.fragment_spirv, "output is fully split");
+            }
+            Err(err) => {
+                assert!(
+                    !spirv_opt_present,
+                    "with spirv-opt present the sampler-in-function shader must compile, \
+                     got {err:?}"
+                );
+                // Without spirv-opt, the documented fall-through is the clear reject.
+                assert!(
+                    matches!(
+                        err,
+                        crate::CompileError::SplitSamplers {
+                            source: SplitError::UnsupportedDeclaration(_),
+                            ..
+                        }
+                    ),
+                    "without spirv-opt expected SplitSamplers/UnsupportedDeclaration, got {err:?}"
+                );
+            }
+        }
     }
 
     /// #32 review finding 2: an array of combined samplers (`sampler2D Tex[2]`) must

@@ -12,6 +12,7 @@ mod glslang;
 pub mod preprocess;
 pub mod push_to_ubo;
 pub mod reflect;
+pub mod spirv_opt;
 pub mod split_samplers;
 
 use std::path::Path;
@@ -24,6 +25,7 @@ pub use reflect::{
     reflect, BlockBinding, MemberKind, ReflectError, ResourceBinding, ScalarType, SpirvReflection,
     UniformBlock, UniformMember,
 };
+pub use spirv_opt::SpirvOptError;
 pub use split_samplers::SplitError;
 
 /// Crate identity marker (kept from the Phase 0 scaffold so dependent crates'
@@ -65,6 +67,15 @@ pub enum CompileError {
         /// The underlying rewrite error.
         source: PushToUboError,
     },
+    /// `spirv-opt` function-inlining (#32) ran but failed for a stage. A *missing*
+    /// `spirv-opt` binary is NOT this error — inlining degrades to a skip (see
+    /// [`spirv_opt::inline_functions`]); this is only a binary that ran and failed.
+    SpirvOpt {
+        /// Which stage's SPIR-V failed to inline.
+        stage: Stage,
+        /// The underlying optimizer error.
+        source: SpirvOptError,
+    },
 }
 
 impl From<PreprocessError> for CompileError {
@@ -90,6 +101,9 @@ impl std::fmt::Display for CompileError {
             CompileError::PushToUbo { stage, source } => {
                 write!(f, "{stage:?} stage push-constant rewrite failed: {source}")
             }
+            CompileError::SpirvOpt { stage, source } => {
+                write!(f, "{stage:?} stage spirv-opt inlining failed: {source}")
+            }
         }
     }
 }
@@ -112,21 +126,28 @@ pub fn compile_slang(
 /// the cache (which preprocesses once to form its key).
 ///
 /// Both stages are compiled to SPIR-V, then normalized into the binding model the
-/// engine speaks (two SPIR-V→SPIR-V transforms):
+/// engine speaks (three SPIR-V→SPIR-V transforms, applied per stage by
+/// [`normalize_stage`]):
 ///
-/// 1. **push-constant → UBO** (#32): real slang shaders put their parameter block
+/// 1. **spirv-opt function inlining** (#32): inline every helper function into the
+///    entry point so no `OpFunctionCall` carries a combined sampler — without this,
+///    `split_samplers` rejects the ~38 corpus presets (crt-royale included) that
+///    factor sampling through a `sampler2D`-taking helper. Degrades to a no-op skip
+///    when `spirv-opt` is absent (see [`spirv_opt`]).
+/// 2. **push-constant → UBO** (#32): real slang shaders put their parameter block
 ///    in a Vulkan `push_constant`, which wgpu/naga reject as the unsupported
 ///    `IMMEDIATES` capability. The block is rewritten to an ordinary UBO at a
 ///    binding chosen to be free across **both** stages (so the same block lands at
 ///    the same binding in each stage — otherwise reflection sees it at two
 ///    bindings, one colliding with a texture; see [`push_to_ubo`]).
-/// 2. **combined → separate samplers** (`split_samplers`): glslang emits
+/// 3. **combined → separate samplers** (`split_samplers`): glslang emits
 ///    `sampler2D` as a combined `OpTypeSampledImage` that naga cannot parse; it is
 ///    split into the separate image + sampler form wgpu requires.
 ///
-/// Both transforms are no-ops on SPIR-V that doesn't use the respective construct
-/// (the hand-written UBO / separate-sampler fixtures pass through verbatim). Each
-/// error is tagged with the failing stage.
+/// All three are no-ops on SPIR-V that doesn't use the respective construct (the
+/// hand-written UBO / separate-sampler fixtures pass through unchanged in behavior;
+/// inlining a function-free shader changes nothing it does). Each error is tagged
+/// with the failing stage.
 pub(crate) fn compile_preprocessed(pre: &Preprocessed) -> Result<CompiledShader, CompileError> {
     let raw_vertex = glslang::compile_stage(Stage::Vertex, &pre.vertex)?;
     let raw_fragment = glslang::compile_stage(Stage::Fragment, &pre.fragment)?;
@@ -145,15 +166,25 @@ pub(crate) fn compile_preprocessed(pre: &Preprocessed) -> Result<CompiledShader,
     })
 }
 
-/// Apply the push-constant→UBO and combined-sampler→separate transforms to one
-/// stage's raw glslang SPIR-V, tagging each error with the failing stage. The
-/// push rewrite runs first (so the sampler split and the final reflection see the
-/// normalized form), using the caller-chosen cross-stage `push_binding`.
+/// Apply the SPIR-V normalization transforms to one stage's raw glslang SPIR-V,
+/// tagging each error with the failing stage. The order is load-bearing:
+///
+/// 1. **spirv-opt function inlining** (#32) FIRST — inline every helper function
+///    into the entry point so no `OpFunctionCall` survives carrying a combined
+///    sampler. This must precede `split_samplers`, which only handles an inline
+///    `OpLoad` of a `sampler2D` global and would otherwise reject a function-sampler
+///    shader (crt-royale and ~38 corpus presets). Degrades to a no-op skip when
+///    `spirv-opt` is absent (see [`spirv_opt::inline_functions`]).
+/// 2. **push-constant → UBO** — so the sampler split and final reflection see the
+///    normalized form, using the caller-chosen cross-stage `push_binding`.
+/// 3. **combined → separate samplers** — the inline form is now all that remains.
 fn normalize_stage(
     stage: Stage,
     spirv: Vec<u32>,
     push_binding: u32,
 ) -> Result<Vec<u32>, CompileError> {
+    let spirv = spirv_opt::inline_functions(stage, &spirv)
+        .map_err(|source| CompileError::SpirvOpt { stage, source })?;
     let spirv = push_to_ubo::push_constant_to_ubo(&spirv, push_binding)
         .map_err(|source| CompileError::PushToUbo { stage, source })?;
     split_samplers::split_combined_samplers(&spirv)
