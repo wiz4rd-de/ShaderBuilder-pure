@@ -392,6 +392,11 @@ pub struct BuiltinValues {
     /// is pass `k`'s output `[w,h,1/w,1/h]`, available to pass `i` for `k < i`
     /// (causal — §7). Backs both spellings `PassOutputKSize` and `PassKSize`.
     pub pass_output_sizes: Vec<[f32; 4]>,
+    /// Aliased passes' output sizes by alias name (#26): `alias_sizes["FOO"]` is
+    /// the `[w,h,1/w,1/h]` of the pass whose preset `aliasN == FOO`, available to
+    /// a later pass as the `FOOSize` builtin (§6/§7). Only causally-available
+    /// aliases are present; an absent alias leaves `<alias>Size` zero.
+    pub alias_sizes: std::collections::HashMap<String, [f32; 4]>,
 }
 
 impl Default for BuiltinValues {
@@ -406,6 +411,7 @@ impl Default for BuiltinValues {
             frame_direction: 1,
             rotation: 0,
             pass_output_sizes: Vec::new(),
+            alias_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -432,6 +438,15 @@ impl BuiltinValues {
             "FrameDirection" => Some(self.frame_direction.to_le_bytes().to_vec()),
             "Rotation" => Some(self.rotation.to_le_bytes().to_vec()),
             _ => {
+                // `<alias>Size` (#26): the aliased pass's output size, if that
+                // alias is causally available this pass. Checked before the
+                // PassK fallback so an alias spelled like `Pass…` can't be
+                // misread (aliases are author-chosen identifiers).
+                if let Some(base) = name.strip_suffix("Size") {
+                    if let Some(v) = self.alias_sizes.get(base) {
+                        return vec4(v);
+                    }
+                }
                 // `PassOutputKSize` (and the `PassKSize` alias) — pass K's output
                 // size, K < this pass (causal). Anything else is unknown here.
                 let idx = parse_pass_size_index(name)?;
@@ -736,6 +751,23 @@ mod tests {
         // A PassNSize past the known passes stays zero (causal / not-yet-run).
         let blk2 = block(16, vec![member("Pass5Size", 0, 16, vec4_kind())]);
         assert_eq!(pack_builtins(&blk2, &values), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn member_bytes_resolves_alias_size() {
+        // `<alias>Size` resolves to the aliased pass's output size (#26); an
+        // un-recorded alias leaves the member zero (returns None).
+        let mut alias_sizes = std::collections::HashMap::new();
+        alias_sizes.insert("FOO".to_string(), size_vec(100, 60));
+        let values = BuiltinValues {
+            alias_sizes,
+            ..Default::default()
+        };
+        let bytes = values.member_bytes("FOOSize").expect("FOOSize resolves");
+        let got = f32x4(&bytes, 0);
+        assert_eq!(got, size_vec(100, 60));
+        // An alias the chain didn't record stays unknown.
+        assert!(values.member_bytes("BARSize").is_none());
     }
 
     #[test]

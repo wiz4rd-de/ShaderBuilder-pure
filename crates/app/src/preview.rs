@@ -221,6 +221,9 @@ fn compile_preset_chain(preset: &preset_io::Preset) -> Result<Vec<preview_engine
         if let Some(scale) = scale_config(p) {
             pass = pass.with_scale(scale);
         }
+        // Carry the preset `aliasN` onto the engine descriptor (#26) so a later
+        // pass sampling `<alias>` / reading `<alias>Size` binds this pass's output.
+        pass.alias = p.alias.clone();
         // Carry the parsed format/sampler hints onto the engine descriptor (#23).
         // An absent key keeps the engine default (linear filter, clamp_to_border
         // wrap, no srgb/float/mipmap — §3 v1 choices).

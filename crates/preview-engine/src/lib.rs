@@ -1485,3 +1485,353 @@ layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; vec4 Pass0Size; }}
         );
     }
 }
+
+#[cfg(test)]
+mod bindtable_tests {
+    //! Reflection-driven texture bind-table tests (#26): `Original` vs `Source`
+    //! bound to distinct textures, `PassOutputN`/`PassN` direct sampling, pass
+    //! aliases (`<alias>` + `<alias>Size`), a non-default / multi-texture reflected
+    //! layout, and the "K+1" sampler-attribution rule. All run on the real GPU.
+    use super::{Pass, Renderer};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    /// Vertex stage + builtin UBO shared by these fixtures. The fragment body is
+    /// appended per test; it declares its own texture/sampler bindings.
+    const HEAD: &str = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat4 MVP;
+    vec4 SourceSize;
+    vec4 OriginalSize;
+    vec4 OutputSize;
+    uint FrameCount;
+} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+";
+
+    fn compile(frag: &str) -> CompiledShader {
+        compile_slang(&format!("{HEAD}{frag}"), None).expect("compile #26 fixture")
+    }
+
+    /// A passthrough sampling `Source` (the standard separate tex/sampler form).
+    fn passthrough() -> CompiledShader {
+        compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }
+",
+        )
+    }
+
+    fn invert() -> CompiledShader {
+        compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+void main() { vec4 c = texture(sampler2D(Source, Smp), vTexCoord); FragColor = vec4(vec3(1.0)-c.rgb, c.a); }
+",
+        )
+    }
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&rgba);
+        }
+        Frame::new(width, height, data)
+    }
+
+    fn close(a: &[u8], b: &[u8]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 3)
+    }
+
+    fn render_chain(passes: &[Pass], frame: &Frame, out: (u32, u32)) -> Frame {
+        let mut r = Renderer::new(out.0, out.1).expect("wgpu device");
+        r.set_source(frame);
+        r.set_chain(passes).expect("set chain");
+        r.render().expect("render");
+        r.read_back().expect("read back")
+    }
+
+    fn center(f: &Frame) -> [u8; 4] {
+        let i = (((f.height / 2) * f.width + f.width / 2) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2], f.rgba[i + 3]]
+    }
+
+    // ---- 1. Original and Source are bound to DISTINCT textures. ----
+
+    /// Pass 1 inverts the source. Pass 2 samples BOTH `Source` (pass 1's inverted
+    /// output) and `Original` (the unmodified source) and outputs `Original -
+    /// Source`. For an input value `v`, Source = `1-v`, so the result is
+    /// `v - (1-v) = 2v-1`. If Original and Source were bound to the SAME texture
+    /// the result would be `0`. Proves they resolve to different textures.
+    #[test]
+    fn original_and_source_are_distinct_textures() {
+        let combine = compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+layout(set=0, binding=4) uniform texture2D Original;
+layout(set=0, binding=5) uniform sampler OrigSmp;
+void main() {
+    vec3 s = texture(sampler2D(Source, Smp), vTexCoord).rgb;
+    vec3 o = texture(sampler2D(Original, OrigSmp), vTexCoord).rgb;
+    FragColor = vec4(o - s, 1.0);
+}
+",
+        );
+        // Source value 200/255 ≈ 0.784; expected 2*0.784-1 = 0.569 ≈ 145.
+        let input = solid(4, 4, [200, 200, 200, 255]);
+        let out = render_chain(&[Pass::new(invert()), Pass::new(combine)], &input, (4, 4));
+        let c = center(&out);
+        assert!(
+            (c[0] as i32 - 145).abs() <= 6,
+            "Original-Source should be 2v-1 (~145) with distinct textures, got {c:?}"
+        );
+        // If both were the same texture the channel would be ~0 — explicitly reject.
+        assert!(
+            c[0] > 60,
+            "Original and Source must NOT be the same texture"
+        );
+    }
+
+    // ---- 2. PassOutputN / PassN sample an earlier pass directly. ----
+
+    /// A 3-pass chain. Pass 0 outputs RED, pass 1 outputs GREEN, pass 2 samples
+    /// `PassOutput0` and must read pass 0's RED — not pass 1's GREEN (its direct
+    /// Source). Spelled `PassOutput0` here and `Pass0` in the sibling test.
+    fn three_pass_reads(pass_output_name: &str) -> [u8; 4] {
+        let red = compile("void main() { FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n");
+        let green = compile("void main() { FragColor = vec4(0.0, 1.0, 0.0, 1.0); }\n");
+        let reader = compile(&format!(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+layout(set=0, binding=4) uniform texture2D {name};
+layout(set=0, binding=5) uniform sampler PoSmp;
+void main() {{ FragColor = texture(sampler2D({name}, PoSmp), vTexCoord); }}
+",
+            name = pass_output_name
+        ));
+        let out = render_chain(
+            &[Pass::new(red), Pass::new(green), Pass::new(reader)],
+            &solid(4, 4, [10, 10, 10, 255]),
+            (4, 4),
+        );
+        center(&out)
+    }
+
+    #[test]
+    fn pass_output0_reads_pass0_not_the_predecessor() {
+        let c = three_pass_reads("PassOutput0");
+        assert!(
+            close(&c, &[255, 0, 0, 255]),
+            "PassOutput0 must be pass 0's RED, not pass 1's GREEN, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn passn_alias_spelling_reads_pass0() {
+        // `Pass0` is the accepted spelling for `PassOutput0` (§7/§11).
+        let c = three_pass_reads("Pass0");
+        assert!(
+            close(&c, &[255, 0, 0, 255]),
+            "Pass0 (PassOutput0 alias) must be pass 0's RED, got {c:?}"
+        );
+    }
+
+    // ---- 3. Alias: <alias> and <alias>Size resolve to the aliased pass. ----
+
+    #[test]
+    fn alias_texture_and_size_resolve_to_the_aliased_pass() {
+        // Pass 0 (alias FOO) outputs BLUE into a 100x60 FBO. Pass 1 is a filler.
+        // Pass 2 samples `FOO` (must be pass 0's BLUE) and encodes `FOOSize`
+        // (must be 100x60) into G/B... we check texture and size in two renders to
+        // keep each fragment simple.
+        let blue = compile("void main() { FragColor = vec4(0.0, 0.0, 1.0, 1.0); }\n");
+        let filler = compile("void main() { FragColor = vec4(0.5, 0.5, 0.5, 1.0); }\n");
+
+        // 3a. `FOO` texture resolves to pass 0's output (BLUE).
+        let read_foo = compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+layout(set=0, binding=4) uniform texture2D FOO;
+layout(set=0, binding=5) uniform sampler FooSmp;
+void main() { FragColor = texture(sampler2D(FOO, FooSmp), vTexCoord); }
+",
+        );
+        let scale = super::ScaleConfig {
+            x: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 100.0,
+            },
+            y: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 60.0,
+            },
+        };
+        let mut p0 = Pass::new(blue.clone()).with_scale(scale);
+        p0.alias = Some("FOO".to_string());
+        let out = render_chain(
+            &[p0, Pass::new(filler.clone()), Pass::new(read_foo)],
+            &solid(8, 8, [0, 0, 0, 255]),
+            (8, 8),
+        );
+        let c = center(&out);
+        assert!(
+            close(&c, &[0, 0, 255, 255]),
+            "alias FOO must resolve to pass 0's BLUE output, got {c:?}"
+        );
+
+        // 3b. `FOOSize` builtin resolves to pass 0's 100x60 output size. The
+        // `FOOSize` member lives in the b0 builtin UBO (alongside MVP) so the
+        // reflection-driven builtin packing (#28/#26) writes it there.
+        let read_foo_size = compile_slang(
+            "#version 450
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; vec4 FOOSize; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() { FragColor = vec4(global.FOOSize.x / 255.0, global.FOOSize.y / 255.0, 0.0, 1.0); }
+",
+            None,
+        )
+        .expect("compile FOOSize reader");
+        let scale2 = super::ScaleConfig {
+            x: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 100.0,
+            },
+            y: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 60.0,
+            },
+        };
+        let mut p0b = Pass::new(blue).with_scale(scale2);
+        p0b.alias = Some("FOO".to_string());
+        let out2 = render_chain(
+            &[p0b, Pass::new(filler), Pass::new(read_foo_size)],
+            &solid(8, 8, [0, 0, 0, 255]),
+            (128, 128),
+        );
+        let c2 = center(&out2);
+        assert!(
+            (c2[0] as i32 - 100).abs() <= 3 && (c2[1] as i32 - 60).abs() <= 3,
+            "FOOSize must equal pass 0's output (100x60), got {c2:?}"
+        );
+    }
+
+    // ---- 4. Reflection-driven layout: non-default / multiple bindings. ----
+
+    /// A pass declaring TWO textures (`Source`@b1 and `Original`@b4) at
+    /// non-adjacent bindings, with samplers at b2/b5. The reflection-driven layout
+    /// must bind all of them with no validation error and read both correctly: the
+    /// pass averages Source and Original (which are equal for pass 0), so the
+    /// output equals the input — proving every reflected binding is wired.
+    #[test]
+    fn reflection_driven_layout_binds_multiple_textures_at_custom_bindings() {
+        let avg = compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+layout(set=0, binding=4) uniform texture2D Original;
+layout(set=0, binding=5) uniform sampler OrigSmp;
+void main() {
+    vec3 s = texture(sampler2D(Source, Smp), vTexCoord).rgb;
+    vec3 o = texture(sampler2D(Original, OrigSmp), vTexCoord).rgb;
+    FragColor = vec4((s + o) * 0.5, 1.0);
+}
+",
+        );
+        let input = solid(4, 4, [120, 80, 40, 255]);
+        // Single pass: Source == Original == input, so avg == input.
+        let out = render_chain(&[Pass::new(avg)], &input, (4, 4));
+        assert!(
+            close(&center(&out), &[120, 80, 40, 255]),
+            "both textures at custom bindings must be wired, got {:?}",
+            center(&out)
+        );
+    }
+
+    /// A plain passthrough (Source@b1, Smp@b2, UBO@b0) still works through the
+    /// reflection-driven layout — the legacy fixed-binding case.
+    #[test]
+    fn legacy_single_texture_layout_still_works() {
+        let input = solid(4, 4, [33, 66, 99, 255]);
+        let out = render_chain(&[Pass::new(passthrough())], &input, (4, 4));
+        assert!(close(&center(&out), &input.rgba[0..4]));
+    }
+
+    // ---- 5. Sampler attribution: the "K+1" rule. ----
+
+    /// A 2x1 black/white source written into a 2x1 FBO by pass 0, then sampled at
+    /// the sub-texel midpoint u=0.5 by pass 1. The sampler used for pass 1's
+    /// `Source` (pass 0's output) is pass 1's own config (K=0 → K+1=1). With pass
+    /// 1 `filter_linear=false` the midpoint reads a single texel (hard edge, 0 or
+    /// 255); with `filter_linear=true` it blends (~127). Proves the per-bound-
+    /// texture sampler is applied (the consuming pass for a direct Source).
+    fn subtexel_sample(consumer_linear: bool) -> u8 {
+        // Pass 0: copy the 2x1 source into a 2x1 FBO (texel0 black, texel1 white).
+        let copy = compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }
+",
+        );
+        let mut p0 = Pass::new(copy).with_scale(super::ScaleConfig {
+            x: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 2.0,
+            },
+            y: super::AxisScale {
+                ty: super::ScaleType::Absolute,
+                factor: 1.0,
+            },
+        });
+        p0.filter_linear = false; // pass 0 copies 1:1, irrelevant to the probe
+                                  // Pass 1: sample pass 0's output at the exact midpoint u=0.5.
+        let probe = compile(
+            "layout(set=0, binding=1) uniform texture2D Source;
+layout(set=0, binding=2) uniform sampler Smp;
+void main() { FragColor = texture(sampler2D(Source, Smp), vec2(0.5, 0.5)); }
+",
+        );
+        let mut p1 = Pass::new(probe);
+        p1.filter_linear = consumer_linear;
+        p1.wrap_mode = super::WrapMode::ClampToEdge;
+        let src = Frame::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        let out = render_chain(&[p0, p1], &src, (8, 8));
+        center(&out)[0]
+    }
+
+    #[test]
+    fn sampler_attribution_uses_the_consuming_pass_for_a_direct_source() {
+        // The "K+1" rule: a direct Source (pass i-1's output) is sampled with pass
+        // i's config. nearest -> single texel (hard edge); linear -> the average.
+        let nearest = subtexel_sample(false);
+        let linear = subtexel_sample(true);
+        assert!(
+            nearest <= 60 || nearest >= 195,
+            "nearest consumer must read a single texel (hard edge), got {nearest}"
+        );
+        assert!(
+            (linear as i32 - 127).abs() <= 40,
+            "linear consumer must blend the two texels (~127), got {linear}"
+        );
+        assert!(
+            linear.abs_diff(nearest) > 40,
+            "nearest vs linear must differ, proving the sampler is selected per texture"
+        );
+    }
+}

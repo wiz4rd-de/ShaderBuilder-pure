@@ -1191,8 +1191,19 @@ impl Renderer {
         // Earlier passes' output sizes, grown as we walk the chain so pass i sees
         // passes 0..i (causal — §7).
         let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
+        // Invert the alias table to index → alias name so we can map an earlier
+        // pass's output size to its `<alias>Size` builtin (#26).
+        let alias_by_index: std::collections::HashMap<usize, &String> = self
+            .aliases
+            .iter()
+            .map(|(name, &idx)| (idx, name))
+            .collect();
+        // `<alias>Size` values, grown causally: after pass k finishes we record
+        // its size under its alias (if any) so passes > k can read `<alias>Size`.
+        let mut alias_sizes: std::collections::HashMap<String, [f32; 4]> =
+            std::collections::HashMap::new();
 
-        for res in &self.passes {
+        for (pass_index, res) in self.passes.iter().enumerate() {
             // A pass that owns an FBO (any intermediate, or a final pass with an
             // explicit scale — #22) sees its FBO size as OutputSize; a final pass
             // with no FBO sees the viewport. After `rebuild_chain`, an owning pass
@@ -1221,6 +1232,7 @@ impl Renderer {
                     frame_direction: self.frame_direction,
                     rotation: 0,
                     pass_output_sizes: pass_output_sizes.clone(),
+                    alias_sizes: alias_sizes.clone(),
                 };
                 let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);
@@ -1237,7 +1249,12 @@ impl Renderer {
                 self.queue.write_buffer(&res.param_buffer, 0, &bytes);
             }
 
-            pass_output_sizes.push(uniforms::size_vec(output_size.0, output_size.1));
+            let out_vec = uniforms::size_vec(output_size.0, output_size.1);
+            pass_output_sizes.push(out_vec);
+            // Record this pass's `<alias>Size` so causally-later passes can read it.
+            if let Some(name) = alias_by_index.get(&pass_index) {
+                alias_sizes.insert((*name).clone(), out_vec);
+            }
             input_size = output_size;
         }
     }
