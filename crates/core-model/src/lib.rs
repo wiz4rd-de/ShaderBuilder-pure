@@ -83,6 +83,82 @@ pub struct Project {
     /// settings carried (#35). Empty for hand-built projects. Defaults to `[]`.
     #[serde(default)]
     pub luts: Vec<Lut>,
+    /// Free-form authoring metadata for the native project file (Spec §6, #38):
+    /// description, author, timestamps. Every field is optional and the whole
+    /// struct defaults to empty, so older project files (and import-produced
+    /// projects) load with no metadata. This is **document** metadata; it is
+    /// deliberately separate from pipeline wiring (which lives in [`pipeline`]).
+    ///
+    /// [`pipeline`]: Project::pipeline
+    #[serde(default)]
+    pub metadata: ProjectMetadata,
+    /// References to personal-library items this project instantiated (Spec §6:
+    /// "project file holds library refs"; #38, forward-looking for the Phase-6
+    /// library, #56/#58). Each entry is a lightweight pointer (id + display name)
+    /// to a `LibraryItem` stored elsewhere — the project records *which* library
+    /// items it used, never the item bodies. Empty for projects that used no
+    /// library items. Defaults to `[]`.
+    ///
+    /// The full `LibraryItem` schema and the library store land in Phase 6; this
+    /// only fixes the reference shape so the native project file can already carry
+    /// the refs without round-trip loss.
+    #[serde(default)]
+    pub library_refs: Vec<LibraryRef>,
+}
+
+/// Free-form authoring metadata for the native project file (Spec §6, #38).
+///
+/// This is **document** metadata — human-facing description, authorship, and
+/// timestamps — kept distinct from the render [`PipelineMetadata`] (which is
+/// *wiring* metadata about the chain). Every field is optional so a project may
+/// carry none of it, and the whole struct defaults to empty so older project
+/// files and import-produced projects load unchanged.
+///
+/// Timestamps are stored as **opaque strings** (RFC 3339 is the intended
+/// convention) rather than a date type, so the serde/TS contract stays
+/// dependency-free and the frontend owns formatting. The save/load commands do
+/// not interpret or mutate these fields — they are authored by the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ProjectMetadata {
+    /// A longer human-readable description of the project, or `None` if unset.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The author / creator name, or `None` if unset.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// When the project was first created, as an opaque (RFC 3339) string, or
+    /// `None` if unset.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// When the project was last modified, as an opaque (RFC 3339) string, or
+    /// `None` if unset.
+    #[serde(default)]
+    pub modified_at: Option<String>,
+}
+
+/// A reference from a project to a personal-library item it instantiated (Spec
+/// §6: "project file holds library refs"; #38). This is a lightweight **pointer**
+/// — the project records *which* library items it used, never the item bodies.
+///
+/// The full `LibraryItem` schema and the on-disk library store arrive in Phase 6
+/// (#56/#58); this fixes only the reference shape so the native project file can
+/// already round-trip the refs. Resolving a ref to a concrete library item (and
+/// handling a missing/updated item) is a Phase-6 concern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LibraryRef {
+    /// The stable id of the referenced `LibraryItem` (Phase 6). Matches the id the
+    /// library store assigns; lets the editor mark instantiated regions and the
+    /// library panel show "used by N projects".
+    pub item_id: String,
+    /// The library item's display name at the time it was instantiated, for
+    /// showing a meaningful label even when the item is no longer in the library.
+    /// `None` if not captured.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -518,9 +594,156 @@ impl Project {
             pipeline: PipelineMetadata::default(),
             parameters: Vec::new(),
             luts: Vec::new(),
+            metadata: ProjectMetadata::default(),
+            library_refs: Vec::new(),
+        }
+    }
+
+    /// Serialize this project to the native project-file JSON text (Spec §6, #38).
+    ///
+    /// The output is pretty-printed (stable, diff-friendly, human-inspectable) and
+    /// carries [`schema_version`] so a later reader can detect and migrate older
+    /// files. This is the **only** serialization the native project file uses; it
+    /// never embeds any `.slangp` export concern — exporting a RetroArch bundle is
+    /// a wholly separate path ([`crate`]'s consumer `preset_io::export_preset`,
+    /// #36). A round trip through [`to_json`]/[`from_json`] reproduces an identical
+    /// in-memory model (modulo JSON formatting).
+    ///
+    /// Serialization is infallible for a well-formed [`Project`] (the model is all
+    /// plain serde types), but the signature stays `Result` to surface the
+    /// theoretical `serde_json` error rather than panicking.
+    ///
+    /// [`schema_version`]: Project::schema_version
+    /// [`to_json`]: Project::to_json
+    /// [`from_json`]: Project::from_json
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Parse native project-file JSON text into a [`Project`] (Spec §6, #38),
+    /// applying **versioned** validation so a malformed or out-of-date file yields
+    /// a typed [`ProjectLoadError`] rather than a panic.
+    ///
+    /// Versioning policy (forward-migration ready):
+    ///
+    /// - The `schema_version` field is read **first**, leniently (only that one
+    ///   `u32` field is required to classify the file). A document missing it, or
+    ///   one that isn't a JSON object, is [`ProjectLoadError::Malformed`].
+    /// - A version **newer** than [`PROJECT_SCHEMA_VERSION`] is
+    ///   [`ProjectLoadError::TooNew`] — this build cannot understand it.
+    /// - A version **older** than [`PROJECT_SCHEMA_VERSION`] currently has no
+    ///   migration registered, so it is [`ProjectLoadError::Unsupported`]. When a
+    ///   v2 schema lands, the migration from v1 hooks in here (the `#[serde(default)]`
+    ///   on every additive field already keeps same-major loads forward-compatible;
+    ///   `Unsupported` is reserved for genuinely breaking version bumps).
+    /// - At the current version, the full [`Project`] is deserialized; any shape
+    ///   mismatch (a required field absent, a wrong type) is
+    ///   [`ProjectLoadError::Malformed`] carrying the `serde_json` message.
+    pub fn from_json(json: &str) -> Result<Self, ProjectLoadError> {
+        // Read just the version first, tolerating everything else, so an old/new
+        // file is classified by version rather than by an incidental shape error.
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            #[serde(rename = "schemaVersion")]
+            schema_version: Option<u32>,
+        }
+        let probe: VersionProbe =
+            serde_json::from_str(json).map_err(|e| ProjectLoadError::Malformed {
+                message: e.to_string(),
+            })?;
+        let version = probe
+            .schema_version
+            .ok_or_else(|| ProjectLoadError::Malformed {
+                message: "missing `schemaVersion` field".into(),
+            })?;
+
+        match version.cmp(&PROJECT_SCHEMA_VERSION) {
+            std::cmp::Ordering::Greater => {
+                return Err(ProjectLoadError::TooNew {
+                    found: version,
+                    supported: PROJECT_SCHEMA_VERSION,
+                });
+            }
+            std::cmp::Ordering::Less => {
+                // No migration is registered yet (v1 is the only schema). A future
+                // breaking bump installs its v1→vN migration here.
+                return Err(ProjectLoadError::Unsupported {
+                    found: version,
+                    supported: PROJECT_SCHEMA_VERSION,
+                });
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+
+        serde_json::from_str(json).map_err(|e| ProjectLoadError::Malformed {
+            message: e.to_string(),
+        })
+    }
+}
+
+/// A typed error from loading a native project file ([`Project::from_json`], and
+/// the `load_project` Tauri command, #38). Returned instead of panicking on a
+/// malformed or out-of-date file (Spec §6 acceptance).
+///
+/// This carries no `std::io` variant: file IO is the caller's concern (the Tauri
+/// command maps a read error separately). These variants describe only the
+/// *content* of a project document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[ts(export)]
+pub enum ProjectLoadError {
+    /// The text is not valid project JSON: not an object, missing
+    /// `schemaVersion`, or a shape that doesn't match the current schema. Carries
+    /// the underlying parser message.
+    ///
+    /// A **struct** variant (not a newtype) on purpose: serde cannot
+    /// *internally-tag* a newtype variant whose payload is a plain string, so the
+    /// message lives in a named `message` field — keeping this enum serializable
+    /// as an IPC payload.
+    Malformed {
+        /// The underlying parser message.
+        message: String,
+    },
+    /// The file's `schemaVersion` is **newer** than this build supports — it was
+    /// written by a later version of the app. The user should update.
+    TooNew {
+        /// The version found in the file.
+        found: u32,
+        /// The newest version this build can read ([`PROJECT_SCHEMA_VERSION`]).
+        supported: u32,
+    },
+    /// The file's `schemaVersion` is **older** than the current schema and no
+    /// migration is registered for it yet. (When a breaking bump lands, its
+    /// migration replaces this for the affected versions.)
+    Unsupported {
+        /// The version found in the file.
+        found: u32,
+        /// The current schema version ([`PROJECT_SCHEMA_VERSION`]).
+        supported: u32,
+    },
+}
+
+impl std::fmt::Display for ProjectLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectLoadError::Malformed { message } => {
+                write!(f, "malformed project file: {message}")
+            }
+            ProjectLoadError::TooNew { found, supported } => write!(
+                f,
+                "project file schema version {found} is newer than this build supports \
+                 (max {supported}); update ShaderBuilder to open it"
+            ),
+            ProjectLoadError::Unsupported { found, supported } => write!(
+                f,
+                "project file schema version {found} is no longer supported \
+                 (current {supported}) and has no migration"
+            ),
         }
     }
 }
+
+impl std::error::Error for ProjectLoadError {}
 
 #[cfg(test)]
 mod tests {
@@ -572,6 +795,16 @@ mod tests {
                 filter_linear: Some(true),
                 wrap_mode: Some(WrapMode::ClampToEdge),
                 mipmap: None,
+            }],
+            metadata: ProjectMetadata {
+                description: Some("A demo project".to_owned()),
+                author: Some("tester".to_owned()),
+                created_at: Some("2026-06-17T00:00:00Z".to_owned()),
+                modified_at: None,
+            },
+            library_refs: vec![LibraryRef {
+                item_id: "lib-item-1".to_owned(),
+                name: Some("Scanlines".to_owned()),
             }],
             passes: vec![
                 Pass {
@@ -773,6 +1006,198 @@ mod tests {
         assert_eq!(lut.filter_linear, None);
         assert_eq!(lut.wrap_mode, None);
         assert_eq!(lut.mipmap, None);
+    }
+
+    #[test]
+    fn metadata_and_library_refs_default_to_empty() {
+        // An omitted `metadata`/`libraryRefs` deserializes to defaults so older
+        // project files (pre-#38) still load.
+        let project: Project =
+            serde_json::from_str(r#"{"schemaVersion":1,"name":"x","passes":[]}"#)
+                .expect("project without metadata/libraryRefs deserializes");
+        assert_eq!(project.metadata, ProjectMetadata::default());
+        assert!(project.library_refs.is_empty());
+        assert_eq!(Project::empty("x").metadata, ProjectMetadata::default());
+        assert_eq!(Project::empty("x").library_refs, Vec::<LibraryRef>::new());
+    }
+
+    #[test]
+    fn project_metadata_serializes_camel_case() {
+        let meta = ProjectMetadata {
+            description: Some("d".to_owned()),
+            author: Some("a".to_owned()),
+            created_at: Some("2026-06-17T00:00:00Z".to_owned()),
+            modified_at: Some("2026-06-18T00:00:00Z".to_owned()),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["createdAt"], "2026-06-17T00:00:00Z");
+        assert_eq!(json["modifiedAt"], "2026-06-18T00:00:00Z");
+        let back: ProjectMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn library_ref_round_trips() {
+        let r = LibraryRef {
+            item_id: "abc".to_owned(),
+            name: Some("Scanlines".to_owned()),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["itemId"], "abc");
+        let back: LibraryRef = serde_json::from_value(json).unwrap();
+        assert_eq!(r, back);
+        // `name` is optional.
+        let minimal: LibraryRef = serde_json::from_str(r#"{"itemId":"x"}"#).unwrap();
+        assert_eq!(minimal.name, None);
+    }
+
+    #[test]
+    fn to_from_json_round_trips_a_multipass_project() {
+        // The native-project-file (#38) round trip: a project with multiple
+        // passes, a whole-pass code node, parameters, metadata, and library refs
+        // survives to_json -> from_json identically.
+        let project = Project {
+            schema_version: PROJECT_SCHEMA_VERSION,
+            name: "Multipass".to_owned(),
+            feedback_pass: Some(0),
+            pipeline: PipelineMetadata::default(),
+            parameters: vec![Parameter {
+                name: "GAIN".to_owned(),
+                label: "Gain".to_owned(),
+                default: 1.0,
+                min: 0.0,
+                max: 4.0,
+                step: 0.1,
+            }],
+            luts: vec![],
+            metadata: ProjectMetadata {
+                description: Some("round trip".to_owned()),
+                author: None,
+                created_at: Some("2026-06-17T00:00:00Z".to_owned()),
+                modified_at: None,
+            },
+            library_refs: vec![LibraryRef {
+                item_id: "lib-1".to_owned(),
+                name: None,
+            }],
+            passes: vec![
+                Pass {
+                    id: "p0".to_owned(),
+                    name: "First".to_owned(),
+                    source: PassSource::WholePassCode {
+                        source: "// pass 0\r\nvoid main() {}\n".to_owned(),
+                        filename: Some("p0.slang".to_owned()),
+                        opaque: true,
+                    },
+                    parameters: vec![],
+                    references: vec![],
+                    settings: PassSettings::default(),
+                },
+                Pass {
+                    id: "p1".to_owned(),
+                    name: "Second".to_owned(),
+                    source: PassSource::Graph {
+                        graph: Graph::default(),
+                    },
+                    parameters: vec![Parameter {
+                        name: "GAIN".to_owned(),
+                        label: "Gain".to_owned(),
+                        default: 1.0,
+                        min: 0.0,
+                        max: 4.0,
+                        step: 0.1,
+                    }],
+                    references: vec![],
+                    settings: PassSettings::default(),
+                },
+            ],
+        };
+
+        let json = project.to_json().expect("serialize");
+        let back = Project::from_json(&json).expect("deserialize");
+        assert_eq!(project, back);
+    }
+
+    #[test]
+    fn from_json_rejects_a_newer_schema_version() {
+        let json = format!(
+            r#"{{"schemaVersion":{},"name":"x","passes":[]}}"#,
+            PROJECT_SCHEMA_VERSION + 1
+        );
+        match Project::from_json(&json) {
+            Err(ProjectLoadError::TooNew { found, supported }) => {
+                assert_eq!(found, PROJECT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, PROJECT_SCHEMA_VERSION);
+            }
+            other => panic!("expected TooNew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_an_older_unsupported_schema_version() {
+        // v1 is the floor today, so v0 has no migration registered.
+        let json = r#"{"schemaVersion":0,"name":"x","passes":[]}"#;
+        match Project::from_json(json) {
+            Err(ProjectLoadError::Unsupported { found, supported }) => {
+                assert_eq!(found, 0);
+                assert_eq!(supported, PROJECT_SCHEMA_VERSION);
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_reports_malformed_input_without_panicking() {
+        // Not JSON at all.
+        assert!(matches!(
+            Project::from_json("not json"),
+            Err(ProjectLoadError::Malformed { .. })
+        ));
+        // Valid JSON but missing schemaVersion.
+        assert!(matches!(
+            Project::from_json(r#"{"name":"x","passes":[]}"#),
+            Err(ProjectLoadError::Malformed { .. })
+        ));
+        // Right version but a required field (`name`) is absent.
+        let json = format!(
+            r#"{{"schemaVersion":{},"passes":[]}}"#,
+            PROJECT_SCHEMA_VERSION
+        );
+        assert!(matches!(
+            Project::from_json(&json),
+            Err(ProjectLoadError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn project_load_error_serializes_as_ipc_payload() {
+        // The error type rides the IPC channel, so every variant must serialize
+        // (a tagged *newtype* string variant would fail at runtime — see the
+        // `message` struct field on `Malformed`).
+        for err in [
+            ProjectLoadError::Malformed {
+                message: "boom".to_owned(),
+            },
+            ProjectLoadError::TooNew {
+                found: 2,
+                supported: 1,
+            },
+            ProjectLoadError::Unsupported {
+                found: 0,
+                supported: 1,
+            },
+        ] {
+            let value = serde_json::to_value(&err).expect("error serializes");
+            let back: ProjectLoadError = serde_json::from_value(value).expect("error round-trips");
+            assert_eq!(err, back);
+        }
+        // The discriminator is `kind` and `Malformed` exposes a named `message`.
+        let v = serde_json::to_value(ProjectLoadError::Malformed {
+            message: "m".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "malformed");
+        assert_eq!(v["message"], "m");
     }
 
     #[test]
