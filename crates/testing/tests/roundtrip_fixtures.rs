@@ -9,8 +9,8 @@
 //! `fixtures/roundtrip/` "kitchen sink" preset alone exercises every parsed
 //! feature (multi-pass, all scale types, feedback, aliases, varied-sampler LUTs,
 //! parameters-with-overrides, a preserved unknown key); the other feature
-//! fixtures (`multipass`, `feedback`, `lut`, `params`) are swept in too so a
-//! regression in any of them is caught here.
+//! fixtures (`multipass`, `feedback`, `lut`, `params`, `orphan_override`) are
+//! swept in too so a regression in any of them is caught here.
 //!
 //! On a non-lossless round trip the failure prints the readable
 //! [`testing::ProjectDiff`] report naming the exact diverging field(s).
@@ -113,6 +113,55 @@ fn kitchen_sink_round_trips_losslessly() {
         "every pass `.slang` must be byte-identical after export: {:?}",
         rt.pass_bytes_identical
     );
+}
+
+#[test]
+fn orphan_override_fixture_round_trips_losslessly() {
+    // FINDING A1/A2: a bare `id = value` override whose `#pragma parameter` lives
+    // in an #included header (which import does NOT resolve) was silently dropped
+    // on import -> export — the tuned value vanished, a gate #1 violation the
+    // first-vs-re-import oracle was blind to. Called out on its own so a
+    // regression names it directly.
+    let slangp = fixtures_dir().join("orphan_override/orphan.slangp");
+    assert!(
+        slangp.is_file(),
+        "orphan-override fixture present: {slangp:?}"
+    );
+
+    let work = tempfile::tempdir().expect("temp bundle dir");
+    let rt = round_trip(&slangp, work.path()).expect("orphan-override round trip");
+
+    assert!(
+        rt.is_lossless(),
+        "orphan-override preset must round-trip losslessly:\n{}",
+        rt.report()
+    );
+    assert!(
+        rt.source_loss.is_empty(),
+        "no source-side loss: {:?}",
+        rt.source_loss
+    );
+
+    // The orphan override's tuned value survives (synthesized into a parameter)…
+    let header = rt
+        .second
+        .parameters
+        .iter()
+        .find(|p| p.name == "HEADER_KNOB")
+        .expect("orphan override HEADER_KNOB survives the round trip");
+    assert_eq!(header.default, 0.625, "orphan value survives");
+
+    // …and so does the normal reconciled override whose pragma IS in the body.
+    let real = rt
+        .second
+        .parameters
+        .iter()
+        .find(|p| p.name == "REAL_KNOB")
+        .expect("reconciled override REAL_KNOB survives");
+    assert_eq!(real.default, 0.75, "pragma-backed override survives");
+    // Its range/step came from the inline pragma (not synthesized).
+    assert_eq!(real.min, 0.0);
+    assert_eq!(real.max, 1.0);
 }
 
 /// Indent a multi-line report so it nests readably under the preset path.
