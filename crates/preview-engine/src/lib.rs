@@ -11,8 +11,10 @@
 //! swaps in a wgpu-backed `FrameSource` without changing the `app` transport.
 
 pub mod frame;
+pub mod renderer;
 
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
+pub use renderer::{Renderer, RendererError, OFFSCREEN_FORMAT};
 
 /// Crate identity marker. See `core_model::NAME`.
 pub const NAME: &str = "preview-engine";
@@ -112,5 +114,87 @@ mod tests {
         // Same size, different pixels — the frame is actually moving.
         assert_eq!(a.len(), b.len());
         assert_ne!(a[FRAME_HEADER_LEN..], b[FRAME_HEADER_LEN..]);
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::Renderer;
+    use slang_compile::compile_slang;
+    use source::Frame;
+
+    // A standard one-pass slang shader (separate texture + sampler, as wgpu's
+    // binding model requires). MVP is identity-applied in the VS.
+    const PREAMBLE: &str = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+";
+
+    fn passthrough() -> String {
+        format!(
+            "{PREAMBLE}void main() {{ FragColor = texture(sampler2D(Source, Smp), vTexCoord); }}\n"
+        )
+    }
+
+    fn invert() -> String {
+        format!("{PREAMBLE}void main() {{ vec4 c = texture(sampler2D(Source, Smp), vTexCoord); FragColor = vec4(vec3(1.0) - c.rgb, c.a); }}\n")
+    }
+
+    // row0 = [red, green], row1 = [blue, yellow]
+    fn checker_2x2() -> Frame {
+        Frame::new(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, // top row
+                0, 0, 255, 255, 255, 255, 0, 255, // bottom row
+            ],
+        )
+    }
+
+    fn render(shader_src: &str, frame: &Frame) -> Frame {
+        let shader = compile_slang(shader_src, None).expect("compile fixture shader");
+        let mut r = Renderer::new(frame.width, frame.height).expect("wgpu device");
+        r.set_source(frame);
+        r.set_shader(&shader);
+        r.render().expect("render");
+        r.read_back().expect("read back")
+    }
+
+    fn close(a: &[u8], b: &[u8]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 2)
+    }
+
+    #[test]
+    fn passthrough_reproduces_the_image() {
+        let input = checker_2x2();
+        let output = render(&passthrough(), &input);
+        assert_eq!((output.width, output.height), (2, 2));
+        assert!(
+            close(&output.rgba, &input.rgba),
+            "passthrough should reproduce the source\n in: {:?}\nout: {:?}",
+            input.rgba,
+            output.rgba
+        );
+    }
+
+    #[test]
+    fn non_trivial_shader_transforms_the_image() {
+        let input = checker_2x2();
+        let output = render(&invert(), &input);
+        // Top-left was red (255,0,0) -> inverted to cyan (0,255,255).
+        assert!(close(&output.rgba[0..4], &[0, 255, 255, 255]));
+        // And the result genuinely differs from the input (not a no-op).
+        assert!(!close(&output.rgba, &input.rgba));
     }
 }

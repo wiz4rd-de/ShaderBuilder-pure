@@ -10,3 +10,6 @@ publish.workspace = true
 [dependencies]
 slang-compile = { workspace = true }
 source = { workspace = true }
+wgpu = { version = "29", features = ["spirv"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
