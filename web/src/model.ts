@@ -8,6 +8,10 @@ import type { Project } from "./bindings/Project";
 export type { Project } from "./bindings/Project";
 export type { Pass } from "./bindings/Pass";
 export type { PassSource } from "./bindings/PassSource";
+export type { PassSettings } from "./bindings/PassSettings";
+export type { ScaleAxis } from "./bindings/ScaleAxis";
+export type { ScaleType } from "./bindings/ScaleType";
+export type { WrapMode } from "./bindings/WrapMode";
 export type { Graph } from "./bindings/Graph";
 export type { Node } from "./bindings/Node";
 export type { Edge } from "./bindings/Edge";
@@ -22,4 +26,5 @@ export const EMPTY_PROJECT: Project = {
   schemaVersion: PROJECT_SCHEMA_VERSION,
   name: "Untitled",
   passes: [],
+  feedbackPass: null,
 };
