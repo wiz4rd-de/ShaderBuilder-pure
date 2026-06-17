@@ -20,7 +20,7 @@ pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
 pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
 pub use renderer::{Renderer, RendererError, OFFSCREEN_FORMAT};
-pub use uniforms::{BuiltinUniforms, BuiltinValues};
+pub use uniforms::{BuiltinUniforms, BuiltinValues, ParamDef, ParamStore, ParamView};
 
 /// Crate identity marker. See `core_model::NAME`.
 pub const NAME: &str = "preview-engine";
@@ -811,6 +811,252 @@ layout(set = 0, binding = 2) uniform sampler Smp;
             !both_lit,
             "without mipmap_input the base level is a sharp split (one channel), got {no_mips:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    //! Reflection-driven parameter packing + live `set_parameter` tests (#29).
+    //! Real GPU: each reads a center pixel back to prove a `#pragma parameter`
+    //! reaches the shader at its reflected offset, that a live update lands within
+    //! one frame WITHOUT recompiling, that preset overrides set the initial value,
+    //! that a parameter is global-by-name across passes, and that sets clamp.
+    use super::{ParamStore, Pass, Renderer};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    /// Vertex stage shared by the fixtures (applies MVP, forwards TexCoord).
+    const VS: &str = "\
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+";
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&rgba);
+        }
+        Frame::new(width, height, data)
+    }
+
+    fn center(f: &Frame) -> [u8; 4] {
+        let i = (((f.height / 2) * f.width + f.width / 2) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2], f.rgba[i + 3]]
+    }
+
+    /// A pass with a dedicated `Params` UBO (binding 3) declaring two params in
+    /// NON-canonical order (B before A), plus a builtin UBO with a builtin AND a
+    /// param (LEVEL) mixed in — exercising both the dedicated-block and the
+    /// mixed-block packing paths in one shader. Output: R=A, G=B, B=LEVEL.
+    fn mixed_param_shader() -> CompiledShader {
+        let src = format!(
+            "#version 450
+#pragma parameter A \"A\" 0.25 0.0 1.0 0.01
+#pragma parameter B \"B\" 0.75 0.0 1.0 0.01
+#pragma parameter LEVEL \"Level\" 0.5 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; vec4 OutputSize; float LEVEL; }} global;
+layout(std140, set = 0, binding = 3) uniform Params {{ float B; float A; }} params;
+{VS}void main() {{ FragColor = vec4(params.A, params.B, global.LEVEL, 1.0); }}
+"
+        );
+        compile_slang(&src, None).expect("compile mixed param shader")
+    }
+
+    /// Param-only fixture: a single param X scaling a constant red. Output R = X.
+    fn x_scale_shader() -> CompiledShader {
+        let src = format!(
+            "#version 450
+#pragma parameter X \"X\" 0.5 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; }} global;
+layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
+{VS}void main() {{ FragColor = vec4(params.X, 0.0, 0.0, 1.0); }}
+"
+        );
+        compile_slang(&src, None).expect("compile x-scale shader")
+    }
+
+    #[test]
+    fn param_defaults_reach_shader_at_reflected_offsets() {
+        // Defaults A=0.25 (~64), B=0.75 (~191), LEVEL=0.5 (~128). The Params UBO
+        // declares B before A, and LEVEL lives in the builtin block — if packing
+        // were positional rather than offset-by-name, these would be swapped.
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&mixed_param_shader());
+        r.render().expect("render");
+        let c = center(&r.read_back().expect("read back"));
+        assert!((c[0] as i32 - 64).abs() <= 3, "A=0.25 -> R~64, got {c:?}");
+        assert!((c[1] as i32 - 191).abs() <= 3, "B=0.75 -> G~191, got {c:?}");
+        assert!(
+            (c[2] as i32 - 128).abs() <= 3,
+            "LEVEL=0.5 -> B~128, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn set_parameter_updates_live_without_recompile() {
+        let shader = x_scale_shader();
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        // set_shader compiles + builds the pipeline exactly once, here.
+        r.set_shader(&shader);
+        r.render().expect("render");
+        let before = center(&r.read_back().expect("read back"))[0];
+        assert!((before as i32 - 128).abs() <= 3, "default X=0.5 -> ~128");
+
+        // Change X live. This must NOT recompile or rebuild the pipeline — just
+        // re-pack + re-upload the param UBO on the next frame.
+        assert!(r.set_parameter("X", 0.25));
+        r.render().expect("render");
+        let after = center(&r.read_back().expect("read back"))[0];
+        assert!(
+            (after as i32 - 64).abs() <= 3,
+            "X=0.25 -> ~64 after live set, got {after}"
+        );
+        assert!(
+            after < before,
+            "the live update genuinely changed the output"
+        );
+    }
+
+    #[test]
+    fn set_parameter_does_not_call_compile() {
+        // Prove no recompile by reusing the SAME CompiledShader: if set_parameter
+        // rebuilt from source it would need to re-run the toolchain. We assert the
+        // engine reflects the change purely from the live store. (compile_slang is
+        // only ever invoked here in the test setup, once.)
+        let shader = x_scale_shader();
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&shader);
+        for v in [0.1f32, 0.4, 0.9] {
+            assert!(r.set_parameter("X", v));
+            r.render().expect("render");
+            let got = center(&r.read_back().expect("read back"))[0];
+            let want = (v * 255.0).round() as i32;
+            assert!(
+                (got as i32 - want).abs() <= 4,
+                "X={v} -> ~{want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn preset_override_sets_the_initial_value() {
+        let shader = x_scale_shader();
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&shader);
+
+        // Build the param store from the collected params, then layer a preset
+        // override (X -> 0.8) — exactly what the app does on preset load.
+        let mut store = r.collected_params().clone();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("X".to_string(), 0.8);
+        store.apply_overrides(&overrides);
+        r.set_params(store);
+
+        r.render().expect("render");
+        let got = center(&r.read_back().expect("read back"))[0];
+        // 0.8, not the pragma default 0.5.
+        assert!(
+            (got as i32 - 204).abs() <= 4,
+            "override X=0.8 -> ~204, got {got}"
+        );
+    }
+
+    #[test]
+    fn parameter_is_global_by_name_across_passes() {
+        // Two passes both declaring X. Pass 0 writes X into its FBO (R=X); pass 1
+        // multiplies its input by X again (R = X * input.R = X*X). A single
+        // set_parameter("X", v) must drive BOTH passes.
+        let writer = {
+            let src = format!(
+                "#version 450
+#pragma parameter X \"X\" 0.5 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; }} global;
+layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
+{VS}void main() {{ FragColor = vec4(params.X, 0.0, 0.0, 1.0); }}
+"
+            );
+            compile_slang(&src, None).expect("compile writer")
+        };
+        let multiplier = {
+            let src = format!(
+                "#version 450
+#pragma parameter X \"X\" 0.5 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; }} global;
+layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
+{VS}void main() {{ vec4 c = texture(sampler2D(Source, Smp), vTexCoord); FragColor = vec4(c.r * params.X, 0.0, 0.0, 1.0); }}
+"
+            );
+            compile_slang(&src, None).expect("compile multiplier")
+        };
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_chain(&[Pass::new(writer), Pass::new(multiplier)])
+            .expect("set chain");
+        // X collected once (global by name).
+        assert_eq!(r.parameters().len(), 1, "X deduped across passes");
+
+        assert!(r.set_parameter("X", 0.5));
+        r.render().expect("render");
+        let got = center(&r.read_back().expect("read back"))[0];
+        // X*X = 0.25 -> ~64. If only one pass saw X (the other defaulting), the
+        // product would differ; both passes seeing 0.5 gives 0.25.
+        assert!(
+            (got as i32 - 64).abs() <= 5,
+            "X applied in BOTH passes -> 0.5*0.5=0.25 (~64), got {got}"
+        );
+    }
+
+    #[test]
+    fn set_parameter_clamps_to_range() {
+        let shader = x_scale_shader(); // X in [0,1]
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&shader);
+
+        // Beyond max clamps to 1.0 -> ~255.
+        assert!(r.set_parameter("X", 9.0));
+        r.render().expect("render");
+        assert!(
+            center(&r.read_back().expect("read back"))[0] >= 250,
+            "clamp to max"
+        );
+
+        // Below min clamps to 0.0 -> ~0.
+        assert!(r.set_parameter("X", -9.0));
+        r.render().expect("render");
+        assert!(
+            center(&r.read_back().expect("read back"))[0] <= 5,
+            "clamp to min"
+        );
+
+        // The view reflects the clamped value.
+        let v = r.parameters().into_iter().find(|p| p.name == "X").unwrap();
+        assert_eq!(v.value, 0.0);
+    }
+
+    #[test]
+    fn collected_store_seeds_defaults_for_a_chain() {
+        // collected_params() returns defaults before any override/set.
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&mixed_param_shader());
+        let store: ParamStore = r.collected_params().clone();
+        let views = store.views();
+        assert_eq!(views.len(), 3, "A, B, LEVEL collected");
+        let a = views.iter().find(|v| v.name == "A").unwrap();
+        assert_eq!(a.value, 0.25, "default seeded");
     }
 }
 

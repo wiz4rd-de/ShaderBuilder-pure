@@ -27,8 +27,8 @@
 //! not GLSL's combined `sampler2D` (the conversion happens in `slang-compile`).
 
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
-use crate::uniforms::{self, BuiltinValues};
-use slang_compile::{CompiledShader, UniformBlock};
+use crate::uniforms::{self, BuiltinValues, ParamStore, ParamView};
+use slang_compile::{CompiledShader, Parameter, UniformBlock};
 use source::Frame;
 
 /// The offscreen color format. Linear RGBA8 so a passthrough shader reproduces
@@ -141,7 +141,8 @@ impl std::error::Error for RendererError {}
 /// GPU resources for one pass in the chain.
 struct PassResources {
     pipeline: wgpu::RenderPipeline,
-    /// Parameter UBO (`#pragma parameter` defaults).
+    /// Parameter UBO (binding 3). Re-packed + re-uploaded each frame from the
+    /// chain's global [`ParamStore`] — no recompile/pipeline rebuild (#29).
     param_buffer: wgpu::Buffer,
     /// This pass's builtin UBO (per-pass because `*Size` differs per pass).
     ubo: wgpu::Buffer,
@@ -149,7 +150,14 @@ struct PassResources {
     /// names → byte offsets, discovered from the SPIR-V so builtins can be
     /// declared in any order/subset. `None` if the pass declares no builtin
     /// block (e.g. a constant-color pass); then the UBO is a zero-filled vec4.
+    /// Parameters declared **inside** this block (a mixed builtin+param block, as
+    /// real RetroArch shaders use) are packed here too (#29).
     builtin_block: Option<UniformBlock>,
+    /// The reflected parameter uniform block (binding 3) this pass declares, if
+    /// any: member names → offsets for `#pragma parameter` values that live in a
+    /// dedicated params block. `None` when the pass has no such block (the param
+    /// UBO is then a zero-filled vec4). #29 packs current param values here.
+    param_block: Option<UniformBlock>,
     /// `frame_count_modN` (#28): the `FrameCount` this pass sees is pre-wrapped
     /// by this modulus (`0` = no wrap).
     frame_count_mod: u32,
@@ -225,6 +233,12 @@ pub struct Renderer {
     source_view: Option<wgpu::TextureView>,
     /// The ordered pass chain. Empty until [`Renderer::set_shader`]/`set_chain`.
     passes: Vec<PassResources>,
+
+    /// The chain's **global-by-name** parameter state (#29): every pass's
+    /// `#pragma parameter`s deduped by name, with live `current` values. Rebuilt
+    /// by `set_chain`; mutated by [`Renderer::set_parameter`] (no recompile — the
+    /// next frame just re-packs + re-uploads the param UBOs).
+    params: ParamStore,
 }
 
 /// Resources for the per-frame mipmap-downsample blit (#23): the shader module,
@@ -353,6 +367,7 @@ impl Renderer {
             frame_direction: 1,
             source_view: None,
             passes: Vec::new(),
+            params: ParamStore::default(),
         })
     }
 
@@ -444,9 +459,51 @@ impl Renderer {
             resources.push(self.build_pass(pass, is_final, produces_mips));
         }
         self.passes = resources;
+
+        // Collect the chain's parameters (global by name, deduped — §8), seeded
+        // to each `#pragma parameter` default. Aliases come from each pass's
+        // `#pragma name` if it coincides with a parameter name; presets may also
+        // carry an explicit alias (#22 `aliasN`), wired by the app via
+        // [`Renderer::set_parameter_alias`] before/with overrides if needed.
+        let param_lists: Vec<&[Parameter]> = passes
+            .iter()
+            .map(|p| p.shader.reflection.parameters.as_slice())
+            .collect();
+        let aliases = std::collections::HashMap::new();
+        self.params = ParamStore::collect(param_lists, &aliases);
+
         // FBO sizes + bind groups are (re)built lazily at render time, once the
         // source size is known and the full chain exists.
         Ok(())
+    }
+
+    /// Replace the chain's parameter state wholesale (#29) — used by the app to
+    /// apply a preset's `parameter_overrides` (and any aliases) after building the
+    /// chain. The current values take effect on the next frame's param packing; no
+    /// recompile or pipeline rebuild.
+    pub fn set_params(&mut self, params: ParamStore) {
+        self.params = params;
+    }
+
+    /// The chain's collected parameters as a fresh [`ParamStore`] (defaults
+    /// seeded, no overrides) — the basis the app layers preset overrides onto.
+    pub fn collected_params(&self) -> &ParamStore {
+        &self.params
+    }
+
+    /// Set a parameter's current value live by canonical name or alias, clamped to
+    /// its `[min, max]` range (#29). Returns `true` if the parameter exists. This
+    /// performs **no** shader recompile or pipeline rebuild: the next
+    /// [`Renderer::render`] re-packs the updated value into each pass's param UBO
+    /// and re-uploads it. A name matching no parameter is a no-op (`false`).
+    pub fn set_parameter(&mut self, name: &str, value: f32) -> bool {
+        self.params.set(name, value)
+    }
+
+    /// The current parameter set (name/label/min/max/step/value) in declaration
+    /// order, for a data-driven slider UI (#29).
+    pub fn parameters(&self) -> Vec<ParamView> {
+        self.params.views()
     }
 
     /// Build the GPU resources for one pass: pipeline, parameter UBO (from the
@@ -471,22 +528,40 @@ impl Renderer {
         // `lod_max_clamp` and selects a linear mipmap filter so coarse mips are
         // sampled; otherwise lod is clamped to the base level.
         let sampler = self.build_sampler(pass);
-        let params = uniforms::pack_parameters(&shader.reflection.parameters);
+
+        // Reflect the SPIR-V once to discover both blocks' member offsets (#28/
+        // #29) so builtins/params can be declared in any order/subset. A
+        // reflection failure is non-fatal: fall back to no blocks (zero-filled
+        // UBOs) rather than refusing to build the pass.
+        let reflection = slang_compile::reflect(shader).ok();
+        let builtin_block = reflection
+            .as_ref()
+            .and_then(|r| uniforms::builtin_block(r).cloned());
+        // The dedicated parameter block: any reflected block that is NOT the
+        // builtin block (#29). Parameters declared *inside* the builtin block are
+        // packed there directly (a mixed block); this catches the common separate
+        // `Params` UBO at binding 3.
+        let param_block = reflection.as_ref().and_then(|r| {
+            r.blocks
+                .iter()
+                .find(|b| Some(b.binding) != builtin_block.as_ref().map(|bb| bb.binding))
+                .cloned()
+        });
+        // Size the param UBO to the reflected block (a 16-byte multiple) or one
+        // vec4 when there is none — a bound UBO needs at least one vec4 of
+        // storage even when the shader declares no parameters. The buffer is
+        // written each frame from the chain's ParamStore (#29).
+        let param_size = param_block
+            .as_ref()
+            .map(|b| b.size as u64)
+            .unwrap_or(UBO_FALLBACK_SIZE)
+            .max(UBO_FALLBACK_SIZE);
         let param_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("parameters"),
-            size: params.len() as u64,
+            size: param_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&param_buffer, 0, &params);
-
-        // Reflect the SPIR-V to discover the builtin block's member offsets (#28)
-        // so builtins can be declared in any order/subset. A reflection failure
-        // is non-fatal: fall back to no builtin block (zero-filled UBO) rather
-        // than refusing to build the pass.
-        let builtin_block = slang_compile::reflect(shader)
-            .ok()
-            .and_then(|r| uniforms::builtin_block(&r).cloned());
         // Size the builtin UBO to the reflected block (a 16-byte multiple), or
         // to one vec4 when there is no builtin block.
         let ubo_size = builtin_block
@@ -575,6 +650,7 @@ impl Renderer {
             param_buffer,
             ubo,
             builtin_block,
+            param_block,
             frame_count_mod: pass.frame_count_mod,
             sampler,
             target_format,
@@ -765,7 +841,10 @@ impl Renderer {
             };
 
             // No builtin block declared -> nothing to pack (the fallback vec4 UBO
-            // stays zero), but still advance the running sizes.
+            // stays zero), but still advance the running sizes. A block mixing
+            // builtins + `#pragma parameter`s packs both here: builtins first
+            // (offset-by-name), then the current param values overlaid at their
+            // own offsets — one unified path (#29).
             if let Some(block) = &res.builtin_block {
                 let values = BuiltinValues {
                     mvp: uniforms::ortho_mvp(),
@@ -781,8 +860,19 @@ impl Renderer {
                     rotation: 0,
                     pass_output_sizes: pass_output_sizes.clone(),
                 };
-                let bytes = uniforms::pack_builtins(block, &values);
+                let mut bytes = uniforms::pack_builtins(block, &values);
+                uniforms::pack_params(&mut bytes, block, &self.params);
                 self.queue.write_buffer(&res.ubo, 0, &bytes);
+            }
+
+            // The dedicated parameter block (binding 3): pack the current global
+            // values at their reflected offsets and re-upload (#29). Re-done every
+            // frame so a live `set_parameter` reaches the shader without a
+            // recompile. A zero-filled buffer when the pass has no param block.
+            if let Some(block) = &res.param_block {
+                let mut bytes = vec![0u8; block.size as usize];
+                uniforms::pack_params(&mut bytes, block, &self.params);
+                self.queue.write_buffer(&res.param_buffer, 0, &bytes);
             }
 
             pass_output_sizes.push(uniforms::size_vec(output_size.0, output_size.1));

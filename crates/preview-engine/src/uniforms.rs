@@ -122,6 +122,207 @@ pub fn pack_parameters(params: &[Parameter]) -> Vec<u8> {
 }
 
 // ============================================================================
+// Reflection-driven parameter packing + global parameter state (#29)
+// ============================================================================
+
+/// The live, global-by-name parameter state for a render chain (#29).
+///
+/// RetroArch parameters are **global by name**: a `#pragma parameter X` declared
+/// in any number of passes is one knob with one `current` value, fed to every
+/// block (UBO or push) that declares a member named `X`. This store holds the
+/// deduped parameter metadata (`#pragma parameter` defaults/range/label, plus any
+/// alias) in declaration order, and a `name -> current value` map the renderer
+/// re-packs into each pass's reflected offsets every frame.
+///
+/// Values are clamped to `[min, max]` on set (the reference's §8 open question —
+/// we apply the clamp for v1; documented). Construction seeds each `current` to
+/// the `#pragma` default; [`ParamStore::apply_overrides`] then layers a preset's
+/// `parameter_overrides` on top (the §8 `id = value` semantics: overrides the
+/// `current` value, not the pragma `initial`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParamStore {
+    /// Deduped parameter metadata in first-seen declaration order. The slider UI
+    /// renders these; the renderer reads `name`/`alias` to know which member
+    /// names a value packs into.
+    params: Vec<ParamDef>,
+    /// Current value per canonical name (initialized to each default, then
+    /// overridden). Looked up by both the canonical name and any alias.
+    current: std::collections::HashMap<String, f32>,
+}
+
+/// One global parameter's metadata: the `#pragma parameter` declaration plus an
+/// optional alternate name (`alias`) the slang/preset may reference it by (§8).
+/// A value set via the alias drives the same `current` slot as the canonical
+/// name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamDef {
+    /// The canonical `#pragma parameter` identifier (the UBO member name).
+    pub name: String,
+    /// An alternate name this parameter is also addressable by, if any. Both the
+    /// canonical name and the alias resolve to the same `current` value.
+    pub alias: Option<String>,
+    /// Human-readable label (`#pragma parameter` description).
+    pub label: String,
+    /// `#pragma` default (the `initial` field; never mutated by a set/override).
+    pub default: f32,
+    /// Minimum (clamp lower bound).
+    pub min: f32,
+    /// Maximum (clamp upper bound).
+    pub max: f32,
+    /// Slider increment (informational; surfaced to the UI).
+    pub step: f32,
+}
+
+/// A current parameter value surfaced to the UI / a query: the metadata plus the
+/// live `value`. Returned by the engine's `parameters()` query so a frontend can
+/// render data-driven sliders.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamView {
+    /// Canonical `#pragma parameter` name.
+    pub name: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Minimum slider value.
+    pub min: f32,
+    /// Maximum slider value.
+    pub max: f32,
+    /// Slider increment.
+    pub step: f32,
+    /// The current (live) value.
+    pub value: f32,
+}
+
+impl ParamStore {
+    /// Build a store from every pass's `#pragma parameter` declarations, deduped
+    /// **by exact name** (RetroArch's global-by-name merge, §8): the first
+    /// declaration of a name wins for metadata and the rest are merged into it.
+    /// Each `current` value is seeded to the parameter's default. `aliases` maps a
+    /// canonical parameter name to an alternate name it may also be referenced by
+    /// (e.g. a preset/pass alias); an empty map means no aliases.
+    ///
+    /// Per §8 the same id declared across files must match exactly; we do not hard
+    /// error on a mismatch here (the compile/preprocess layer is the place for
+    /// that) — we keep the first declaration, which is the value RetroArch uses.
+    pub fn collect<'a>(
+        passes: impl IntoIterator<Item = &'a [Parameter]>,
+        aliases: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let mut store = ParamStore::default();
+        for params in passes {
+            for p in params {
+                if store.params.iter().any(|d| d.name == p.name) {
+                    continue; // already collected (global by name)
+                }
+                let alias = aliases.get(&p.name).cloned();
+                store.current.insert(p.name.clone(), p.default);
+                if let Some(a) = &alias {
+                    store.current.insert(a.clone(), p.default);
+                }
+                store.params.push(ParamDef {
+                    name: p.name.clone(),
+                    alias,
+                    label: p.label.clone(),
+                    default: p.default,
+                    min: p.min,
+                    max: p.max,
+                    step: p.step,
+                });
+            }
+        }
+        store
+    }
+
+    /// Apply a preset's `parameter_overrides` (§8 bare `id = value`): set each
+    /// named parameter's current value (clamped to its range). Names that match no
+    /// collected parameter are ignored. An override may target the canonical name
+    /// or an alias.
+    pub fn apply_overrides(&mut self, overrides: &std::collections::BTreeMap<String, f32>) {
+        for (name, value) in overrides {
+            self.set(name, *value);
+        }
+    }
+
+    /// Set a parameter's current value by canonical name or alias, clamped to
+    /// `[min, max]` (§8 clamp, applied for v1). A name matching no parameter is a
+    /// no-op (returns `false`); a successful set returns `true`.
+    pub fn set(&mut self, name: &str, value: f32) -> bool {
+        // Resolve the name (or alias) to the canonical parameter.
+        let Some(def) = self
+            .params
+            .iter()
+            .find(|d| d.name == name || d.alias.as_deref() == Some(name))
+        else {
+            return false;
+        };
+        let clamped = value.clamp(def.min, def.max);
+        // Write under the canonical name and the alias so a member declared under
+        // either spelling reads the same value.
+        self.current.insert(def.name.clone(), clamped);
+        if let Some(a) = &def.alias {
+            self.current.insert(a.clone(), clamped);
+        }
+        true
+    }
+
+    /// The current value for a member `name` (canonical or alias), or `None` if
+    /// no parameter is named that. The packing path calls this per uniform-block
+    /// member: a member matching a parameter gets its current value; everything
+    /// else (builtins, unknowns) is left to the builtin packing / zero.
+    pub fn value(&self, name: &str) -> Option<f32> {
+        self.current.get(name).copied()
+    }
+
+    /// Whether the store holds no parameters at all.
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    /// The current parameter set for the UI / a query, in declaration order.
+    pub fn views(&self) -> Vec<ParamView> {
+        self.params
+            .iter()
+            .map(|d| ParamView {
+                name: d.name.clone(),
+                label: d.label.clone(),
+                min: d.min,
+                max: d.max,
+                step: d.step,
+                value: self.value(&d.name).unwrap_or(d.default),
+            })
+            .collect()
+    }
+}
+
+/// Overlay the current parameter values onto an already-packed block byte image
+/// (#29): for every member of `block` whose name matches a parameter in `store`,
+/// write that parameter's current value (an `f32`) at the member's reflected
+/// offset. Members that are builtins or unknown are left untouched — so this is
+/// safe to run after [`pack_builtins`] on the *same* block, giving one
+/// "builtins first, then params" path for a mixed block (as real RetroArch
+/// shaders declare). Mutates `bytes` in place; a no-op when the store is empty.
+///
+/// This is the same offset-by-name mechanism #28 uses for builtins, layered for
+/// parameters: a member is a builtin XOR a parameter, so the two passes never
+/// fight over the same offset.
+pub fn pack_params(bytes: &mut [u8], block: &UniformBlock, store: &ParamStore) {
+    if store.is_empty() {
+        return;
+    }
+    for m in &block.members {
+        let Some(value) = store.value(&m.name) else {
+            continue;
+        };
+        let src = value.to_le_bytes();
+        let start = m.offset as usize;
+        let max = (m.size as usize).min(src.len());
+        let end = (start + max).min(bytes.len());
+        if start < bytes.len() {
+            bytes[start..end].copy_from_slice(&src[..end - start]);
+        }
+    }
+}
+
+// ============================================================================
 // Reflection-driven builtin semantics (#28)
 // ============================================================================
 
@@ -524,6 +725,154 @@ mod tests {
         // Not-yet-wired / unknown semantics return None (member left zero).
         assert!(values.member_bytes("OriginalHistory1Size").is_none());
         assert!(values.member_bytes("SomeUserParam").is_none());
+    }
+
+    // ---- Reflection-driven parameter packing + state (#29; no GPU). ----
+
+    fn full_param(name: &str, default: f32, min: f32, max: f32) -> Parameter {
+        Parameter {
+            name: name.to_string(),
+            label: format!("{name} label"),
+            default,
+            min,
+            max,
+            step: 0.1,
+        }
+    }
+
+    #[test]
+    fn param_store_collects_globally_by_name_and_seeds_defaults() {
+        // Two passes; param X declared in both (same value), Y only in pass 1.
+        // Declaration order is preserved; X is collected once (global by name).
+        let pass0 = vec![full_param("X", 0.5, 0.0, 1.0)];
+        let pass1 = vec![
+            full_param("X", 0.5, 0.0, 1.0),
+            full_param("Y", 2.0, 0.0, 4.0),
+        ];
+        let aliases = std::collections::HashMap::new();
+        let store = ParamStore::collect([pass0.as_slice(), pass1.as_slice()], &aliases);
+
+        let views = store.views();
+        assert_eq!(views.len(), 2, "X deduped, Y added");
+        assert_eq!(views[0].name, "X");
+        assert_eq!(views[0].value, 0.5);
+        assert_eq!(views[1].name, "Y");
+        assert_eq!(views[1].value, 2.0);
+        // Lookups by name return the current (default) values.
+        assert_eq!(store.value("X"), Some(0.5));
+        assert_eq!(store.value("Y"), Some(2.0));
+        assert_eq!(store.value("Z"), None);
+    }
+
+    #[test]
+    fn param_store_set_clamps_to_range() {
+        let p = vec![full_param("LEVEL", 0.5, 0.0, 1.0)];
+        let aliases = std::collections::HashMap::new();
+        let mut store = ParamStore::collect([p.as_slice()], &aliases);
+
+        assert!(store.set("LEVEL", 0.75));
+        assert_eq!(store.value("LEVEL"), Some(0.75));
+        // Above max clamps to max; below min clamps to min.
+        assert!(store.set("LEVEL", 5.0));
+        assert_eq!(store.value("LEVEL"), Some(1.0));
+        assert!(store.set("LEVEL", -3.0));
+        assert_eq!(store.value("LEVEL"), Some(0.0));
+        // An unknown name is a no-op.
+        assert!(!store.set("NOPE", 0.5));
+    }
+
+    #[test]
+    fn param_store_alias_drives_the_same_value() {
+        let p = vec![full_param("BRIGHT", 1.0, 0.0, 2.0)];
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("BRIGHT".to_string(), "brightness".to_string());
+        let mut store = ParamStore::collect([p.as_slice()], &aliases);
+
+        // Setting via the alias updates the canonical value (and vice versa).
+        assert!(store.set("brightness", 1.5));
+        assert_eq!(store.value("BRIGHT"), Some(1.5));
+        assert_eq!(store.value("brightness"), Some(1.5));
+        assert!(store.set("BRIGHT", 0.25));
+        assert_eq!(store.value("brightness"), Some(0.25));
+    }
+
+    #[test]
+    fn param_store_overrides_set_current_not_default() {
+        let p = vec![full_param("CONTRAST", 0.5, 0.0, 1.0)];
+        let aliases = std::collections::HashMap::new();
+        let mut store = ParamStore::collect([p.as_slice()], &aliases);
+
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("CONTRAST".to_string(), 0.9);
+        // An out-of-range override is also clamped.
+        overrides.insert("UNKNOWN".to_string(), 1.0);
+        store.apply_overrides(&overrides);
+
+        assert_eq!(store.value("CONTRAST"), Some(0.9));
+        // The pragma default is untouched (visible if we never overrode it).
+        assert_eq!(store.views()[0].value, 0.9);
+        assert_eq!(store.value("UNKNOWN"), None, "unknown override ignored");
+    }
+
+    #[test]
+    fn pack_params_writes_current_value_at_member_offset() {
+        // A param-only block with members in NON-canonical order: B at 0, A at 4.
+        let blk = block(
+            16,
+            vec![
+                member("B", 0, 4, MemberKind::Scalar(ScalarType::Float)),
+                member("A", 4, 4, MemberKind::Scalar(ScalarType::Float)),
+            ],
+        );
+        let params = vec![
+            full_param("A", 0.25, 0.0, 1.0),
+            full_param("B", 0.75, 0.0, 1.0),
+        ];
+        let aliases = std::collections::HashMap::new();
+        let store = ParamStore::collect([params.as_slice()], &aliases);
+
+        let mut bytes = vec![0u8; 16];
+        pack_params(&mut bytes, &blk, &store);
+        // B at offset 0, A at offset 4 — proves offset-by-name, not declaration
+        // order in the #pragma list.
+        assert_eq!(&bytes[0..4], &0.75f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0.25f32.to_le_bytes());
+    }
+
+    #[test]
+    fn pack_params_overlays_builtins_in_a_mixed_block() {
+        // A block mixing a builtin (OutputSize) and a param (LEVEL): pack_builtins
+        // then pack_params must each land at their own offset without clobbering.
+        let blk = block(
+            32,
+            vec![
+                member("OutputSize", 0, 16, vec4_kind()),
+                member("LEVEL", 16, 4, MemberKind::Scalar(ScalarType::Float)),
+            ],
+        );
+        let values = BuiltinValues {
+            output_size: size_vec(100, 50),
+            ..Default::default()
+        };
+        let params = vec![full_param("LEVEL", 0.5, 0.0, 1.0)];
+        let aliases = std::collections::HashMap::new();
+        let store = ParamStore::collect([params.as_slice()], &aliases);
+
+        let mut bytes = pack_builtins(&blk, &values);
+        pack_params(&mut bytes, &blk, &store);
+        assert_eq!(f32x4(&bytes, 0), size_vec(100, 50), "builtin survives");
+        assert_eq!(&bytes[16..20], &0.5f32.to_le_bytes(), "param packed");
+    }
+
+    #[test]
+    fn pack_params_is_noop_for_empty_store() {
+        let blk = block(
+            16,
+            vec![member("X", 0, 4, MemberKind::Scalar(ScalarType::Float))],
+        );
+        let mut bytes = vec![7u8; 16];
+        pack_params(&mut bytes, &blk, &ParamStore::default());
+        assert_eq!(bytes, vec![7u8; 16], "empty store touches nothing");
     }
 
     #[test]
