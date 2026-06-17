@@ -55,12 +55,27 @@ pub struct BuiltinUniforms {
 impl BuiltinUniforms {
     /// Compute the builtin set from the source-image and output (viewport) sizes
     /// and the current frame counter. `original` is the pass-0 input — in a
-    /// one-pass slice it is the same image as `source`.
+    /// one-pass slice it is the same image as `source`. Convenience wrapper over
+    /// [`BuiltinUniforms::new_full`] for the single-pass case where
+    /// `Source == Original`.
     pub fn new(source: (u32, u32), output: (u32, u32), frame_count: u32) -> Self {
+        Self::new_full(source, source, output, frame_count)
+    }
+
+    /// Compute the builtin set for one pass of a multi-pass chain, where the
+    /// pass's `Source` (its input), the chain's `Original` (the pass-0 input),
+    /// and the pass's `Output` (its render target) can all differ (§2/§6). Pass 0
+    /// has `source == original`; later passes' `source` is the previous FBO size.
+    pub fn new_full(
+        source: (u32, u32),
+        original: (u32, u32),
+        output: (u32, u32),
+        frame_count: u32,
+    ) -> Self {
         Self {
             mvp: ortho_mvp(),
             source_size: size_vec(source.0, source.1),
-            original_size: size_vec(source.0, source.1),
+            original_size: size_vec(original.0, original.1),
             output_size: size_vec(output.0, output.1),
             frame_count,
             pad: [0; 3],

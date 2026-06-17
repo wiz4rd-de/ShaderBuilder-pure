@@ -24,6 +24,7 @@ use slang_compile::CompiledShader;
 use source::Frame;
 
 use crate::frame::{FrameHeader, FRAME_HEADER_LEN};
+use crate::pass::Pass;
 use crate::renderer::{Renderer, RendererError};
 use crate::FrameSource;
 
@@ -59,8 +60,12 @@ const WAITING_RGBA: [u8; 4] = [32, 32, 32, 255];
 pub enum RenderCommand {
     /// Replace the source image the shader samples.
     SetSource(Frame),
-    /// Replace the active compiled shader pass.
+    /// Replace the active shader with a single-pass chain (back-compat with the
+    /// Phase-1 single-shader path).
     SetShader(CompiledShader),
+    /// Replace the active render chain with an ordered N-pass pipeline (#22). A
+    /// `.slangp` preset is loaded by the app into a `Vec<Pass>` and sent here.
+    SetChain(Vec<Pass>),
     /// Resize the offscreen target — i.e. the preview-pane size that frames are
     /// downsampled to.
     SetViewport(u32, u32),
@@ -106,6 +111,12 @@ impl RenderSource {
                 RenderCommand::SetShader(shader) => {
                     self.renderer.set_shader(&shader);
                     self.have_shader = true;
+                }
+                RenderCommand::SetChain(passes) => {
+                    // An empty chain is ignored (keeps the previous one running).
+                    if self.renderer.set_chain(&passes).is_ok() {
+                        self.have_shader = true;
+                    }
                 }
                 RenderCommand::SetViewport(width, height) => {
                     self.renderer.set_viewport(width, height);
