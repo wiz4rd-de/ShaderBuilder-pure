@@ -1,0 +1,39 @@
+# RetroArch reference capture metadata (#32, PART B).
+#
+# This PNG is an ACTUAL RetroArch screenshot — NOT a self-oracle golden from our
+# own engine. It is the final shader-output framebuffer RetroArch rendered for the
+# preset below over the committed source image, captured headlessly. The
+# references.rs test renders the SAME preset through our engine and diffs against
+# this PNG to prove fidelity vs RetroArch (see docs/golden-image-harness.md).
+
+preset = "crt/crt-geom.slangp"
+corpus = "slang-shaders"
+corpus_commit = "74bf541845e65cca7f09b3c6b3baeeea8f52afb3"
+source = "references/src/testcard_320x240.png"
+viewport_width = 320
+viewport_height = 240
+# RetroArch's FrameCount at the screenshot; our engine renders at the matching
+# 0-based frame_index (frame_index = max_frames - 1 ... but for a still source only
+# animated shaders care; crt-geom's only frame dependence is interlace, identical
+# every other frame). We render at frame_index = 60 to match --max-frames=60.
+frame_index = 60
+retroarch_version = "1.22.2 (Git 69a4f0ea1e)"
+retroarch_video_driver = "glcore"   # slang backend; the GL driver only does GLSL
+gpu = "llvmpipe (software, LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe)"
+core = "imageviewer (built from libretro/RetroArch cores/libretro-imageviewer)"
+
+# The appendconfig forced for a predictable, full-frame 1:1 geometry:
+#   video_driver = glcore, video_shader_enable = true, menu_driver = null,
+#   video_scale_integer = false, aspect_ratio_index = 23 (custom),
+#   custom_viewport_{width,height} = 320,240, video_smooth = false,
+#   video_threaded = false, video_vsync = false.
+# Capture command:
+#   retroarch -L imageviewer_libretro.so testcard_320x240.png \
+#     --appendconfig=fidelity.cfg --set-shader=<preset> \
+#     --max-frames=60 --max-frames-ss --max-frames-ss-path=<out>.png
+
+# Calibrated diff thresholds (per-channel tolerance / max fraction over it).
+# crt-geom matches RetroArch essentially pixel-for-pixel here (both renderers run
+# on llvmpipe): observed max_abs=2, mean_abs=0.001, 0% of pixels over tolerance 2.
+diff_tolerance = 4
+diff_max_fraction = 0.001

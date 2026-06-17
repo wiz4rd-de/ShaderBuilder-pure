@@ -1,0 +1,31 @@
+# RetroArch reference capture metadata (#32, PART B). See crt-geom.toml for the
+# full capture procedure; only the preset-specific fields differ here.
+#
+# ACTUAL RetroArch screenshot, NOT a self-oracle golden.
+
+preset = "ntsc/ntsc-256px-svideo-scanline.slangp"
+corpus = "slang-shaders"
+corpus_commit = "74bf541845e65cca7f09b3c6b3baeeea8f52afb3"
+source = "references/src/testcard_320x240.png"
+viewport_width = 320
+viewport_height = 240
+frame_index = 60
+retroarch_version = "1.22.2 (Git 69a4f0ea1e)"
+retroarch_video_driver = "glcore"
+gpu = "llvmpipe (software, LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe)"
+core = "imageviewer (built from libretro/RetroArch cores/libretro-imageviewer)"
+
+# Calibrated thresholds. This is a multi-pass NTSC chain (S-video band-limiting +
+# scanlines). The NTSC encode/decode produces high-frequency chroma ringing where
+# the two software paths round slightly differently along the vertical color-bar
+# edges; the flat interiors and the gradient match closely. Observed: max_abs=53,
+# mean_abs=0.166, 3.6% of pixels over tolerance 2, 0.73% over tolerance 16. A
+# structural break (wrong filter, missing pass, phase error) would move a large
+# fraction far past tolerance 16.
+diff_tolerance = 24
+diff_max_fraction = 0.05
+
+# NOTE: the NTSC chain reads FrameCount for its signal phase; the match holds at
+# the recorded frame_index because imageviewer re-presents the same still each
+# frame (so FrameCount, not the source, is what advances — exactly our pump's
+# still-image behavior).
