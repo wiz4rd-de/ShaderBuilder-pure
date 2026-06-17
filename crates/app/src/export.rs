@@ -5,7 +5,19 @@
 //! copying, relative paths, inline parameter defaults, preserved-key re-emission —
 //! lives in [`preset_io::export_preset`]. This module is the thin IPC seam: it
 //! takes the project the editor holds plus a destination directory, calls the
-//! writer, and returns a small JSON-friendly summary the UI can show.
+//! writer, and returns the typed [`core_model::ExportResult`] the UI can show — or
+//! the typed [`core_model::ExportError`] on failure.
+//!
+//! ## Typed surface (single shared schema, Fix C1)
+//!
+//! Both the success ([`core_model::ExportResult`]) and error
+//! ([`core_model::ExportError`]) payloads live in `core-model`, so TypeScript
+//! bindings are generated from the one shared schema (core-model module doc §A)
+//! instead of escaping it as an untyped string. Mirroring the
+//! `save_project`/`load_project` precedent ([`crate::project`]), the error keeps
+//! its two failure modes — a write `Io` failure and the expected
+//! `GraphPassUnsupported` limitation — as **branchable** variants. The internal
+//! [`preset_io::ExportError`] is mapped at this seam by [`to_typed_error`].
 //!
 //! ## Extras (preserved unknown keys)
 //!
@@ -18,37 +30,40 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use core_model::{ExportError, ExportResult};
 
-/// The summary [`export_preset`] returns to the webview: where the bundle was
-/// written and what files it contains, plus any non-fatal notes.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportResult {
-    /// Absolute path of the written `preset.slangp`.
-    pub preset_path: String,
-    /// Per-pass `.slang` file names written, relative to the bundle root.
-    pub pass_files: Vec<String>,
-    /// LUT file names written under `textures/`, relative to the bundle root.
-    pub texture_files: Vec<String>,
-    /// Non-fatal notes (e.g. a LUT source image that could not be copied in).
-    pub warnings: Vec<String>,
+/// Map the crate-internal [`preset_io::ExportError`] into the webview-facing,
+/// TS-exported [`core_model::ExportError`] (Fix C1). The two failure modes stay
+/// **distinct** so the frontend can branch — the expected `GraphPassUnsupported`
+/// limitation never collapses into the same opaque string as a real write error.
+/// `std::io::Error` is flattened to a message rather than leaked across IPC.
+fn to_typed_error(err: preset_io::ExportError) -> ExportError {
+    match err {
+        preset_io::ExportError::Io(e) => ExportError::Io {
+            message: e.to_string(),
+        },
+        preset_io::ExportError::GraphPassUnsupported(pass_id) => {
+            ExportError::GraphPassUnsupported { pass_id }
+        }
+    }
 }
 
 /// Export the editor's current [`core_model::Project`] as a RetroArch bundle under
 /// `dest_dir` (#36). Writes `preset.slangp` + per-pass `.slang` + `textures/` LUT
-/// PNGs with **relative** paths and inline parameter defaults; returns a summary.
-/// A write error (bad destination, unwritable dir, a graph pass) is returned to
-/// the caller as a string.
+/// PNGs with **relative** paths and inline parameter defaults; returns a typed
+/// [`ExportResult`] summary. On failure returns the typed [`ExportError`] — a
+/// write failure (`Io`) or the expected graph-pass limitation
+/// (`GraphPassUnsupported`) — so the webview can branch on the variant rather than
+/// parse a string.
 #[tauri::command]
 pub fn export_preset(
     project: core_model::Project,
     dest_dir: String,
-) -> Result<ExportResult, String> {
+) -> Result<ExportResult, ExportError> {
     // The editable project carries no preserved unknown keys, so extras is empty
     // here (see the module docs).
-    let report = preset_io::export_preset(&project, &dest_dir, &BTreeMap::new())
-        .map_err(|e| e.to_string())?;
+    let report =
+        preset_io::export_preset(&project, &dest_dir, &BTreeMap::new()).map_err(to_typed_error)?;
     Ok(ExportResult {
         preset_path: report.preset_path.to_string_lossy().into_owned(),
         pass_files: report.pass_files,
@@ -116,5 +131,38 @@ mod tests {
         assert!(text.contains("shader0 = a.slang"));
         assert!(text.contains("BORDER = textures/border.png"));
         assert!(text.contains("B = 1.5"), "param override emitted inline");
+    }
+
+    /// A graph pass cannot be exported until Phase-5 codegen lands; the command
+    /// must surface the typed [`ExportError::GraphPassUnsupported`] variant — not
+    /// an opaque string — carrying the offending pass id, so the webview can branch
+    /// on the expected limitation (Fix C1 acceptance).
+    #[test]
+    fn export_command_returns_typed_graph_pass_unsupported() {
+        use core_model::{Graph, Pass, PassSettings, PassSource, Project};
+
+        let project = Project {
+            passes: vec![Pass {
+                id: "graph-pass".to_owned(),
+                name: "Graph".to_owned(),
+                source: PassSource::Graph {
+                    graph: Graph::default(),
+                },
+                parameters: vec![],
+                references: vec![],
+                settings: PassSettings::default(),
+            }],
+            ..Project::empty("Graph Export")
+        };
+
+        let out = tempfile::tempdir().unwrap();
+        let err = export_preset(project, out.path().to_string_lossy().into_owned())
+            .expect_err("graph pass must not export");
+
+        // Branchable typed variant, carrying the pass id — not a flattened string.
+        match err {
+            ExportError::GraphPassUnsupported { pass_id } => assert_eq!(pass_id, "graph-pass"),
+            other => panic!("expected GraphPassUnsupported, got {other:?}"),
+        }
     }
 }
