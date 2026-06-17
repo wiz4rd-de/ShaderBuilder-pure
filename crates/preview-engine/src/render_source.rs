@@ -69,6 +69,14 @@ pub enum RenderCommand {
     /// Resize the offscreen target — i.e. the preview-pane size that frames are
     /// downsampled to.
     SetViewport(u32, u32),
+    /// Update a `#pragma parameter`'s current value live (#29). Applied to the
+    /// chain's global-by-name parameter store; the next frame re-packs it — no
+    /// recompile or pipeline rebuild. An unknown name is a no-op.
+    SetParameter { name: String, value: f32 },
+    /// Apply a preset's `parameter_overrides` (#29): for each `name -> value`, set
+    /// the current value (clamped). Sent after a `SetChain` so the override lands
+    /// on the freshly-collected defaults.
+    ApplyParameterOverrides(std::collections::BTreeMap<String, f32>),
 }
 
 /// A [`FrameSource`] that renders a source image through a compiled slang shader
@@ -120,6 +128,15 @@ impl RenderSource {
                 }
                 RenderCommand::SetViewport(width, height) => {
                     self.renderer.set_viewport(width, height);
+                }
+                RenderCommand::SetParameter { name, value } => {
+                    // Live param update: no recompile, takes effect next frame.
+                    self.renderer.set_parameter(&name, value);
+                }
+                RenderCommand::ApplyParameterOverrides(overrides) => {
+                    let mut store = self.renderer.collected_params().clone();
+                    store.apply_overrides(&overrides);
+                    self.renderer.set_params(store);
                 }
             }
         }
@@ -240,6 +257,55 @@ mod tests {
         assert!(
             px.chunks_exact(4).all(|p| p == WAITING_RGBA.as_slice()),
             "every pixel should be the waiting color until ready"
+        );
+    }
+
+    /// A param-only shader (R = X) driven over the command channel: the
+    /// `SetParameter` command must change the streamed frame within one render,
+    /// exactly as the Tauri command will (#29).
+    #[test]
+    fn set_parameter_command_changes_streamed_frame() {
+        let (tx, rx) = mpsc::channel();
+        let mut src = RenderSource::new(8, 8, rx).expect("wgpu device");
+
+        let shader = compile_slang(
+            "#version 450
+#pragma parameter X \"X\" 0.5 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+layout(std140, set = 0, binding = 3) uniform Params { float X; } params;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() { FragColor = vec4(params.X, 0.0, 0.0, 1.0); }
+",
+            None,
+        )
+        .expect("compile param shader");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(8, 8)))
+            .unwrap();
+
+        // Default X=0.5 -> R~128.
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+        assert!((pixels(&buf)[0] as i32 - 128).abs() <= 4, "default X");
+
+        // Live set X=0.9 -> R~230 on the very next frame.
+        tx.send(RenderCommand::SetParameter {
+            name: "X".to_string(),
+            value: 0.9,
+        })
+        .unwrap();
+        src.render_into(1, &mut buf);
+        assert!(
+            (pixels(&buf)[0] as i32 - 230).abs() <= 6,
+            "live SetParameter took effect, got {}",
+            pixels(&buf)[0]
         );
     }
 
