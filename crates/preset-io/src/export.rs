@@ -35,6 +35,20 @@
 //! until the Phase-5 codegen lands, so [`export_preset`] returns
 //! [`ExportError::GraphPassUnsupported`] for one. Import-produced projects are
 //! entirely whole-pass code, so the export path this issue targets is unaffected.
+//!
+//! ## Known limitation — per-pass `#include` dependencies are NOT bundled (B5)
+//!
+//! A pass `.slang` body may `#include` (or `#pragma include_optional`) other files
+//! — shared headers, parameter blocks, library helpers. The export bundle writes
+//! each whole-pass source byte-for-byte but does **not** copy those included files,
+//! nor rewrite the directives, so an include-using preset may fail to load in
+//! RetroArch as-is. The full fix — capturing and reproducing the transitive
+//! include closure while preserving its relative directory layout — is a **tracked
+//! Phase-3 follow-up** (deferred, beyond this issue's scope). Until then the gap is
+//! made NON-SILENT: [`export_preset`] scans each pass source for include directives
+//! and pushes a clear [`ExportReport::warnings`] entry when any are present, so the
+//! caller is told the bundle may be incomplete rather than discovering it at load
+//! time.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -126,6 +140,18 @@ pub fn export_preset(
         // Byte-for-byte: write the stored bytes with no normalization so an
         // unmodified imported pass is byte-identical to its original.
         std::fs::write(dest_dir.join(file), source.as_bytes())?;
+        // B5 (minimal mitigation): this pass body may `#include` other files that
+        // are NOT copied into the bundle. The full fix — capturing and reproducing
+        // the transitive include closure with its relative layout — is a tracked
+        // Phase-3 follow-up beyond this issue's scope. For now, make the gap
+        // NON-SILENT: warn so the exporter never quietly produces a preset that
+        // won't load in RetroArch.
+        if source_has_include(source) {
+            report.warnings.push(format!(
+                "pass `{file}`: #include dependencies are not copied into the bundle \
+                 (known limitation); the exported preset may not load in RetroArch as-is"
+            ));
+        }
     }
     report.pass_files = pass_files.clone();
 
@@ -440,6 +466,20 @@ fn wrap_mode_str(w: WrapMode) -> &'static str {
     }
 }
 
+/// Whether a whole-pass source carries any `#include` / `#pragma include_optional`
+/// directive (B5). A textual line scan — not a preprocessor — matching a directive
+/// at the start of a line (after leading whitespace). Used only to emit a
+/// non-silent export warning, since the export bundle does NOT copy the included
+/// files (a tracked Phase-3 follow-up; see the module docs).
+fn source_has_include(source: &str) -> bool {
+    source.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("#include")
+            || t.starts_with("#pragma include")
+            || t.starts_with("#pragma include_optional")
+    })
+}
+
 /// Format a scale factor: an `absolute` factor is a literal integer pixel count
 /// (§2), so it is written without a fractional part; every other type writes the
 /// float via [`fmt_f32`].
@@ -737,6 +777,68 @@ mod tests {
             on_disk.as_slice(),
             raw.as_bytes(),
             "pass source must be written byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn include_in_pass_source_yields_export_warning() {
+        // B5: the export bundle does NOT copy a pass's #include dependencies, so an
+        // include-using preset may not load in RetroArch as-is. The gap must be
+        // NON-SILENT: a clear ExportReport warning naming the pass file fires, while
+        // a pass with no includes produces no such warning.
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = sample_project();
+        project.passes[0].source = wpc(
+            "#version 450\n#include \"common.inc\"\nvoid main(){}\n",
+            "first.slang",
+        );
+        // Also exercise the #pragma include_optional spelling.
+        project.passes[1].source = wpc(
+            "#version 450\n  #pragma include_optional \"opt.inc\"\nvoid main(){}\n",
+            "second.slang",
+        );
+        let out = dir.path().join("bundle");
+        let report = export_preset(&project, &out, &BTreeMap::new()).expect("exports");
+
+        let include_warnings: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("#include dependencies are not copied"))
+            .collect();
+        assert_eq!(
+            include_warnings.len(),
+            2,
+            "both include-using passes warn: {:?}",
+            report.warnings
+        );
+        assert!(
+            include_warnings.iter().any(|w| w.contains("first.slang")),
+            "warning names the pass file: {:?}",
+            report.warnings
+        );
+        assert!(
+            include_warnings.iter().any(|w| w.contains("second.slang")),
+            "include_optional also warns: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn no_include_yields_no_include_warning() {
+        // A pass with no #include must NOT trip the B5 warning (no false positive).
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = sample_project();
+        project.passes[0].source = wpc("#version 450\nvoid main(){}\n", "first.slang");
+        project.passes[1].source = wpc("#version 450\nvoid main(){}\n", "second.slang");
+        let out = dir.path().join("bundle");
+        let report = export_preset(&project, &out, &BTreeMap::new()).expect("exports");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("#include dependencies are not copied")),
+            "no include -> no include warning: {:?}",
+            report.warnings
         );
     }
 
