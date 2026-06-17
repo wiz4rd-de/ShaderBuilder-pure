@@ -4,8 +4,10 @@
 //! (Architecture §G risk 3).
 //!
 //! [`compile_slang`] is the pure entry point: source string in, SPIR-V + parsed
-//! reflection out.
+//! reflection out. [`cache::CompileCache`] wraps it with a content-hash cache so
+//! identical input skips glslang.
 
+pub mod cache;
 mod glslang;
 pub mod preprocess;
 
