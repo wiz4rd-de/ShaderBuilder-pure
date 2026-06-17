@@ -766,4 +766,138 @@ mod tests {
         assert_eq!(fmt_scale(Some(ScaleType::Absolute), 320.0), "320");
         assert_eq!(fmt_scale(Some(ScaleType::Source), 2.0), "2.0");
     }
+
+    // ---- import → export → re-import round-trip fidelity (#36) ---------------
+
+    /// Write a small but representative multi-pass preset (scale, alias, format,
+    /// feedback, a LUT, params + an override, and an unknown key) to a temp dir,
+    /// returning the `.slangp` path. The two pass `.slang` files carry gnarly
+    /// bytes (BOM, CRLF, trailing whitespace, no final newline) to prove the
+    /// byte-exact contract survives the round trip.
+    fn write_source_preset(dir: &Path) -> PathBuf {
+        let pass0 = "\u{feff}#version 450\r\n\
+             #pragma parameter BRIGHT \"Brightness\" 1.0 0.0 2.0 0.01   \r\n\
+             void main(){}";
+        let pass1 = "#version 450\n#pragma stage fragment\nvoid main(){}\n";
+        std::fs::write(dir.join("first.slang"), pass0).unwrap();
+        std::fs::write(dir.join("second.slang"), pass1).unwrap();
+        std::fs::write(dir.join("border.png"), b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let slangp = dir.join("crt.slangp");
+        std::fs::write(
+            &slangp,
+            "shaders = 2\n\
+             feedback_pass = 1\n\
+             shader0 = first.slang\n\
+             alias0 = FIRST\n\
+             scale_type0 = source\n\
+             scale0 = 2.0\n\
+             filter_linear0 = false\n\
+             srgb_framebuffer0 = true\n\
+             shader1 = second.slang\n\
+             scale_type_x1 = absolute\n\
+             scale_x1 = 320\n\
+             scale_type_y1 = viewport\n\
+             scale_y1 = 1.0\n\
+             frame_count_mod1 = 60\n\
+             textures = BORDER\n\
+             BORDER = border.png\n\
+             BORDER_linear = true\n\
+             BORDER_wrap_mode = clamp_to_edge\n\
+             parameters = \"BRIGHT\"\n\
+             BRIGHT = 1.5\n\
+             vendor_unknown = some_value\n",
+        )
+        .unwrap();
+        slangp
+    }
+
+    #[test]
+    fn round_trip_preserves_passes_settings_luts_and_params() {
+        let src = tempfile::tempdir().unwrap();
+        let slangp = write_source_preset(src.path());
+
+        // Import the source preset.
+        let preset = crate::parse_slangp(&slangp).expect("parses");
+        let (project, _) = crate::import_parsed_preset(&preset, "crt");
+
+        // Export it to a fresh bundle dir, threading the preserved extras back in.
+        let out = tempfile::tempdir().unwrap();
+        let report = export_preset(&project, out.path(), &preset.extras).expect("export succeeds");
+        assert!(
+            report.warnings.is_empty(),
+            "no warnings: {:?}",
+            report.warnings
+        );
+
+        // Re-import the EXPORTED bundle and compare the salient model fields.
+        let (reimported, _) =
+            crate::import_preset(out.path().join(PRESET_FILENAME)).expect("re-import");
+
+        assert_eq!(reimported.passes.len(), project.passes.len());
+        assert_eq!(reimported.feedback_pass, project.feedback_pass);
+
+        // Per-pass settings survive.
+        for (a, b) in project.passes.iter().zip(&reimported.passes) {
+            assert_eq!(a.settings, b.settings, "pass settings round-trip");
+        }
+
+        // The reconciled parameter (with its preset override applied) survives.
+        let bright = reimported
+            .parameters
+            .iter()
+            .find(|p| p.name == "BRIGHT")
+            .expect("BRIGHT present after round trip");
+        assert_eq!(bright.default, 1.5, "override survives round trip");
+        assert_eq!(bright.min, 0.0);
+        assert_eq!(bright.max, 2.0);
+        assert_eq!(bright.step, 0.01);
+
+        // The LUT survives with its sampler settings + a path under textures/.
+        let lut = &reimported.luts[0];
+        assert_eq!(lut.name, "BORDER");
+        assert_eq!(lut.filter_linear, Some(true));
+        assert_eq!(lut.wrap_mode, Some(WrapMode::ClampToEdge));
+        assert!(
+            lut.path.ends_with("textures/border.png"),
+            "LUT path is under textures/: {}",
+            lut.path
+        );
+
+        // The unknown key was re-emitted, so the re-import preserves it again.
+        let (_, diags) = crate::import_preset(out.path().join(PRESET_FILENAME)).unwrap();
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("vendor_unknown")),
+            "preserved extra reappears on re-import: {:?}",
+            diags.diagnostics
+        );
+    }
+
+    #[test]
+    fn round_trip_pass_slang_files_are_byte_identical() {
+        // ACCEPTANCE (#36): an unmodified imported pass's `.slang` is byte-identical
+        // to its original after export.
+        let src = tempfile::tempdir().unwrap();
+        let slangp = write_source_preset(src.path());
+
+        let (project, _) = crate::import_preset(&slangp).expect("import");
+        let out = tempfile::tempdir().unwrap();
+        let report = export_preset(&project, out.path(), &BTreeMap::new()).expect("export");
+
+        for (n, file) in report.pass_files.iter().enumerate() {
+            let original_name = if n == 0 {
+                "first.slang"
+            } else {
+                "second.slang"
+            };
+            let original = std::fs::read(src.path().join(original_name)).unwrap();
+            let exported = std::fs::read(out.path().join(file)).unwrap();
+            assert_eq!(
+                exported, original,
+                "pass {n} ({file}) must be byte-identical to its original"
+            );
+        }
+    }
 }
