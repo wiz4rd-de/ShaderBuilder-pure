@@ -19,4 +19,11 @@ name: string,
  * The render pipeline: an ordered list of passes. Maps 1:1 to a `.slangp`
  * (Spec §3, pipeline view).
  */
-passes: Array<Pass>, };
+passes: Array<Pass>, 
+/**
+ * `feedback_pass` — the global pass index double-buffered for feedback, or
+ * `None` when the preset declares no global feedback pass (RetroArch default
+ * `-1`). Distinct from per-pass `<alias>Feedback` bindings (§4). Carried on
+ * the project so import → re-export is lossless.
+ */
+feedbackPass: number | null, };

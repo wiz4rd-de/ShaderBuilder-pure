@@ -56,6 +56,12 @@ pub struct Project {
     /// The render pipeline: an ordered list of passes. Maps 1:1 to a `.slangp`
     /// (Spec §3, pipeline view).
     pub passes: Vec<Pass>,
+    /// `feedback_pass` — the global pass index double-buffered for feedback, or
+    /// `None` when the preset declares no global feedback pass (RetroArch default
+    /// `-1`). Distinct from per-pass `<alias>Feedback` bindings (§4). Carried on
+    /// the project so import → re-export is lossless.
+    #[serde(default)]
+    pub feedback_pass: Option<u32>,
 }
 
 /// One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -73,6 +79,126 @@ pub struct Pass {
     pub source: PassSource,
     /// `#pragma parameter` knobs this pass exposes as live sliders (Spec §4).
     pub parameters: Vec<Parameter>,
+    /// RetroArch per-pass render settings (scale, format, sampler, feedback;
+    /// `docs/retroarch-slang-runtime.md` §1–§3). Defaults to [`PassSettings::default`]
+    /// (all `None`) for graph-authored passes that haven't set anything yet.
+    #[serde(default)]
+    pub settings: PassSettings,
+}
+
+/// How a pass's render target (FBO) size is derived from the available size
+/// inputs (`docs/retroarch-slang-runtime.md` §2). The serde tag is the exact
+/// RetroArch `.slangp` string, so import → export round-trips losslessly.
+///
+/// The librashader-only `Original` extension has no upstream preset string and
+/// is intentionally **not** represented here (§11 open-question 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ScaleType {
+    /// `source`: factor × this pass's input size (`OriginalSize` for pass 0,
+    /// else the previous FBO size). RetroArch `RARCH_SCALE_INPUT`.
+    Source,
+    /// `viewport`: factor × the simulated final viewport size
+    /// (`FinalViewportSize`). RetroArch `RARCH_SCALE_VIEWPORT`.
+    Viewport,
+    /// `absolute`: a literal integer pixel count; the input size is ignored.
+    /// RetroArch `RARCH_SCALE_ABSOLUTE`.
+    Absolute,
+}
+
+/// Sampler wrap mode for a pass's (or LUT's) source texture
+/// (`docs/retroarch-slang-runtime.md` §3, `video_shader_wrap_str_to_mode`). The
+/// serde representation is camelCase (e.g. `"clampToBorder"`) per the §A
+/// convention; the v1 default is [`WrapMode::ClampToBorder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum WrapMode {
+    /// `clamp_to_border` — RetroArch `RARCH_WRAP_BORDER`, the default.
+    ClampToBorder,
+    /// `clamp_to_edge` — RetroArch `RARCH_WRAP_EDGE`.
+    ClampToEdge,
+    /// `repeat` — RetroArch `RARCH_WRAP_REPEAT`.
+    Repeat,
+    /// `mirrored_repeat` — RetroArch `RARCH_WRAP_MIRRORED_REPEAT`.
+    MirroredRepeat,
+}
+
+/// One axis of a pass's scale specification: a scale type and its factor
+/// (`docs/retroarch-slang-runtime.md` §2). Each field is `Option` so an absent
+/// preset key stays absent — the engine applies the position-dependent default
+/// (intermediate = `source × 1.0`, final = `viewport`) rather than this carrying
+/// an invented value.
+///
+/// For `Absolute` the `scale` is the literal integer pixel count (stored as
+/// `f32`; callers round). For `Source`/`Viewport` it multiplies the relevant
+/// size.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ScaleAxis {
+    /// The effective scale type for this axis, or `None` if the preset set no
+    /// scale-type key for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_type: Option<ScaleType>,
+    /// The effective scale factor for this axis, or `None` if the preset set no
+    /// scale-factor key for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
+}
+
+/// RetroArch per-pass render settings carried on a [`Pass`]
+/// (`docs/retroarch-slang-runtime.md` §1–§3). Every field is optional: `None`
+/// means "the preset did not set this key" so the engine can apply the
+/// position-dependent §2/§3 defaults rather than this baking one in.
+///
+/// ## Combined-vs-per-axis scale precedence (§2)
+///
+/// The `.slangp` file may set scale either combined (`scale_typeN` / `scaleN`,
+/// applying to both axes) or per-axis (`scale_type_xN` / `scale_xN` and the `_y`
+/// forms). Per [`preset_io::Pass::scale_type_x`] et al., the per-axis key wins
+/// over the combined key for its axis, and a combined key applies to whichever
+/// axis has no per-axis override. The import bridge ([`preset_io::import_preset`])
+/// **resolves** that precedence and stores the already-effective per-axis values
+/// in [`ScaleAxis`], so this model never carries the raw combined/per-axis
+/// ambiguity — `scale_x`/`scale_y` here are the final values.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PassSettings {
+    /// Effective X-axis scale (combined/per-axis precedence already resolved).
+    #[serde(default)]
+    pub scale_x: ScaleAxis,
+    /// Effective Y-axis scale (combined/per-axis precedence already resolved).
+    #[serde(default)]
+    pub scale_y: ScaleAxis,
+    /// `filter_linearN` — `true`=linear, `false`=nearest input filtering; `None`
+    /// ⇒ unspecified (engine uses the §3 v1 default, linear).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_linear: Option<bool>,
+    /// `wrap_modeN` — sampler wrap for this pass's input; `None` ⇒ §3 default
+    /// (`clampToBorder`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_mode: Option<WrapMode>,
+    /// `mipmap_inputN` — generate a mip chain for this pass's input texture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mipmap_input: Option<bool>,
+    /// `float_framebufferN` — `true` → RGBA16F render target (§3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float_framebuffer: Option<bool>,
+    /// `srgb_framebufferN` — `true` → RGBA8 sRGB render target (§3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srgb_framebuffer: Option<bool>,
+    /// `aliasN` — semantic name enabling `<alias>` / `<alias>Size` /
+    /// `<alias>Feedback` bindings from later passes (§1/§4). Empty in the preset
+    /// ⇒ `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// `frame_count_modN` — if `>0`, the `FrameCount` fed to this pass wraps mod
+    /// this value (§1). `None`/`0` ⇒ no wrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_count_mod: Option<u32>,
 }
 
 /// How a pass's shader is defined (Spec §3, Architecture §C).
@@ -208,6 +334,7 @@ impl Project {
             schema_version: PROJECT_SCHEMA_VERSION,
             name: name.into(),
             passes: Vec::new(),
+            feedback_pass: None,
         }
     }
 }
@@ -226,6 +353,7 @@ mod tests {
         let project = Project {
             schema_version: PROJECT_SCHEMA_VERSION,
             name: "Demo".to_owned(),
+            feedback_pass: Some(1),
             passes: vec![
                 Pass {
                     id: "pass-0".to_owned(),
@@ -249,6 +377,23 @@ mod tests {
                         max: 2.0,
                         step: 0.01,
                     }],
+                    settings: PassSettings {
+                        scale_x: ScaleAxis {
+                            scale_type: Some(ScaleType::Source),
+                            scale: Some(2.0),
+                        },
+                        scale_y: ScaleAxis {
+                            scale_type: Some(ScaleType::Source),
+                            scale: Some(2.0),
+                        },
+                        filter_linear: Some(true),
+                        wrap_mode: Some(WrapMode::ClampToBorder),
+                        mipmap_input: None,
+                        float_framebuffer: None,
+                        srgb_framebuffer: Some(true),
+                        alias: Some("FirstPass".to_owned()),
+                        frame_count_mod: Some(60),
+                    },
                 },
                 Pass {
                     id: "pass-1".to_owned(),
@@ -257,6 +402,7 @@ mod tests {
                         source: "// verbatim slang".to_owned(),
                     },
                     parameters: vec![],
+                    settings: PassSettings::default(),
                 },
             ],
         };
@@ -273,6 +419,52 @@ mod tests {
             serde_json::from_str(r#"{"id":"n0","kind":"output","position":{"x":0,"y":0}}"#)
                 .expect("deserialize node without data");
         assert_eq!(node.data, serde_json::json!({}));
+    }
+
+    #[test]
+    fn scale_type_serializes_as_retroarch_strings() {
+        // The serde tag must be the exact `.slangp` string so import → export
+        // round-trips losslessly (and matches the parser's accepted strings).
+        assert_eq!(
+            serde_json::to_value(ScaleType::Source).unwrap(),
+            serde_json::json!("source")
+        );
+        assert_eq!(
+            serde_json::to_value(ScaleType::Viewport).unwrap(),
+            serde_json::json!("viewport")
+        );
+        assert_eq!(
+            serde_json::to_value(ScaleType::Absolute).unwrap(),
+            serde_json::json!("absolute")
+        );
+    }
+
+    #[test]
+    fn wrap_mode_serializes_as_camel_case() {
+        assert_eq!(
+            serde_json::to_value(WrapMode::ClampToBorder).unwrap(),
+            serde_json::json!("clampToBorder")
+        );
+        assert_eq!(
+            serde_json::to_value(WrapMode::MirroredRepeat).unwrap(),
+            serde_json::json!("mirroredRepeat")
+        );
+    }
+
+    #[test]
+    fn pass_settings_default_is_all_none() {
+        let s = PassSettings::default();
+        assert_eq!(s.scale_x, ScaleAxis::default());
+        assert_eq!(s.scale_y, ScaleAxis::default());
+        assert_eq!(s.filter_linear, None);
+        assert_eq!(s.alias, None);
+        // An omitted `settings`/`feedbackPass` deserializes to the defaults, so
+        // older project files (schemaVersion 1, no settings) still load.
+        let pass: Pass = serde_json::from_str(
+            r#"{"id":"p","name":"n","source":{"kind":"wholePassCode","source":""},"parameters":[]}"#,
+        )
+        .expect("pass without settings deserializes");
+        assert_eq!(pass.settings, PassSettings::default());
     }
 
     #[test]
