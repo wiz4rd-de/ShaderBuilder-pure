@@ -62,6 +62,13 @@ pub struct Project {
     /// the project so import → re-export is lossless.
     #[serde(default)]
     pub feedback_pass: Option<u32>,
+    /// Derived pipeline wiring metadata (alias → pass index, per-pass texture
+    /// availability) reconstructed at import time (#34). This is *metadata about*
+    /// the chain — not a node-IR — so a pass can be referenced by its alias and
+    /// the editor knows which RetroArch textures each pass may bind. Defaults to
+    /// [`PipelineMetadata::default`] (empty) for hand-built projects.
+    #[serde(default)]
+    pub pipeline: PipelineMetadata,
 }
 
 /// One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -84,6 +91,14 @@ pub struct Pass {
     /// (all `None`) for graph-authored passes that haven't set anything yet.
     #[serde(default)]
     pub settings: PassSettings,
+    /// RetroArch textures/aliases this pass's source *textually* references
+    /// (`PassOutputN`, `<alias>`, `Original`, `Source`, `…Feedback`, LUT names;
+    /// §7). Reconstructed by a **light textual scan** of the whole-pass source at
+    /// import time (#34) for pipeline wiring + LUT cross-check — it is **not** a
+    /// parse of the pass body into node-IR. Empty for graph-authored passes (and
+    /// for an unreadable/empty imported source). Defaults to `[]`.
+    #[serde(default)]
+    pub references: Vec<TextureRef>,
 }
 
 /// How a pass's render target (FBO) size is derived from the available size
@@ -213,10 +228,127 @@ pub enum PassSource {
     },
     /// Opaque whole-pass slang source taken verbatim — the escape hatch, and
     /// what preset import produces (Spec §3/§5).
+    ///
+    /// The pass body is **intentionally NOT decomposed** into a visual node
+    /// graph (Architecture §C: whole-pass nodes bypass the node-IR). The
+    /// [`WholePassCode::opaque`] marker records that contract on the data itself:
+    /// the source is held verbatim and treated as a single non-decomposable unit.
     WholePassCode {
-        /// The complete `.slang` pass source.
+        /// The complete `.slang` pass source, stored **byte-for-byte** as read
+        /// from disk on import — no normalization (line endings, trailing
+        /// whitespace, BOM) so import → re-export is lossless.
         source: String,
+        /// The source `.slang` file name (the `shaderN` basename, e.g.
+        /// `"crt-pass1.slang"`), or `None` when the source did not come from a
+        /// named file. Carried for display + lossless re-export of the chain.
+        #[serde(default)]
+        filename: Option<String>,
+        /// Marks this source as **opaque / non-decomposable**: its body is taken
+        /// verbatim and is *not* lowered into a [`Graph`] of visual nodes
+        /// (Architecture §C). Always `true` for whole-pass code; present as an
+        /// explicit, serialized contract rather than an implicit convention.
+        /// Defaults to `true` so older project files load as opaque.
+        #[serde(default = "default_true")]
+        opaque: bool,
     },
+}
+
+/// Default for [`PassSource::WholePassCode::opaque`]: whole-pass code is opaque.
+fn default_true() -> bool {
+    true
+}
+
+/// One RetroArch texture/alias a whole-pass source textually references (§7),
+/// found by the import-time scan (#34). This is *wiring metadata*, deliberately
+/// shallow: it records the **name** as written and a coarse [`TextureRefKind`]
+/// classification — it does not model where in the body the read occurs, nor
+/// does it decompose the pass into node-IR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TextureRef {
+    /// The texture/sampler identifier exactly as it appears in the source, e.g.
+    /// `"Original"`, `"Source"`, `"PassOutput2"`, `"MyAliasFeedback"`, or a LUT
+    /// name like `"BORDER"`.
+    pub name: String,
+    /// Coarse classification of what `name` refers to (§7 binding table).
+    pub kind: TextureRefKind,
+}
+
+/// Coarse classification of a [`TextureRef`] (§7 sampler binding table). The
+/// import scan classifies by the well-known RetroArch prefixes; anything else is
+/// [`TextureRefKind::Alias`] (a `#pragma name` pass alias or a LUT name —
+/// resolved against the alias/LUT tables, not distinguished by the scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TextureRefKind {
+    /// `Original` — the whole-chain input frame (`≡ OriginalHistory0`).
+    Original,
+    /// `Source` — the previous pass's output (`Original` for pass 0).
+    Source,
+    /// `PassOutputK` / `PassK` — pass `K`'s output **this frame** (causal).
+    PassOutput,
+    /// `PassFeedbackK` / `<alias>Feedback` — a pass's output from the previous
+    /// frame (§4).
+    Feedback,
+    /// `OriginalHistoryK` — `Original` from `K` frames ago (§5).
+    History,
+    /// `UserK` — the un-aliased LUT fallback (§7); a LUT referenced by its alias
+    /// name instead is classified as [`TextureRefKind::Alias`].
+    User,
+    /// A `#pragma name` pass alias or a preset LUT name — distinguished from the
+    /// pass/LUT it binds to only by the alias/LUT tables, not by the scan.
+    Alias,
+}
+
+/// Derived pipeline wiring metadata, reconstructed at import time (#34). This is
+/// **metadata about** the rendered chain — ordering, alias bindings, and the
+/// per-pass set of bindable RetroArch textures — and is deliberately **not** a
+/// node-IR: whole-pass bodies are never decomposed (Architecture §C). It lets a
+/// pass be referenced by its `#pragma name` / `aliasN` alias and lets the editor
+/// surface what each pass may legally bind without re-scanning sources.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PipelineMetadata {
+    /// `alias` → pass index, for every pass that declares an `aliasN`
+    /// (`#pragma name`) (§1/§7). Lets a later pass's `<alias>` / `<alias>Feedback`
+    /// reference resolve to a concrete pass. Ordered by pass index.
+    #[serde(default)]
+    pub aliases: Vec<AliasBinding>,
+    /// Per-pass availability: for each pass, the set of RetroArch texture
+    /// semantic names it may bind (`Original`, `Source`, `PassOutput0..i-1`,
+    /// earlier aliases, all LUTs, any feedback). Recorded as metadata so the
+    /// editor needn't re-derive causality. Indexed parallel to [`Project::passes`].
+    #[serde(default)]
+    pub availability: Vec<PassAvailability>,
+}
+
+/// One `alias → pass index` binding in [`PipelineMetadata::aliases`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AliasBinding {
+    /// The pass's semantic alias (`aliasN` / `#pragma name`).
+    pub alias: String,
+    /// Index of the pass it names, into [`Project::passes`].
+    pub pass_index: u32,
+}
+
+/// The set of RetroArch textures a single pass may bind, recorded as pipeline
+/// metadata (#34). Causal: only earlier passes' outputs/aliases appear (plus the
+/// always-available `Original`/`Source`, all LUTs, and any pass's feedback).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PassAvailability {
+    /// Index of the pass this availability is for, into [`Project::passes`].
+    pub pass_index: u32,
+    /// The semantic texture names bindable from this pass, in a deterministic
+    /// order (built-ins, then earlier `PassOutputK`, then earlier aliases, then
+    /// LUTs). Names only — sizes (`…Size`) and feedback twins are implied.
+    pub available: Vec<String>,
 }
 
 /// A per-pass node graph — a typed dataflow DAG (Architecture §C). Skeletal
@@ -335,6 +467,7 @@ impl Project {
             name: name.into(),
             passes: Vec::new(),
             feedback_pass: None,
+            pipeline: PipelineMetadata::default(),
         }
     }
 }
@@ -354,6 +487,27 @@ mod tests {
             schema_version: PROJECT_SCHEMA_VERSION,
             name: "Demo".to_owned(),
             feedback_pass: Some(1),
+            pipeline: PipelineMetadata {
+                aliases: vec![AliasBinding {
+                    alias: "FirstPass".to_owned(),
+                    pass_index: 0,
+                }],
+                availability: vec![
+                    PassAvailability {
+                        pass_index: 0,
+                        available: vec!["Original".to_owned(), "Source".to_owned()],
+                    },
+                    PassAvailability {
+                        pass_index: 1,
+                        available: vec![
+                            "Original".to_owned(),
+                            "Source".to_owned(),
+                            "PassOutput0".to_owned(),
+                            "FirstPass".to_owned(),
+                        ],
+                    },
+                ],
+            },
             passes: vec![
                 Pass {
                     id: "pass-0".to_owned(),
@@ -377,6 +531,7 @@ mod tests {
                         max: 2.0,
                         step: 0.01,
                     }],
+                    references: vec![],
                     settings: PassSettings {
                         scale_x: ScaleAxis {
                             scale_type: Some(ScaleType::Source),
@@ -400,8 +555,14 @@ mod tests {
                     name: "Imported".to_owned(),
                     source: PassSource::WholePassCode {
                         source: "// verbatim slang".to_owned(),
+                        filename: Some("imported.slang".to_owned()),
+                        opaque: true,
                     },
                     parameters: vec![],
+                    references: vec![TextureRef {
+                        name: "Source".to_owned(),
+                        kind: TextureRefKind::Source,
+                    }],
                     settings: PassSettings::default(),
                 },
             ],
@@ -477,9 +638,49 @@ mod tests {
 
         let code = PassSource::WholePassCode {
             source: "x".to_owned(),
+            filename: Some("x.slang".to_owned()),
+            opaque: true,
         };
         let value = serde_json::to_value(&code).unwrap();
         assert_eq!(value["kind"], "wholePassCode");
         assert_eq!(value["source"], "x");
+        assert_eq!(value["filename"], "x.slang");
+        assert_eq!(value["opaque"], true);
+    }
+
+    #[test]
+    fn whole_pass_code_filename_and_opaque_default() {
+        // Older project files (no `filename`/`opaque`) still load: filename
+        // defaults to None and the source is treated as opaque (non-decomposable).
+        let src: PassSource =
+            serde_json::from_str(r#"{"kind":"wholePassCode","source":"// body"}"#)
+                .expect("legacy wholePassCode deserializes");
+        match src {
+            PassSource::WholePassCode {
+                source,
+                filename,
+                opaque,
+            } => {
+                assert_eq!(source, "// body");
+                assert_eq!(filename, None);
+                assert!(
+                    opaque,
+                    "whole-pass code defaults to opaque/non-decomposable"
+                );
+            }
+            other => panic!("expected whole-pass code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_metadata_defaults_to_empty() {
+        // An omitted `pipeline`/`references` deserializes to defaults so older
+        // project files (schemaVersion 1, no pipeline metadata) still load.
+        let project: Project = serde_json::from_str(
+            r#"{"schemaVersion":1,"name":"x","passes":[{"id":"p","name":"n","source":{"kind":"wholePassCode","source":""},"parameters":[]}]}"#,
+        )
+        .expect("project without pipeline deserializes");
+        assert_eq!(project.pipeline, PipelineMetadata::default());
+        assert!(project.passes[0].references.is_empty());
     }
 }

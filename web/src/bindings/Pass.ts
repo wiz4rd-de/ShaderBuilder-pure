@@ -2,6 +2,7 @@
 import type { Parameter } from "./Parameter";
 import type { PassSettings } from "./PassSettings";
 import type { PassSource } from "./PassSource";
+import type { TextureRef } from "./TextureRef";
 
 /**
  * One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -30,4 +31,13 @@ parameters: Array<Parameter>,
  * `docs/retroarch-slang-runtime.md` §1–§3). Defaults to [`PassSettings::default`]
  * (all `None`) for graph-authored passes that haven't set anything yet.
  */
-settings: PassSettings, };
+settings: PassSettings, 
+/**
+ * RetroArch textures/aliases this pass's source *textually* references
+ * (`PassOutputN`, `<alias>`, `Original`, `Source`, `…Feedback`, LUT names;
+ * §7). Reconstructed by a **light textual scan** of the whole-pass source at
+ * import time (#34) for pipeline wiring + LUT cross-check — it is **not** a
+ * parse of the pass body into node-IR. Empty for graph-authored passes (and
+ * for an unreadable/empty imported source). Defaults to `[]`.
+ */
+references: Array<TextureRef>, };

@@ -17,6 +17,11 @@ export type { Node } from "./bindings/Node";
 export type { Edge } from "./bindings/Edge";
 export type { Parameter } from "./bindings/Parameter";
 export type { Vec2 } from "./bindings/Vec2";
+export type { TextureRef } from "./bindings/TextureRef";
+export type { TextureRefKind } from "./bindings/TextureRefKind";
+export type { PipelineMetadata } from "./bindings/PipelineMetadata";
+export type { AliasBinding } from "./bindings/AliasBinding";
+export type { PassAvailability } from "./bindings/PassAvailability";
 
 /** Schema version the frontend was built against (mirrors PROJECT_SCHEMA_VERSION). */
 export const PROJECT_SCHEMA_VERSION = 1;
@@ -27,4 +32,5 @@ export const EMPTY_PROJECT: Project = {
   name: "Untitled",
   passes: [],
   feedbackPass: null,
+  pipeline: { aliases: [], availability: [] },
 };

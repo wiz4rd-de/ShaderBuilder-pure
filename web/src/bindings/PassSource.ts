@@ -10,6 +10,22 @@ export type PassSource = { "kind": "graph",
  */
 graph: Graph, } | { "kind": "wholePassCode", 
 /**
- * The complete `.slang` pass source.
+ * The complete `.slang` pass source, stored **byte-for-byte** as read
+ * from disk on import — no normalization (line endings, trailing
+ * whitespace, BOM) so import → re-export is lossless.
  */
-source: string, };
+source: string, 
+/**
+ * The source `.slang` file name (the `shaderN` basename, e.g.
+ * `"crt-pass1.slang"`), or `None` when the source did not come from a
+ * named file. Carried for display + lossless re-export of the chain.
+ */
+filename: string | null, 
+/**
+ * Marks this source as **opaque / non-decomposable**: its body is taken
+ * verbatim and is *not* lowered into a [`Graph`] of visual nodes
+ * (Architecture §C). Always `true` for whole-pass code; present as an
+ * explicit, serialized contract rather than an implicit convention.
+ * Defaults to `true` so older project files load as opaque.
+ */
+opaque: boolean, };
