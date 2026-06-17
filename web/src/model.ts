@@ -23,6 +23,12 @@ export type { TextureRefKind } from "./bindings/TextureRefKind";
 export type { PipelineMetadata } from "./bindings/PipelineMetadata";
 export type { AliasBinding } from "./bindings/AliasBinding";
 export type { PassAvailability } from "./bindings/PassAvailability";
+export type { ProjectMetadata } from "./bindings/ProjectMetadata";
+export type { LibraryRef } from "./bindings/LibraryRef";
+// Typed save/load diagnostics returned by the save_project/load_project commands
+// (#38) — re-exported so the Phase-7 save/load UX can match on the variants.
+export type { ProjectLoadError } from "./bindings/ProjectLoadError";
+export type { ProjectSaveError } from "./bindings/ProjectSaveError";
 
 /** Schema version the frontend was built against (mirrors PROJECT_SCHEMA_VERSION). */
 export const PROJECT_SCHEMA_VERSION = 1;
@@ -36,4 +42,11 @@ export const EMPTY_PROJECT: Project = {
   pipeline: { aliases: [], availability: [] },
   parameters: [],
   luts: [],
+  metadata: {
+    description: null,
+    author: null,
+    createdAt: null,
+    modifiedAt: null,
+  },
+  libraryRefs: [],
 };
