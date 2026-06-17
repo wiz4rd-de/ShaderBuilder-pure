@@ -36,7 +36,11 @@
 //! crt-royale's `crt-royale-scanlines-horizontal-apply-mask` pass has exactly such
 //! helpers (`decode_input`, `sample_rgb_scanline_horizontal`, …), so without
 //! `--merge-return` a sampler-carrying `OpFunctionCall` survives and
-//! `split_samplers` still rejects the pass. With it, all calls are inlined.
+//! `split_samplers` still rejects the pass. With it, all of crt-royale's calls
+//! inline. (spirv-opt reports an un-inlinable function as a warning + exit 0, not
+//! an error, so this transform can't *guarantee* zero surviving calls; should one
+//! resist inlining, its sampler call simply falls through to `split_samplers`'
+//! clear rejection — a graceful failure, never corrupt SPIR-V.)
 //!
 //! ## Why a CLI shell-out (mirroring [`crate::glslang`])
 //!
@@ -146,8 +150,12 @@ pub fn inline_functions(stage: Stage, words: &[u32]) -> Result<Vec<u32>, SpirvOp
 
     let output = match output {
         Ok(o) => o,
-        Err(_) => {
-            // Binary not found / not runnable: skip inlining (degrade gracefully).
+        // ONLY a genuinely-absent binary degrades to a skip. A present-but-broken
+        // `spirv-opt` (non-executable / wrong arch → PermissionDenied / ENOEXEC) is
+        // an environment fault that must surface, not be silently mistaken for "not
+        // installed" — which would route sampler-in-function shaders to the
+        // split_samplers reject as if SPIRV-Tools were simply missing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if !MISSING_LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "slang-compile: '{bin}' not found; skipping SPIR-V function inlining. \
@@ -158,6 +166,7 @@ pub fn inline_functions(stage: Stage, words: &[u32]) -> Result<Vec<u32>, SpirvOp
             }
             return Ok(words.to_vec());
         }
+        Err(e) => return Err(SpirvOptError::Io(e)),
     };
 
     if !output.status.success() {
