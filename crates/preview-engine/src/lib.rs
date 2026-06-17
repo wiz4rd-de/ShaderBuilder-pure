@@ -1007,25 +1007,32 @@ layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
         // X collected once (global by name).
         assert_eq!(r.parameters().len(), 1, "X deduped across passes");
 
-        assert!(r.set_parameter("X", 0.5));
+        // Set X to a NON-default value (default is 0.5). With X=0.6 the cross-pass
+        // product is 0.6*0.6=0.36 (~92). This is robust against false greens:
+        // - a no-op set would leave both at the default 0.5 -> 0.25 (~64);
+        // - a world where only one pass picks up X (the other defaulting to 0.5)
+        //   would give 0.6*0.5=0.30 (~76).
+        // Only X reaching BOTH passes at the set value yields ~92.
+        assert!(r.set_parameter("X", 0.6));
         r.render().expect("render");
         let got = center(&r.read_back().expect("read back"))[0];
-        // X*X = 0.25 -> ~64. If only one pass saw X (the other defaulting), the
-        // product would differ; both passes seeing 0.5 gives 0.25.
         assert!(
-            (got as i32 - 64).abs() <= 5,
-            "X applied in BOTH passes -> 0.5*0.5=0.25 (~64), got {got}"
+            (got as i32 - 92).abs() <= 5,
+            "X=0.6 applied in BOTH passes -> 0.6*0.6=0.36 (~92), got {got} \
+             (a no-op set gives ~64; one-pass-only gives ~76)"
         );
     }
 
     #[test]
-    fn set_parameter_clamps_to_range() {
+    fn set_parameter_clamps_the_rendered_pixel_but_surfaces_raw() {
+        // §11 item 7: the store keeps the RAW value (surfaced to the UI), but the
+        // clamp is applied at use so the rendered pixel stays in range.
         let shader = x_scale_shader(); // X in [0,1]
         let mut r = Renderer::new(8, 8).expect("wgpu device");
         r.set_source(&solid(8, 8, [0, 0, 0, 255]));
         r.set_shader(&shader);
 
-        // Beyond max clamps to 1.0 -> ~255.
+        // Beyond max: the rendered pixel clamps to 1.0 -> ~255.
         assert!(r.set_parameter("X", 9.0));
         r.render().expect("render");
         assert!(
