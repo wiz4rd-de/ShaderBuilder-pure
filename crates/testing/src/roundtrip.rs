@@ -22,7 +22,11 @@
 //!    lived; the export *copies* it into `textures/<file>` and the re-import
 //!    points there. The bytes and sampler settings are unchanged, so we compare
 //!    LUTs by `name` + sampler settings and by the **basename** of the path, not
-//!    the absolute location.
+//!    the absolute location. The basename itself is compared modulo the export's
+//!    two deterministic file-name rewrites: unsafe-char **sanitization** (a space
+//!    → `_`, e.g. `psp border.png` → `psp_border.png`) and the collision **de-dup
+//!    suffix** the writer appends when several LUTs resolve to the same source
+//!    image (`foo.png` → `foo_3.png`). Both keep the LUT name + bytes intact.
 //! 2. **Pass `filename`** — the export may rename a `.slang` to avoid a collision
 //!    (`dup.slang` → `dup_1.slang`). The *source bytes* are what must survive, so
 //!    pass sources are compared by `source` (+ `opaque`), not `filename`.
@@ -272,7 +276,13 @@ fn compare_luts(a: &[Lut], b: &[Lut], d: &mut Vec<String>) {
                     la.mipmap, lb.mipmap
                 ));
             }
-            if path_basename(&la.path) != path_basename(&lb.path) {
+            // Compare basenames modulo the export's two deterministic file-name
+            // rewrites (see [`basenames_match`]): unsafe-char sanitization (a space
+            // → `_`) and the collision de-dup suffix (`foo.png` → `foo_3.png` when
+            // several LUTs share one source image). Both are identity rewrites the
+            // writer performs by design — the LUT NAME, bytes, and samplers are
+            // unchanged — so they are canonicalized away.
+            if !basenames_match(&la.path, &lb.path) {
                 d.push(format!(
                     "LUT `{name}` path basename: {:?} vs {:?}",
                     path_basename(&la.path),
@@ -290,6 +300,57 @@ fn path_basename(p: &str) -> &str {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(p)
+}
+
+/// Whether two LUT path basenames are equal modulo the export's deterministic
+/// file-name rewrites: (1) unsafe-char **sanitization** (`psp border.png` →
+/// `psp_border.png`) and (2) the collision **de-dup suffix** the writer appends
+/// before the extension when several LUTs resolve to the same source file
+/// (`foo.png` → `foo_3.png`). The original (`a`) sanitized stem must be a prefix
+/// of the re-imported (`b`) sanitized stem, with the remainder either empty or a
+/// `_<digits>` de-dup suffix, and the extensions equal.
+fn basenames_match(a: &str, b: &str) -> bool {
+    let (a_stem, a_ext) = split_stem_ext(&sanitize_basename(path_basename(a)));
+    let (b_stem, b_ext) = split_stem_ext(&sanitize_basename(path_basename(b)));
+    if a_ext != b_ext {
+        return false;
+    }
+    if a_stem == b_stem {
+        return true;
+    }
+    // `b` may be `a` with a `_<digits>` de-dup suffix appended.
+    match b_stem
+        .strip_prefix(&a_stem)
+        .and_then(|r| r.strip_prefix('_'))
+    {
+        Some(suffix) => !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// Split a file name into its stem and extension (the extension includes no dot;
+/// `""` when there is none). `"foo.bar.png"` → `("foo.bar", "png")`.
+fn split_stem_ext(name: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem.to_owned(), ext.to_owned()),
+        None => (name.to_owned(), String::new()),
+    }
+}
+
+/// Replicate the export's file-name sanitization (`preset_io::export`'s
+/// `sanitize_stem`): keep ASCII alphanumerics + `-`, `_`, `.`; map every other
+/// char (spaces, path separators, …) to `_`. Kept in lock-step with the writer so
+/// the round-trip compare canonicalizes exactly the rewrite the export performs.
+fn sanitize_basename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Whether an error indicates the round trip is **not applicable** to this preset
@@ -332,15 +393,39 @@ pub struct RoundTrip {
     pub diff: ProjectDiff,
     /// Per-pass byte equality of the exported `.slang` against the **original**
     /// source file — `true` for every unmodified imported pass (#34/#36 contract).
-    /// Parallel to [`Project::passes`].
+    /// Parallel to [`Project::passes`]. A pass whose original is non-UTF-8 (see
+    /// [`Self::non_utf8_passes`]) is recorded as `false` *and* listed there, so the
+    /// caller can classify the intrinsic-model limitation distinctly from a bug.
     pub pass_bytes_identical: Vec<bool>,
+    /// Indices of passes whose **original** `.slang` is not valid UTF-8. The model
+    /// stores a pass body as a `String` (UTF-8), so such a file cannot round-trip
+    /// byte-for-byte — an intrinsic limitation, not a writer bug. These are
+    /// surfaced for the corpus harness to report as a documented exclusion rather
+    /// than a silent byte loss.
+    pub non_utf8_passes: Vec<usize>,
 }
 
 impl RoundTrip {
     /// Whether the round trip preserved both structure (the diff) AND the
-    /// per-pass `.slang` bytes — the full lossless verdict.
+    /// per-pass `.slang` bytes — the full lossless verdict. A non-UTF-8 original
+    /// (which the `String` model cannot hold) makes this `false`; check
+    /// [`Self::non_utf8_passes`] to distinguish that intrinsic limitation from a
+    /// genuine byte-loss bug.
     pub fn is_lossless(&self) -> bool {
         self.diff.is_lossless() && self.pass_bytes_identical.iter().all(|&b| b)
+    }
+
+    /// Whether every byte mismatch is attributable to a non-UTF-8 original (so the
+    /// only "loss" is the intrinsic UTF-8-model limitation, and structure is
+    /// otherwise lossless). Used by the corpus harness to classify a finding as a
+    /// documented exclusion rather than a failure.
+    pub fn only_non_utf8_loss(&self) -> bool {
+        self.diff.is_lossless()
+            && self
+                .pass_bytes_identical
+                .iter()
+                .enumerate()
+                .all(|(i, &ok)| ok || self.non_utf8_passes.contains(&i))
     }
 
     /// A readable failure report (the structural diff plus any pass whose bytes
@@ -357,6 +442,13 @@ impl RoundTrip {
         if !changed.is_empty() {
             out.push_str(&format!(
                 "pass `.slang` bytes changed after export for pass index(es): {changed:?}\n"
+            ));
+        }
+        if !self.non_utf8_passes.is_empty() {
+            out.push_str(&format!(
+                "  (pass index(es) {:?} have a non-UTF-8 original — the String model \
+                 cannot round-trip those bytes)\n",
+                self.non_utf8_passes
             ));
         }
         out
@@ -387,10 +479,19 @@ pub fn round_trip(slangp: &Path, work_dir: &Path) -> Result<RoundTrip, RoundTrip
 
     // 3. Per-pass byte equality: each exported `.slang` vs its ORIGINAL on-disk
     //    file (the parsed pass `shader` path), for every unmodified imported pass.
+    //    A non-UTF-8 original is noted separately — the `String` model can't hold
+    //    its bytes, so the export of an empty source legitimately differs (an
+    //    intrinsic limitation, classified, not silently passed).
     let mut pass_bytes_identical = Vec::with_capacity(first.passes.len());
-    for (pass, exported_name) in preset.passes.iter().zip(&report.pass_files) {
+    let mut non_utf8_passes = Vec::new();
+    for (i, (pass, exported_name)) in preset.passes.iter().zip(&report.pass_files).enumerate() {
         let original = std::fs::read(&pass.shader).ok();
         let exported = std::fs::read(work_dir.join(exported_name)).ok();
+        if let Some(o) = &original {
+            if std::str::from_utf8(o).is_err() {
+                non_utf8_passes.push(i);
+            }
+        }
         pass_bytes_identical.push(match (original, exported) {
             (Some(o), Some(e)) => o == e,
             // A missing original (unreadable shader) can't be byte-compared; the
@@ -411,6 +512,7 @@ pub fn round_trip(slangp: &Path, work_dir: &Path) -> Result<RoundTrip, RoundTrip
         second,
         diff,
         pass_bytes_identical,
+        non_utf8_passes,
     })
 }
 
@@ -497,6 +599,52 @@ mod tests {
             "LUT dir change must be canonicalized: {}",
             diff.report()
         );
+    }
+
+    #[test]
+    fn lut_space_in_filename_sanitization_is_canonicalized_away() {
+        // The export rewrites a space to `_` (psp border.png -> psp_border.png).
+        let mut a = one_pass_project();
+        a.luts[0].path = "/src/psp border.png".to_owned();
+        let mut b = a.clone();
+        b.luts[0].path = "/bundle/textures/psp_border.png".to_owned();
+        let diff = compare_projects(&a, &b);
+        assert!(
+            diff.is_lossless(),
+            "space sanitization must be canonicalized: {}",
+            diff.report()
+        );
+    }
+
+    #[test]
+    fn lut_collision_dedup_suffix_is_canonicalized_away() {
+        // Several LUTs sharing one source file get a de-dup suffix on export
+        // (placeholder.png -> placeholder_3.png). The LUT NAME + bytes are
+        // unchanged, so this is canonicalized.
+        let a = one_pass_project();
+        let mut b = a.clone();
+        b.luts[0].path = "/bundle/textures/pal_3.png".to_owned();
+        let diff = compare_projects(&a, &b);
+        assert!(
+            diff.is_lossless(),
+            "de-dup suffix must be canonicalized: {}",
+            diff.report()
+        );
+    }
+
+    #[test]
+    fn basenames_match_only_for_sanitize_or_dedup_rewrites() {
+        // Identity, sanitization, and de-dup match…
+        assert!(basenames_match("a/pal.png", "b/pal.png"));
+        assert!(basenames_match("a/psp border.png", "b/psp_border.png"));
+        assert!(basenames_match("a/pal.png", "b/pal_3.png"));
+        assert!(basenames_match("a/pal.png", "b/pal_12.png"));
+        // …but a genuinely different file, a non-numeric suffix, or a changed
+        // extension does NOT.
+        assert!(!basenames_match("a/pal.png", "b/other.png"));
+        assert!(!basenames_match("a/pal.png", "b/pal_x.png"));
+        assert!(!basenames_match("a/pal.png", "b/pal.jpg"));
+        assert!(!basenames_match("a/pal.png", "b/pal.png.bak"));
     }
 
     #[test]
