@@ -679,19 +679,123 @@ impl Project {
             message: e.to_string(),
         })
     }
+
+    /// Save this project to a single `.json` file at `path` (Spec §6, #38) — the
+    /// native project-file writer. Serializes via [`to_json`] and writes the bytes
+    /// (a UTF-8 trailing newline is appended so the file is tool-friendly). Any
+    /// serialize or write failure is a typed [`ProjectSaveError`], never a panic.
+    ///
+    /// This writes **one** self-contained JSON document and nothing else: it does
+    /// not produce, reference, or touch any `.slangp` bundle. Exporting a RetroArch
+    /// bundle is the separate `preset_io::export_preset` path (#36); the boundary
+    /// is enforced by these being different functions in different crates.
+    ///
+    /// [`to_json`]: Project::to_json
+    pub fn save_to_file(&self, path: impl AsRef<std::path::Path>) -> Result<(), ProjectSaveError> {
+        let mut json = self.to_json().map_err(|e| ProjectSaveError::Serialize {
+            message: e.to_string(),
+        })?;
+        json.push('\n');
+        std::fs::write(path, json).map_err(|e| ProjectSaveError::Io {
+            error_kind: format!("{:?}", e.kind()),
+            message: e.to_string(),
+        })
+    }
+
+    /// Load a project from a single `.json` file at `path` (Spec §6, #38) — the
+    /// native project-file reader. Reads the bytes (a read failure is
+    /// [`ProjectLoadError::Io`]) then parses + version-validates them via
+    /// [`from_json`] (so a malformed or out-of-date file is the corresponding typed
+    /// [`ProjectLoadError`]). Never panics.
+    ///
+    /// [`from_json`]: Project::from_json
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self, ProjectLoadError> {
+        let json = std::fs::read_to_string(path).map_err(|e| ProjectLoadError::Io {
+            error_kind: format!("{:?}", e.kind()),
+            message: e.to_string(),
+        })?;
+        Self::from_json(&json)
+    }
 }
 
-/// A typed error from loading a native project file ([`Project::from_json`], and
-/// the `load_project` Tauri command, #38). Returned instead of panicking on a
-/// malformed or out-of-date file (Spec §6 acceptance).
+/// A typed error from saving a native project file ([`Project::save_to_file`] and
+/// the `save_project` Tauri command, #38). Serializing a well-formed [`Project`]
+/// effectively never fails, so in practice this is an [`Io`] write error; both
+/// variants exist so the command never panics and the frontend can match.
 ///
-/// This carries no `std::io` variant: file IO is the caller's concern (the Tauri
-/// command maps a read error separately). These variants describe only the
-/// *content* of a project document.
+/// [`Io`]: ProjectSaveError::Io
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ProjectSaveError {
+    /// The file could not be written (permission denied, missing parent dir, …).
+    Io {
+        /// The `std::io::ErrorKind` label (e.g. `"PermissionDenied"`). Named
+        /// `errorKind` to avoid colliding with the `"kind"` serde tag.
+        error_kind: String,
+        /// The OS error message.
+        message: String,
+    },
+    /// The project could not be serialized to JSON (should not happen for a
+    /// well-formed model; present so the path never panics).
+    Serialize {
+        /// The underlying `serde_json` message.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ProjectSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectSaveError::Io {
+                error_kind,
+                message,
+            } => {
+                write!(f, "could not write project file ({error_kind}): {message}")
+            }
+            ProjectSaveError::Serialize { message } => {
+                write!(f, "could not serialize project: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectSaveError {}
+
+/// A typed error from loading a native project file ([`Project::from_json`] /
+/// [`Project::load_from_file`], and the `load_project` Tauri command, #38).
+/// Returned instead of panicking on a missing, malformed, or out-of-date file
+/// (Spec §6 acceptance).
+///
+/// `std::io::Error` is not `Clone`/`Eq`/`Serialize`, so the [`Io`] variant
+/// flattens a read failure to its `ErrorKind` label + message; this keeps the
+/// whole enum a clean, serializable IPC payload the Phase-7 UX can match on (e.g.
+/// distinguishing "file not found" from "corrupt file"). The content-only
+/// helper [`Project::from_json`] never produces [`Io`].
+///
+/// [`Io`]: ProjectLoadError::Io
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[ts(export)]
 pub enum ProjectLoadError {
+    /// The file could not be **read** from disk (missing, permission denied, …).
+    /// Produced only by the file helper [`Project::load_from_file`], never by the
+    /// in-memory [`Project::from_json`].
+    Io {
+        /// The `std::io::ErrorKind` label (e.g. `"NotFound"`), for matching.
+        /// Named `errorKind` to avoid colliding with the `"kind"` serde tag.
+        error_kind: String,
+        /// The OS error message.
+        message: String,
+    },
     /// The text is not valid project JSON: not an object, missing
     /// `schemaVersion`, or a shape that doesn't match the current schema. Carries
     /// the underlying parser message.
@@ -726,6 +830,12 @@ pub enum ProjectLoadError {
 impl std::fmt::Display for ProjectLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProjectLoadError::Io {
+                error_kind,
+                message,
+            } => {
+                write!(f, "could not read project file ({error_kind}): {message}")
+            }
             ProjectLoadError::Malformed { message } => {
                 write!(f, "malformed project file: {message}")
             }
@@ -1119,6 +1229,67 @@ mod tests {
     }
 
     #[test]
+    fn save_to_file_then_load_from_file_round_trips() {
+        // The on-disk #38 round trip: save a project to one .json, load it back,
+        // and get an identical in-memory model.
+        let project = Project {
+            schema_version: PROJECT_SCHEMA_VERSION,
+            name: "OnDisk".to_owned(),
+            metadata: ProjectMetadata {
+                description: Some("disk round trip".to_owned()),
+                ..ProjectMetadata::default()
+            },
+            ..Project::empty("OnDisk")
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "sb-project-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        project.save_to_file(&path).expect("save");
+        let loaded = Project::load_from_file(&path).expect("load");
+        assert_eq!(project, loaded);
+        // The written file ends in a newline (tool-friendly) but still parses.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with('\n'));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_file_missing_file_is_typed_io_error() {
+        let path = std::env::temp_dir().join(format!(
+            "sb-project-does-not-exist-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        match Project::load_from_file(&path) {
+            Err(ProjectLoadError::Io { error_kind, .. }) => assert_eq!(error_kind, "NotFound"),
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_save_error_serializes_as_ipc_payload() {
+        for err in [
+            ProjectSaveError::Io {
+                error_kind: "PermissionDenied".to_owned(),
+                message: "denied".to_owned(),
+            },
+            ProjectSaveError::Serialize {
+                message: "bad".to_owned(),
+            },
+        ] {
+            let value = serde_json::to_value(&err).expect("serializes");
+            let back: ProjectSaveError = serde_json::from_value(value).expect("round-trips");
+            assert_eq!(err, back);
+        }
+    }
+
+    #[test]
     fn from_json_rejects_a_newer_schema_version() {
         let json = format!(
             r#"{{"schemaVersion":{},"name":"x","passes":[]}}"#,
@@ -1175,6 +1346,10 @@ mod tests {
         // (a tagged *newtype* string variant would fail at runtime — see the
         // `message` struct field on `Malformed`).
         for err in [
+            ProjectLoadError::Io {
+                error_kind: "NotFound".to_owned(),
+                message: "missing".to_owned(),
+            },
             ProjectLoadError::Malformed {
                 message: "boom".to_owned(),
             },
