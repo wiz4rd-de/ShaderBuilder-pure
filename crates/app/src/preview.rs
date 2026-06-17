@@ -199,8 +199,9 @@ fn compile_preset_chain(preset: &preset_io::Preset) -> Result<Vec<preview_engine
         if let Some(scale) = scale_config(p) {
             pass = pass.with_scale(scale);
         }
-        // Carry the parsed format/sampler hints onto the engine descriptor for
-        // the later tickets that consume them (#23/#24); harmless to #22.
+        // Carry the parsed format/sampler hints onto the engine descriptor (#23).
+        // An absent key keeps the engine default (linear filter, clamp_to_border
+        // wrap, no srgb/float/mipmap — §3 v1 choices).
         if let Some(v) = p.srgb_framebuffer {
             pass.srgb_framebuffer = v;
         }
@@ -209,6 +210,9 @@ fn compile_preset_chain(preset: &preset_io::Preset) -> Result<Vec<preview_engine
         }
         if let Some(v) = p.filter_linear {
             pass.filter_linear = v;
+        }
+        if let Some(v) = p.wrap_mode {
+            pass.wrap_mode = map_wrap_mode(v);
         }
         if let Some(v) = p.mipmap_input {
             pass.mipmap_input = v;
@@ -259,6 +263,16 @@ fn map_scale_type(ty: preset_io::ScaleType) -> preview_engine::ScaleType {
         preset_io::ScaleType::Source => preview_engine::ScaleType::Source,
         preset_io::ScaleType::Viewport => preview_engine::ScaleType::Viewport,
         preset_io::ScaleType::Absolute => preview_engine::ScaleType::Absolute,
+    }
+}
+
+/// Convert the preset parser's wrap-mode enum to the engine's (#23).
+fn map_wrap_mode(wrap: preset_io::WrapMode) -> preview_engine::WrapMode {
+    match wrap {
+        preset_io::WrapMode::ClampToBorder => preview_engine::WrapMode::ClampToBorder,
+        preset_io::WrapMode::ClampToEdge => preview_engine::WrapMode::ClampToEdge,
+        preset_io::WrapMode::Repeat => preview_engine::WrapMode::Repeat,
+        preset_io::WrapMode::MirroredRepeat => preview_engine::WrapMode::MirroredRepeat,
     }
 }
 

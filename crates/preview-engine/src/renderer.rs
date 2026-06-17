@@ -26,15 +26,48 @@
 //! Note on samplers: wgpu's binding model uses **separate** texture + sampler,
 //! not GLSL's combined `sampler2D` (the conversion happens in `slang-compile`).
 
-use crate::pass::{AxisScale, Pass, ScaleConfig};
+use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
 use crate::uniforms::{self, BuiltinUniforms};
 use slang_compile::CompiledShader;
 use source::Frame;
 
 /// The offscreen color format. Linear RGBA8 so a passthrough shader reproduces
-/// the uploaded image byte-for-byte (no sRGB conversion in the slice). Phase 2
-/// per-pass format selection (sRGB/float, #23) is reserved on [`Pass`].
+/// the uploaded image byte-for-byte (no sRGB conversion in the slice).
+///
+/// The **final pass always renders into this 8-bit linear target** regardless of
+/// its `srgb_framebuffer`/`float_framebuffer` keys (#23): the preview reads back
+/// 8 bits per channel, so a float/sRGB final FBO would only be re-quantized to
+/// RGBA8 on read-back. Per-pass formats apply to **intermediate** FBOs (see
+/// [`Pass::fbo_format`]). This matches §3/§11.16: the final/viewport format is
+/// the swapchain's (here, the read-back target's).
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// WGSL for the mipmap-downsample pass (#23). A fullscreen triangle samples the
+/// previous mip level with a linear sampler; rendering into mip `k` from mip
+/// `k-1` performs a 2×2 box/linear downsample. Used to (re)generate a pass FBO's
+/// mip chain each frame when a consumer sets `mipmap_input` (§10 mip timing).
+const MIP_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+    // Fullscreen triangle covering the target; uv in [0,1].
+    var out: VsOut;
+    let x = f32((vi << 1u) & 2u);
+    let y = f32(vi & 2u);
+    out.uv = vec2<f32>(x, y);
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(src, smp, in.uv, 0.0);
+}
+"#;
 
 /// Fullscreen-quad vertex: clip-space position + source texture coordinate.
 #[repr(C)]
@@ -112,26 +145,47 @@ struct PassResources {
     param_buffer: wgpu::Buffer,
     /// This pass's builtin UBO (per-pass because `*Size` differs per pass).
     ubo: wgpu::Buffer,
+    /// This pass's **input** sampler (binding 2): filter/wrap/mip per the pass's
+    /// `filter_linear`/`wrap_mode`/`mipmap_input` (#23). Built once at
+    /// [`Renderer::build_pass`].
+    sampler: wgpu::Sampler,
+    /// The render-target format this pass writes (its FBO format for an
+    /// intermediate pass; [`OFFSCREEN_FORMAT`] for the final pass). The pipeline
+    /// was built for this format, so the FBO must match it.
+    target_format: wgpu::TextureFormat,
     /// Explicit scale config, or `None` to take the §2 position default.
     scale: Option<ScaleConfig>,
     /// `true` for an **intermediate** pass (owns an FBO, sized by its scale);
     /// `false` for the **final** pass, which renders into the shared offscreen
     /// target and has no FBO of its own.
     intermediate: bool,
+    /// `true` if a **downstream** consumer reads this pass's output with
+    /// `mipmap_input` (#23): its FBO must carry a full mip chain that we
+    /// regenerate each frame right after this pass draws (§10 mip timing).
+    produces_mips: bool,
     /// For an intermediate pass: its owned FBO, allocated on the first render and
-    /// reallocated when its size changes. `None` for the final pass, and for an
-    /// intermediate pass before its first allocation.
+    /// reallocated when its size/format/mip-count changes. `None` for the final
+    /// pass, and for an intermediate pass before its first allocation.
     fbo: Option<Fbo>,
     /// The bind group for this pass, rebuilt when its input texture changes.
     bind_group: Option<wgpu::BindGroup>,
 }
 
-/// An owned intermediate render target. Only the `view` is held — a wgpu
-/// `TextureView` keeps its backing texture alive — plus the size it was
-/// allocated at so we can detect when a viewport/source change needs a realloc.
+/// An owned intermediate render target. Holds the `view` (sampled by the next
+/// pass) and the `texture` (needed to create per-mip-level views for mip
+/// generation), plus the size/format/mip-count it was allocated at so we can
+/// detect when a viewport/source/format change needs a realloc.
 struct Fbo {
+    texture: wgpu::Texture,
+    /// Full view spanning all mip levels — what the **next** pass samples (so a
+    /// `mipmap_input` consumer can read coarse mips).
     view: wgpu::TextureView,
+    /// Single base-level (mip 0) view — what **this** pass renders into (a color
+    /// attachment must target exactly one mip level).
+    base_view: wgpu::TextureView,
     size: (u32, u32),
+    format: wgpu::TextureFormat,
+    mip_level_count: u32,
 }
 
 /// A headless N-pass renderer.
@@ -139,8 +193,14 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     vertex_buffer: wgpu::Buffer,
-    sampler: wgpu::Sampler,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Whether the device supports `AddressMode::ClampToBorder` (#23). When
+    /// `false`, a pass asking for `WrapMode::ClampToBorder` falls back to
+    /// `ClampToEdge` (so lavapipe/CI without the feature still works).
+    clamp_to_border_supported: bool,
+    /// Lazily-built resources for mipmap generation (pipeline + sampler), shared
+    /// across passes and formats keyed by target format.
+    mip_gen: Option<MipGen>,
 
     width: u32,
     height: u32,
@@ -154,6 +214,17 @@ pub struct Renderer {
     source_view: Option<wgpu::TextureView>,
     /// The ordered pass chain. Empty until [`Renderer::set_shader`]/`set_chain`.
     passes: Vec<PassResources>,
+}
+
+/// Resources for the per-frame mipmap-downsample blit (#23): the shader module,
+/// a dedicated bind-group layout (texture + linear sampler), the linear sampler,
+/// and a per-target-format pipeline cache (a render pipeline is format-specific).
+struct MipGen {
+    module: wgpu::ShaderModule,
+    layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    sampler: wgpu::Sampler,
+    pipelines: std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
 /// Size of the builtin UBO (std140; see [`BuiltinUniforms`]).
@@ -176,9 +247,22 @@ impl Renderer {
         }))
         .map_err(|_| RendererError::NoAdapter)?;
 
+        // `WrapMode::ClampToBorder` (the RetroArch default, §3) needs an optional
+        // wgpu feature. Request it ONLY if the adapter advertises it, so software
+        // adapters (lavapipe/llvmpipe on CI) that lack it still get a device; a
+        // pass asking for ClampToBorder then falls back to ClampToEdge.
+        let clamp_to_border_supported = adapter
+            .features()
+            .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
+        let required_features = if clamp_to_border_supported {
+            wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("preview-engine device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
@@ -193,16 +277,6 @@ impl Renderer {
             mapped_at_creation: false,
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&QUAD));
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("source sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pass bind group layout"),
@@ -254,8 +328,9 @@ impl Renderer {
             device,
             queue,
             vertex_buffer,
-            sampler,
             bind_group_layout,
+            clamp_to_border_supported,
+            mip_gen: None,
             width,
             height,
             offscreen,
@@ -264,6 +339,12 @@ impl Renderer {
             source_view: None,
             passes: Vec::new(),
         })
+    }
+
+    /// Whether this device supports `AddressMode::ClampToBorder` (#23). When
+    /// `false`, `WrapMode::ClampToBorder` falls back to `ClampToEdge`.
+    pub fn clamp_to_border_supported(&self) -> bool {
+        self.clamp_to_border_supported
     }
 
     /// The current offscreen target (final-viewport) size.
@@ -341,7 +422,11 @@ impl Renderer {
         let mut resources = Vec::with_capacity(passes.len());
         for (i, pass) in passes.iter().enumerate() {
             let is_final = i == last;
-            resources.push(self.build_pass(pass, is_final));
+            // Pass `i`'s output is sampled with mips iff the *next* pass reads it
+            // with `mipmap_input` (its input is this pass's FBO). The final pass
+            // never produces mips (nothing reads it as Source).
+            let produces_mips = !is_final && passes[i + 1].mipmap_input;
+            resources.push(self.build_pass(pass, is_final, produces_mips));
         }
         self.passes = resources;
         // FBO sizes + bind groups are (re)built lazily at render time, once the
@@ -353,8 +438,24 @@ impl Renderer {
     /// shader's reflected `#pragma parameter` defaults), the per-pass builtin
     /// UBO, and — for an intermediate pass — a placeholder FBO slot (sized on the
     /// first render).
-    fn build_pass(&self, pass: &Pass, is_final: bool) -> PassResources {
+    fn build_pass(&self, pass: &Pass, is_final: bool, produces_mips: bool) -> PassResources {
         let shader = &pass.shader;
+
+        // The format this pass writes: the final pass always writes the 8-bit
+        // read-back target (OFFSCREEN_FORMAT); an intermediate pass writes its
+        // selected per-pass format (§3). The pipeline's color target MUST match
+        // the FBO it renders into, so build the pipeline for this format.
+        let target_format = if is_final {
+            OFFSCREEN_FORMAT
+        } else {
+            pass.fbo_format()
+        };
+
+        // This pass's input sampler (binding 2): filter + wrap + mip per its
+        // `filter_linear`/`wrap_mode`/`mipmap_input` (#23). `mipmap_input` raises
+        // `lod_max_clamp` and selects a linear mipmap filter so coarse mips are
+        // sampled; otherwise lod is clamped to the base level.
+        let sampler = self.build_sampler(pass);
         let params = uniforms::pack_parameters(&shader.reflection.parameters);
         let param_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("parameters"),
@@ -394,8 +495,9 @@ impl Renderer {
                 immediate_size: 0,
             });
 
-        // Every target uses OFFSCREEN_FORMAT for now; per-pass sRGB/float
-        // formats are #23 (the reserved fields on `Pass`).
+        // The color target's format matches the FBO this pass renders into
+        // (#23): per-pass float/sRGB/default for an intermediate, OFFSCREEN_FORMAT
+        // for the final pass. A pipeline is format-specific, so this is baked in.
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -427,7 +529,7 @@ impl Renderer {
                     entry_point: Some("main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: OFFSCREEN_FORMAT,
+                        format: target_format,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -443,11 +545,71 @@ impl Renderer {
             pipeline,
             param_buffer,
             ubo,
+            sampler,
+            target_format,
             scale: pass.scale,
             // The final pass renders into the offscreen target (no own FBO).
             intermediate: !is_final,
+            produces_mips,
             fbo: None,
             bind_group: None,
+        }
+    }
+
+    /// Build a pass's input sampler from its `filter_linear`/`wrap_mode`/
+    /// `mipmap_input` (#23). Address modes use [`Renderer::address_mode`] (which
+    /// applies the ClampToBorder→ClampToEdge fallback). When `mipmap_input` is
+    /// set, the mipmap filter is `Linear` and `lod_max_clamp` is left at its
+    /// default (`f32::MAX`) so coarse mips can be sampled; otherwise lod is
+    /// clamped to the base level so only mip 0 is read.
+    fn build_sampler(&self, pass: &Pass) -> wgpu::Sampler {
+        let filter = if pass.filter_linear {
+            wgpu::FilterMode::Linear
+        } else {
+            wgpu::FilterMode::Nearest
+        };
+        let address = self.address_mode(pass.wrap_mode);
+        let (mipmap_filter, lod_max_clamp) = if pass.mipmap_input {
+            // Linear between mip levels; allow the full chain.
+            (wgpu::MipmapFilterMode::Linear, f32::MAX)
+        } else {
+            // No mips consumed: pin to the base level.
+            (wgpu::MipmapFilterMode::Nearest, 0.0)
+        };
+        self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pass input sampler"),
+            address_mode_u: address,
+            address_mode_v: address,
+            address_mode_w: address,
+            mag_filter: filter,
+            min_filter: filter,
+            mipmap_filter,
+            lod_min_clamp: 0.0,
+            lod_max_clamp,
+            // A transparent-black border matches RetroArch's clamp_to_border
+            // (used only when the device supports ClampToBorder).
+            border_color: Some(wgpu::SamplerBorderColor::TransparentBlack),
+            ..Default::default()
+        })
+    }
+
+    /// Map a [`WrapMode`] to a wgpu [`AddressMode`] (#23). `ClampToBorder` is the
+    /// RetroArch default but needs `ADDRESS_MODE_CLAMP_TO_BORDER`; when the device
+    /// lacks it we fall back to `ClampToEdge` (RetroArch's border is
+    /// transparent-black-ish, so clamping to the edge is the closest baseline
+    /// choice — documented fallback, keeps CI/lavapipe working).
+    fn address_mode(&self, wrap: WrapMode) -> wgpu::AddressMode {
+        match wrap {
+            WrapMode::Repeat => wgpu::AddressMode::Repeat,
+            WrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
+            WrapMode::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+            WrapMode::ClampToBorder => {
+                if self.clamp_to_border_supported {
+                    wgpu::AddressMode::ClampToBorder
+                } else {
+                    wgpu::AddressMode::ClampToEdge
+                }
+            }
         }
     }
 
@@ -478,8 +640,29 @@ impl Renderer {
             if res.intermediate {
                 let scale = Self::intermediate_scale(res.scale);
                 let size = scale.resolve(input_size, viewport);
-                if res.fbo.as_ref().map(|f| f.size) != Some(size) {
-                    res.fbo = Some(Fbo::allocate(&self.device, size));
+                // An FBO read downstream with `mipmap_input` carries a full mip
+                // chain; otherwise just the base level (#23). Reallocate when
+                // size, format, or mip-count changes.
+                let mip_level_count = if res.produces_mips {
+                    mip_level_count_for(size)
+                } else {
+                    1
+                };
+                let stale = match res.fbo.as_ref() {
+                    Some(f) => {
+                        f.size != size
+                            || f.format != res.target_format
+                            || f.mip_level_count != mip_level_count
+                    }
+                    None => true,
+                };
+                if stale {
+                    res.fbo = Some(Fbo::allocate(
+                        &self.device,
+                        size,
+                        res.target_format,
+                        mip_level_count,
+                    ));
                 }
                 input_size = size;
             } else {
@@ -511,7 +694,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.passes[i].sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -564,6 +747,19 @@ impl Renderer {
         }
         self.write_uniforms();
 
+        // Build the mip-generation resources up front (lazily, once) for every
+        // FBO format that needs mips this frame, so the per-pass loop below can
+        // borrow `self.mip_gen` immutably alongside `self.passes`.
+        let mip_formats: Vec<wgpu::TextureFormat> = self
+            .passes
+            .iter()
+            .filter(|p| p.produces_mips)
+            .map(|p| p.target_format)
+            .collect();
+        if !mip_formats.is_empty() {
+            self.ensure_mip_gen(&mip_formats);
+        }
+
         let offscreen_view = self
             .offscreen
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -573,41 +769,147 @@ impl Renderer {
                 label: Some("frame encoder"),
             });
         for res in &self.passes {
-            // Intermediate passes draw into their FBO; the final pass (no FBO)
-            // draws into the shared offscreen target.
+            // Intermediate passes draw into their FBO's base mip level; the final
+            // pass (no FBO) draws into the shared offscreen target. (Coarser mips,
+            // if any, are filled by `generate_mips` after the draw.)
             let target = match &res.fbo {
-                Some(fbo) => &fbo.view,
+                Some(fbo) => &fbo.base_view,
                 None => &offscreen_view,
             };
             let bind_group = res
                 .bind_group
                 .as_ref()
                 .expect("bind group built by rebuild_chain (checked in ready)");
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("chain pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rp.set_pipeline(&res.pipeline);
-            rp.set_bind_group(0, bind_group, &[]);
-            rp.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            rp.draw(0..QUAD.len() as u32, 0..1);
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("chain pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&res.pipeline);
+                rp.set_bind_group(0, bind_group, &[]);
+                rp.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                rp.draw(0..QUAD.len() as u32, 0..1);
+            }
+            // §10 mip timing: regenerate this FBO's mip chain immediately after
+            // it is drawn, before the next (consuming) pass samples it.
+            if res.produces_mips {
+                if let Some(fbo) = &res.fbo {
+                    let mip_gen = self
+                        .mip_gen
+                        .as_ref()
+                        .expect("mip_gen built when any pass produces mips");
+                    generate_mips(&self.device, &mut encoder, mip_gen, fbo);
+                }
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         // Advance the animation clock for the next frame (Phase 2 pumps this).
         self.frame_count = self.frame_count.wrapping_add(1);
         Ok(())
+    }
+
+    /// Lazily create the shared mip-generation resources and ensure a pipeline
+    /// exists for each requested target format (#23). A render pipeline is
+    /// format-specific, so we cache one per format.
+    fn ensure_mip_gen(&mut self, formats: &[wgpu::TextureFormat]) {
+        if self.mip_gen.is_none() {
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("mipgen shader"),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(MIP_WGSL)),
+                });
+            let layout = self
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("mipgen bind group layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+            let pipeline_layout =
+                self.device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("mipgen pipeline layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+            let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("mipgen sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            self.mip_gen = Some(MipGen {
+                module,
+                layout,
+                pipeline_layout,
+                sampler,
+                pipelines: std::collections::HashMap::new(),
+            });
+        }
+
+        let mip_gen = self.mip_gen.as_mut().expect("just created");
+        for &format in formats {
+            mip_gen.pipelines.entry(format).or_insert_with(|| {
+                self.device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("mipgen pipeline"),
+                        layout: Some(&mip_gen.pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &mip_gen.module,
+                            entry_point: Some("vs"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &mip_gen.module,
+                            entry_point: Some("fs"),
+                            compilation_options: Default::default(),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                        }),
+                        primitive: wgpu::PrimitiveState::default(),
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+            });
+        }
     }
 
     /// Frames rendered so far (the next `render` writes this as `FrameCount`).
@@ -684,10 +986,17 @@ impl Renderer {
 }
 
 impl Fbo {
-    /// Allocate an intermediate render target of `size`. It is both a render
-    /// attachment (this pass draws into it) and texture-bound (the next pass
-    /// samples it).
-    fn allocate(device: &wgpu::Device, size: (u32, u32)) -> Self {
+    /// Allocate an intermediate render target of `size` and `format` with
+    /// `mip_level_count` mip levels (#23). It is both a render attachment (this
+    /// pass draws into it; mip-gen draws into each level) and texture-bound (the
+    /// next pass samples it). The default `view` spans all mip levels so a
+    /// `mipmap_input` consumer can sample coarse mips.
+    fn allocate(
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+        mip_level_count: u32,
+    ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pass FBO"),
             size: wgpu::Extent3d {
@@ -695,15 +1004,104 @@ impl Fbo {
                 height: size.1,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { view, size }
+        let base_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("pass FBO base level"),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        Self {
+            texture,
+            view,
+            base_view,
+            size,
+            format,
+            mip_level_count,
+        }
+    }
+}
+
+/// Full mip-chain length for a 2D texture of `size`: `floor(log2(max(w,h))) + 1`.
+fn mip_level_count_for(size: (u32, u32)) -> u32 {
+    let max_dim = size.0.max(size.1).max(1);
+    32 - max_dim.leading_zeros()
+}
+
+/// Regenerate `fbo`'s mip chain via a linear-blit downsample (#23): for each mip
+/// level `k = 1 .. n`, sample level `k-1` with a linear sampler into level `k`
+/// (a 2×2 average). Recorded into `encoder`, between the producing pass's draw
+/// and the next pass's sample (§10 mip timing). No-op for a single-level FBO.
+fn generate_mips(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    mip_gen: &MipGen,
+    fbo: &Fbo,
+) {
+    if fbo.mip_level_count <= 1 {
+        return;
+    }
+    let pipeline = mip_gen
+        .pipelines
+        .get(&fbo.format)
+        .expect("mipgen pipeline for this format ensured before render");
+
+    // One single-level view per mip level: used as the sampled source (level
+    // k-1) and as the render target (level k).
+    let level_views: Vec<wgpu::TextureView> = (0..fbo.mip_level_count)
+        .map(|level| {
+            fbo.texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("mip level view"),
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+
+    for level in 1..fbo.mip_level_count {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mipgen bind group"),
+            layout: &mip_gen.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &level_views[(level - 1) as usize],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&mip_gen.sampler),
+                },
+            ],
+        });
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mipgen pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &level_views[level as usize],
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(0, &bind_group, &[]);
+        rp.draw(0..3, 0..1);
     }
 }
 

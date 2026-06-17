@@ -28,6 +28,33 @@ pub enum ScaleType {
     Absolute,
 }
 
+/// Sampler wrap mode for a pass's input texture (§3
+/// `video_shader_wrap_str_to_mode`). Mirrors `preset_io::WrapMode` so the engine
+/// has no compile dependency on the preset parser; the app converts at the
+/// boundary. The §3/§11 v1 default is [`WrapMode::ClampToBorder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    /// `clamp_to_border` — RetroArch `RARCH_WRAP_BORDER`, the default. Maps to
+    /// `wgpu::AddressMode::ClampToBorder` **iff** the device supports
+    /// `ADDRESS_MODE_CLAMP_TO_BORDER`; otherwise the renderer falls back to
+    /// `ClampToEdge` (RetroArch's border is transparent-black-ish; see
+    /// `renderer::address_mode`).
+    ClampToBorder,
+    /// `clamp_to_edge` — RetroArch `RARCH_WRAP_EDGE`.
+    ClampToEdge,
+    /// `repeat` — RetroArch `RARCH_WRAP_REPEAT`.
+    Repeat,
+    /// `mirrored_repeat` — RetroArch `RARCH_WRAP_MIRRORED_REPEAT`.
+    MirroredRepeat,
+}
+
+impl Default for WrapMode {
+    /// The §3/§11 v1 default: `clamp_to_border` (RetroArch fidelity).
+    fn default() -> Self {
+        WrapMode::ClampToBorder
+    }
+}
+
 /// One axis of a scale specification: a type plus its factor. For `Absolute` the
 /// factor is the literal pixel count (rounded); for `Source`/`Viewport` it
 /// multiplies the relevant size.
@@ -118,13 +145,17 @@ pub struct Pass {
     /// Explicit scale config, or `None` to take the position default (§2).
     pub scale: Option<ScaleConfig>,
 
-    // ---- Reserved for later tickets; defaulted by #22. ----
-    /// `srgb_framebufferN` (#23). When set the FBO uses an sRGB format.
+    // ---- Format / sampler state (consumed by #23). ----
+    /// `srgb_framebufferN` (#23). When set the FBO uses an sRGB format
+    /// (`Rgba8UnormSrgb`).
     pub srgb_framebuffer: bool,
-    /// `float_framebufferN` (#23). When set the FBO uses RGBA16F.
+    /// `float_framebufferN` (#23). When set the FBO uses RGBA16F
+    /// (`Rgba16Float`). Wins over `srgb_framebuffer` if both are set (§11.3).
     pub float_framebuffer: bool,
     /// `filter_linearN` (#23). `true`=linear, `false`=nearest input sampling.
     pub filter_linear: bool,
+    /// `wrap_modeN` (#23). Sampler wrap mode for this pass's input texture.
+    pub wrap_mode: WrapMode,
     /// `mipmap_inputN` (#23). Generate a mip chain for this pass's input.
     pub mipmap_input: bool,
 }
@@ -140,6 +171,7 @@ impl Pass {
             srgb_framebuffer: false,
             float_framebuffer: false,
             filter_linear: true,
+            wrap_mode: WrapMode::default(),
             mipmap_input: false,
         }
     }
@@ -148,6 +180,27 @@ impl Pass {
     pub fn with_scale(mut self, scale: ScaleConfig) -> Self {
         self.scale = Some(scale);
         self
+    }
+
+    /// The wgpu render-target format this pass's FBO should use (§3):
+    ///
+    /// ```text
+    /// float_framebuffer -> Rgba16Float       (16-bit float; preserves >1.0/HDR)
+    /// srgb_framebuffer  -> Rgba8UnormSrgb     (HW sRGB encode on store/decode on load)
+    /// else              -> Rgba8Unorm         (default: 8-bit linear UNORM)
+    /// ```
+    ///
+    /// `float` wins over `srgb` when both are set (§11.3). This applies to an
+    /// **intermediate** pass's owned FBO; the final pass always renders into the
+    /// 8-bit read-back target (see `renderer::OFFSCREEN_FORMAT`).
+    pub fn fbo_format(&self) -> wgpu::TextureFormat {
+        if self.float_framebuffer {
+            wgpu::TextureFormat::Rgba16Float
+        } else if self.srgb_framebuffer {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        }
     }
 }
 
