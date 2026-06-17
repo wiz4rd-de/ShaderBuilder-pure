@@ -167,6 +167,18 @@ pub struct Pass {
     /// `frame_count_modN` (#28). When `> 0`, the `FrameCount` this pass sees is
     /// pre-wrapped: `frame_count % mod` (§6). `0` (the default) means no wrap.
     pub frame_count_mod: u32,
+
+    // ---- Feedback (consumed by #24). ----
+    /// Explicit feedback opt-in (the preset's global `feedback_pass = N` — §4).
+    /// When `true`, this pass is double-buffered so it (or any other pass) can
+    /// read its previous-frame output as `PassFeedbackN` / `<alias>Feedback`,
+    /// even if no shader reflection references that feedback texture.
+    ///
+    /// This is a **union** with reflection-based detection: the renderer also
+    /// double-buffers any pass referenced via a `PassFeedbackN`/`<alias>Feedback`
+    /// texture (the slang-native opt-in), so leaving this `false` is correct for
+    /// presets that drive feedback purely through `Feedback` texture references.
+    pub feedback: bool,
 }
 
 impl Pass {
@@ -184,6 +196,7 @@ impl Pass {
             wrap_mode: WrapMode::default(),
             mipmap_input: false,
             frame_count_mod: 0,
+            feedback: false,
         }
     }
 

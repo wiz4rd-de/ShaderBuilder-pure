@@ -397,6 +397,17 @@ pub struct BuiltinValues {
     /// a later pass as the `FOOSize` builtin (§6/§7). Only causally-available
     /// aliases are present; an absent alias leaves `<alias>Size` zero.
     pub alias_sizes: std::collections::HashMap<String, [f32; 4]>,
+    /// Every feedback target's previous-frame output size (#24, §4), indexed by
+    /// pass number: `pass_feedback_sizes[k]` backs `PassFeedbackKSize`. The
+    /// feedback twin has the same dimensions as the pass's output, and feedback is
+    /// time-causal, so — unlike `pass_output_sizes` — this is **not** restricted to
+    /// earlier passes: any `k` may be read. An absent index leaves the member zero.
+    pub pass_feedback_sizes: Vec<[f32; 4]>,
+    /// Feedback sizes by alias name (#24, §4): `alias_feedback_sizes["FOO"]` backs
+    /// the `FOOFeedbackSize` builtin — the previous-frame output size of the pass
+    /// aliased `FOO`. Same dimensions as `alias_sizes["FOO"]`, but populated for
+    /// all aliased feedback targets regardless of causal order.
+    pub alias_feedback_sizes: std::collections::HashMap<String, [f32; 4]>,
 }
 
 impl Default for BuiltinValues {
@@ -412,6 +423,8 @@ impl Default for BuiltinValues {
             rotation: 0,
             pass_output_sizes: Vec::new(),
             alias_sizes: std::collections::HashMap::new(),
+            pass_feedback_sizes: Vec::new(),
+            alias_feedback_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -443,9 +456,23 @@ impl BuiltinValues {
                 // PassK fallback so an alias spelled like `Pass…` can't be
                 // misread (aliases are author-chosen identifiers).
                 if let Some(base) = name.strip_suffix("Size") {
+                    // `<alias>FeedbackSize` (#24) is matched before the plain
+                    // `<alias>Size`: strip the `Feedback` suffix and look the alias
+                    // up in the feedback-size table (same dims as its output, but
+                    // valid for any causal-in-time feedback read).
+                    if let Some(alias) = base.strip_suffix("Feedback") {
+                        if let Some(v) = self.alias_feedback_sizes.get(alias) {
+                            return vec4(v);
+                        }
+                    }
                     if let Some(v) = self.alias_sizes.get(base) {
                         return vec4(v);
                     }
+                }
+                // `PassFeedbackKSize` (#24) — pass K's previous-frame output size;
+                // time-causal, so any K is valid.
+                if let Some(idx) = parse_pass_feedback_size_index(name) {
+                    return self.pass_feedback_sizes.get(idx).and_then(vec4);
                 }
                 // `PassOutputKSize` (and the `PassKSize` alias) — pass K's output
                 // size, K < this pass (causal). Anything else is unknown here.
@@ -466,6 +493,17 @@ fn parse_pass_size_index(name: &str) -> Option<usize> {
         .or_else(|| name.strip_prefix("Pass"))?
         .strip_suffix("Size")?;
     // Must be all digits (rejects e.g. `PassFeedback…Size`, `PassOutputSize`).
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Parse a `PassFeedbackKSize` semantic name into its pass index `K` (#24, §4).
+/// Returns `None` for any other name. Distinct from [`parse_pass_size_index`],
+/// which deliberately rejects the `Feedback` spelling.
+fn parse_pass_feedback_size_index(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix("PassFeedback")?.strip_suffix("Size")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -526,7 +564,9 @@ fn is_builtin_semantic(name: &str) -> bool {
             | "FrameCount"
             | "FrameDirection"
             | "Rotation"
-    ) || name.ends_with("Size") && parse_pass_size_index(name).is_some()
+    ) || (name.ends_with("Size")
+        && (parse_pass_size_index(name).is_some()
+            || parse_pass_feedback_size_index(name).is_some()))
 }
 
 /// Apply a pass's `frame_count_mod` to the raw frame counter, per §6:

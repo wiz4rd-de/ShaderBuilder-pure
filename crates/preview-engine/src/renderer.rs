@@ -242,6 +242,19 @@ struct PassResources {
     /// reallocated when its size/format/mip-count changes. `None` for the final
     /// pass, and for an intermediate pass before its first allocation.
     fbo: Option<Fbo>,
+    /// `true` if this pass is a **feedback target** (#24): some pass reads its
+    /// previous-frame output as `PassFeedbackN`/`<alias>Feedback`, or the preset's
+    /// global `feedback_pass` named it. A feedback target owns a second
+    /// (ping-pong) FBO in [`PassResources::feedback_fbo`] and always owns `fbo`
+    /// (a no-FBO final pass is upgraded to own one in [`Renderer::set_chain`]).
+    is_feedback_target: bool,
+    /// The previous-frame output buffer (#24, §4): the back half of this pass's
+    /// double buffer. `Some` only for a feedback target. Each frame, before draws,
+    /// [`Renderer::rebuild_chain`] swaps `fbo` ↔ `feedback_fbo` so `feedback_fbo`
+    /// holds *last* frame's output (what `PassFeedbackN` samples) while the pass
+    /// draws this frame into `fbo`. Cleared to transparent black on (re)allocation
+    /// so a cold first frame reads a defined value (§4 cold start).
+    feedback_fbo: Option<Fbo>,
     /// The bind group for this pass, rebuilt when its input texture changes.
     bind_group: Option<wgpu::BindGroup>,
 }
@@ -584,6 +597,57 @@ impl Renderer {
         }
         self.passes = resources;
 
+        // ---- Feedback targets (#24, §4) ----
+        // A pass is double-buffered when something reads its PREVIOUS-frame output:
+        // a `PassFeedbackN`/`<alias>Feedback` texture reference (the slang-native
+        // opt-in, detected from reflection), or the preset's global
+        // `feedback_pass = N` (surfaced as the per-pass `feedback` flag). The two
+        // are unioned so either form works.
+        let mut feedback_targets: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for (i, pass) in passes.iter().enumerate() {
+            if pass.feedback {
+                feedback_targets.insert(i);
+            }
+        }
+        for res in &self.passes {
+            for slot in &res.texture_slots {
+                match &slot.class {
+                    TextureClass::PassFeedback(n) => {
+                        feedback_targets.insert(*n);
+                    }
+                    TextureClass::AliasFeedback(name) => {
+                        if let Some(&n) = self.aliases.get(name) {
+                            feedback_targets.insert(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Mark each target and ensure it owns an FBO to capture its output. The
+        // only pass that can lack one is a final pass with no explicit scale (it
+        // renders straight to the offscreen target); upgrade it to own a
+        // viewport-sized FBO that is then stretched (blitted) to the offscreen
+        // target — the same `final_owns_fbo` path #22 built for an explicitly
+        // scaled final pass. Its pipeline already targets `OFFSCREEN_FORMAT`, which
+        // is also what its FBO is allocated as, so no rebuild is needed.
+        for &idx in &feedback_targets {
+            let Some(res) = self.passes.get_mut(idx) else {
+                continue; // a reference past the chain end: nothing to double-buffer
+            };
+            res.is_feedback_target = true;
+            if !res.owns_fbo {
+                debug_assert_eq!(idx, last, "only a no-scale final pass lacks an FBO");
+                res.owns_fbo = true;
+                res.final_owns_fbo = true;
+                res.scale = Some(ScaleConfig {
+                    x: AxisScale::VIEWPORT_1X,
+                    y: AxisScale::VIEWPORT_1X,
+                });
+            }
+        }
+
         // Collect the chain's parameters (global by name, deduped — §8), seeded
         // to each `#pragma parameter` default. Aliases come from each pass's
         // `#pragma name` if it coincides with a parameter name; presets may also
@@ -855,6 +919,12 @@ impl Renderer {
             produces_mips,
             consumes_input_mips: pass.mipmap_input,
             fbo: None,
+            // Feedback flags are filled in by `set_chain` once the whole chain's
+            // feedback references are known (a pass can't know it's a feedback
+            // target from its own reflection alone). A no-FBO final pass that turns
+            // out to be a feedback target is upgraded to own an FBO there too.
+            is_feedback_target: false,
+            feedback_fbo: None,
             bind_group: None,
         }
     }
@@ -1005,6 +1075,36 @@ impl Renderer {
                         mip_level_count,
                     ));
                 }
+                // Feedback double buffer (#24, §4): keep a twin matching `fbo`, then
+                // swap them once per frame so `feedback_fbo` holds LAST frame's
+                // output (what `PassFeedbackN` samples) while the pass draws this
+                // frame into `fbo`. On (re)allocation clear BOTH halves to
+                // transparent black — the per-frame swap means either can be the
+                // buffer a consumer reads first, and a cold/rebuilt feedback must
+                // read a defined value (§4 cold start), not garbage.
+                if res.is_feedback_target {
+                    let twin_stale = stale
+                        || res.feedback_fbo.as_ref().is_none_or(|f| {
+                            f.size != size
+                                || f.format != res.target_format
+                                || f.mip_level_count != mip_level_count
+                        });
+                    if twin_stale {
+                        res.feedback_fbo = Some(Fbo::allocate(
+                            &self.device,
+                            size,
+                            res.target_format,
+                            mip_level_count,
+                        ));
+                        if let Some(f) = &res.fbo {
+                            clear_fbo(&self.device, &self.queue, f);
+                        }
+                        if let Some(f) = &res.feedback_fbo {
+                            clear_fbo(&self.device, &self.queue, f);
+                        }
+                    }
+                    std::mem::swap(&mut res.fbo, &mut res.feedback_fbo);
+                }
                 input_size = size;
             } else {
                 // Final pass with no FBO: output is the viewport.
@@ -1138,8 +1238,24 @@ impl Renderer {
                 .get(name)
                 .and_then(|&n| pass_output(n))
                 .unwrap_or_else(|| self.placeholder_resource()),
-            // Deferred resources (#24/#25/#27): the resolver hook returns a
-            // placeholder black view today. Sampled with the source sampler.
+            // Feedback (#24, §4): pass N's PREVIOUS-frame output. Unlike
+            // `PassOutput`, feedback is causal in *time*, so any pass may read any
+            // pass's feedback — including its own and even later passes; no
+            // pass-order check. Binds the swapped-in `feedback_fbo` (last frame's
+            // output), or the black placeholder if pass N isn't double-buffered or
+            // is still cold.
+            TextureClass::PassFeedback(n) => self
+                .feedback_resource(*n)
+                .unwrap_or_else(|| self.placeholder_resource()),
+            TextureClass::AliasFeedback(name) => self
+                .aliases
+                .get(name)
+                .copied()
+                .and_then(|n| self.feedback_resource(n))
+                .unwrap_or_else(|| self.placeholder_resource()),
+            // Deferred resources (#25 history / #27 LUTs): the resolver hook
+            // returns a placeholder black view today. Sampled with the source
+            // sampler.
             other => {
                 let view = self
                     .resolver
@@ -1175,6 +1291,18 @@ impl Renderer {
         (self.resolver.black(), self.sampler_after_source())
     }
 
+    /// A feedback target's previous-frame output `(view, sampler)` (#24, §4), or
+    /// `None` when pass `n` is out of range or not double-buffered (no
+    /// `feedback_fbo`) — the caller then falls back to the black placeholder.
+    /// Feedback is time-causal, so there is no pass-order restriction: any pass may
+    /// read pass `n`'s feedback. The view is `feedback_fbo` (last frame's output
+    /// after [`Renderer::rebuild_chain`]'s per-frame swap), paired with pass `n`'s
+    /// producer's-successor sampler (the K+1 rule, as for `PassOutput`).
+    fn feedback_resource(&self, n: usize) -> Option<(&wgpu::TextureView, &wgpu::Sampler)> {
+        let view = &self.passes.get(n)?.feedback_fbo.as_ref()?.view;
+        Some((view, self.sampler_after(n)))
+    }
+
     /// Compute and upload each pass's builtin UBO for the current frame (#28),
     /// reflection-driven: for each pass we compute every currently-computable
     /// builtin semantic, then pack each into the offset of the same-named member
@@ -1188,6 +1316,24 @@ impl Renderer {
         let original = self.source_size.unwrap_or((self.width, self.height));
         let viewport = (self.width, self.height);
         let mut input_size = original;
+        // Every pass's output size (NOT just causal ones): a feedback twin shares
+        // its pass's output dimensions, and feedback is causal in time, so any pass
+        // may read any pass's `PassFeedbackKSize` / `<alias>FeedbackSize` (#24, §4).
+        // Read after `rebuild_chain`, so a feedback pass's (post-swap) `fbo` already
+        // holds this frame's draw target — same dimensions as its feedback twin.
+        let all_output_sizes: Vec<[f32; 4]> = self
+            .passes
+            .iter()
+            .map(|res| {
+                let (w, h) = res.fbo.as_ref().map(|f| f.size).unwrap_or(viewport);
+                uniforms::size_vec(w, h)
+            })
+            .collect();
+        let alias_feedback_sizes: std::collections::HashMap<String, [f32; 4]> = self
+            .aliases
+            .iter()
+            .filter_map(|(name, &idx)| all_output_sizes.get(idx).map(|v| (name.clone(), *v)))
+            .collect();
         // Earlier passes' output sizes, grown as we walk the chain so pass i sees
         // passes 0..i (causal — §7).
         let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
@@ -1233,6 +1379,8 @@ impl Renderer {
                     rotation: 0,
                     pass_output_sizes: pass_output_sizes.clone(),
                     alias_sizes: alias_sizes.clone(),
+                    pass_feedback_sizes: all_output_sizes.clone(),
+                    alias_feedback_sizes: alias_feedback_sizes.clone(),
                 };
                 let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);
@@ -1828,6 +1976,36 @@ fn blit_to_offscreen(
     rp.set_pipeline(&blit.pipeline);
     rp.set_bind_group(0, &bind_group, &[]);
     rp.draw(0..3, 0..1);
+}
+
+/// Clear an FBO's base mip level to transparent black (#24, §4 cold start). Used
+/// to initialize a feedback pass's double buffers so a never-written feedback read
+/// is a defined `(0,0,0,0)` rather than garbage. Only the base level is cleared;
+/// for a feedback target that also feeds a downstream `mipmap_input` consumer, the
+/// coarse mips of the very first cold frame are undefined — they are regenerated
+/// from the base after each subsequent draw (§10 mip timing), so this affects only
+/// frame 0 of that rare combination.
+fn clear_fbo(device: &wgpu::Device, queue: &wgpu::Queue, fbo: &Fbo) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("feedback clear encoder"),
+    });
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("feedback clear"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &fbo.base_view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    queue.submit(Some(encoder.finish()));
 }
 
 fn create_offscreen(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {

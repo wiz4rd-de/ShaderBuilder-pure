@@ -1835,3 +1835,251 @@ void main() { FragColor = texture(sampler2D(Source, Smp), vec2(0.5, 0.5)); }
         );
     }
 }
+
+#[cfg(test)]
+mod feedback_tests {
+    //! Feedback double-buffer tests (#24, §4): a pass reads its OWN previous-frame
+    //! output via `PassFeedback0`, blending `0.5*Source + 0.5*Feedback`. Over a
+    //! sequence of frames on a constant source the output converges toward the
+    //! source by the recurrence `out_N = S*(1 - 0.5^(N+1))` — which is only true if
+    //! feedback reads the PREVIOUS frame (a current-frame read would solve to the
+    //! fixed point `S` on frame 0). All run on the real GPU and read back a pixel.
+    use super::{Pass, Renderer};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    // Preamble: builtin UBO @0, Source @1 + shared sampler @2, PassFeedback0 @3.
+    // Both textures share the one sampler (the renderer pairs sampler 0 with
+    // texture 0 and reuses it). The fragment blends source with feedback.
+    const PREAMBLE: &str = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat4 MVP;
+    vec4 SourceSize;
+    vec4 OriginalSize;
+    vec4 OutputSize;
+    uint FrameCount;
+} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+layout(set = 0, binding = 3) uniform texture2D PassFeedback0;
+";
+
+    /// `out = 0.5*Source + 0.5*PassFeedback0` — the classic decay/accumulate
+    /// feedback pass reading its own previous-frame output.
+    fn half_blend_feedback() -> CompiledShader {
+        compile_slang(
+            &format!(
+                "{PREAMBLE}void main() {{ \
+                 vec4 s = texture(sampler2D(Source, Smp), vTexCoord); \
+                 vec4 f = texture(sampler2D(PassFeedback0, Smp), vTexCoord); \
+                 FragColor = 0.5 * s + 0.5 * f; }}\n"
+            ),
+            None,
+        )
+        .expect("compile feedback fixture")
+    }
+
+    /// A plain passthrough (Source only) used as the final pass when the feedback
+    /// pass is an INTERMEDIATE pass.
+    fn passthrough() -> CompiledShader {
+        compile_slang(
+            "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; vec4 SourceSize; vec4 OriginalSize; vec4 OutputSize; uint FrameCount; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }
+",
+            None,
+        )
+        .expect("compile passthrough")
+    }
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&rgba);
+        }
+        Frame::new(width, height, data)
+    }
+
+    fn center_r(f: &Frame) -> u8 {
+        let i = (((f.height / 2) * f.width + f.width / 2) * 4) as usize;
+        f.rgba[i]
+    }
+
+    #[test]
+    fn single_pass_self_feedback_converges_toward_source() {
+        // A single feedback pass (also the FINAL pass — exercises the no-FBO →
+        // owns-FBO + blit upgrade). Source R = 200. The R channel must follow
+        // out_N = 200*(1 - 0.5^(N+1)): 100, 150, 175, 187.5, ...
+        let src = solid(4, 4, [200, 0, 0, 255]);
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&src);
+        r.set_chain(&[Pass::new(half_blend_feedback())])
+            .expect("set chain");
+
+        let mut seq = Vec::new();
+        for _ in 0..4 {
+            r.render().expect("render");
+            seq.push(center_r(&r.read_back().expect("read back")));
+        }
+        // Frame 0 ~100 (NOT 200): proves feedback read the PREVIOUS (cold/black)
+        // frame, not the current output (which would solve to the fixed point 200).
+        assert!(
+            (seq[0] as i32 - 100).abs() <= 6,
+            "frame 0 should be ~100 (0.5*200 + 0.5*0), got {}; a value near 200 \
+             would mean the shader read the CURRENT frame's output",
+            seq[0]
+        );
+        // Strictly increasing toward 200 (monotonic accumulation).
+        assert!(
+            seq[0] < seq[1] && seq[1] < seq[2] && seq[2] < seq[3],
+            "feedback must accumulate monotonically toward the source, got {seq:?}"
+        );
+        // Approaches the expected analytic values.
+        for (n, &got) in seq.iter().enumerate() {
+            let want = 200.0 * (1.0 - 0.5_f32.powi(n as i32 + 1));
+            assert!(
+                (got as f32 - want).abs() <= 6.0,
+                "frame {n}: want ~{want:.1}, got {got} (seq {seq:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_feedback_pass_reads_previous_frame() {
+        // The feedback pass is pass 0 (an INTERMEDIATE pass; owns an FBO normally),
+        // followed by a passthrough final pass. Same convergence proves the
+        // previous-frame read on the non-upgrade path.
+        let src = solid(4, 4, [200, 0, 0, 255]);
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&src);
+        r.set_chain(&[Pass::new(half_blend_feedback()), Pass::new(passthrough())])
+            .expect("set chain");
+
+        let mut seq = Vec::new();
+        for _ in 0..3 {
+            r.render().expect("render");
+            seq.push(center_r(&r.read_back().expect("read back")));
+        }
+        assert!(
+            (seq[0] as i32 - 100).abs() <= 6,
+            "frame 0 should be ~100 (previous frame was cold black), got {}",
+            seq[0]
+        );
+        assert!(
+            seq[0] < seq[1] && seq[1] < seq[2],
+            "feedback through an intermediate pass must still accumulate, got {seq:?}"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_chain_resets_feedback() {
+        // After accumulating several frames, re-setting the chain must reset the
+        // feedback buffers to cold black, so the next frame 0 is ~100 again.
+        let src = solid(4, 4, [200, 0, 0, 255]);
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&src);
+        r.set_chain(&[Pass::new(half_blend_feedback())])
+            .expect("set chain");
+        for _ in 0..5 {
+            r.render().expect("render");
+            let _ = r.read_back().expect("read back");
+        }
+        // Rebuild: fresh PassResources → feedback FBOs reallocate + clear.
+        r.set_chain(&[Pass::new(half_blend_feedback())])
+            .expect("rebuild chain");
+        r.render().expect("render");
+        let after = center_r(&r.read_back().expect("read back"));
+        assert!(
+            (after as i32 - 100).abs() <= 6,
+            "rebuild should reset feedback to cold black (frame 0 ~100), got {after}"
+        );
+    }
+
+    #[test]
+    fn non_feedback_chain_is_unaffected() {
+        // A chain with no feedback references renders deterministically the same on
+        // every frame (no double-buffer, no swap-induced drift).
+        let src = solid(4, 4, [123, 0, 0, 255]);
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&src);
+        r.set_chain(&[Pass::new(passthrough())]).expect("set chain");
+        r.render().expect("render");
+        let a = center_r(&r.read_back().expect("read back"));
+        r.render().expect("render");
+        let b = center_r(&r.read_back().expect("read back"));
+        assert_eq!(a, b, "a non-feedback pass must be frame-stable");
+        assert!(
+            (a as i32 - 123).abs() <= 2,
+            "passthrough should reproduce source"
+        );
+    }
+}
+
+#[cfg(test)]
+mod feedback_size_tests {
+    //! `PassFeedbackKSize` / `<alias>FeedbackSize` builtin semantics (#24, §4).
+    use crate::uniforms::{size_vec, BuiltinValues};
+
+    #[test]
+    fn pass_feedback_size_resolves_for_any_index() {
+        let v = BuiltinValues {
+            pass_feedback_sizes: vec![size_vec(320, 240), size_vec(64, 64)],
+            ..Default::default()
+        };
+        // Both indices resolve (feedback is time-causal, so no "earlier-only" rule).
+        assert_eq!(
+            v.member_bytes("PassFeedback0Size"),
+            Some(size_vec_bytes(320, 240))
+        );
+        assert_eq!(
+            v.member_bytes("PassFeedback1Size"),
+            Some(size_vec_bytes(64, 64))
+        );
+        // Out of range → None (member stays zero).
+        assert_eq!(v.member_bytes("PassFeedback9Size"), None);
+        // The plain output-size spelling is unaffected and distinct.
+        assert_eq!(v.member_bytes("PassFeedbackXSize"), None);
+    }
+
+    #[test]
+    fn alias_feedback_size_resolves_by_name() {
+        let mut v = BuiltinValues::default();
+        v.alias_feedback_sizes
+            .insert("PREV".to_string(), size_vec(128, 96));
+        v.alias_sizes.insert("PREV".to_string(), size_vec(128, 96));
+        // (Two inserts on the same value → keep the readable mutate-after-default form.)
+        assert_eq!(
+            v.member_bytes("PREVFeedbackSize"),
+            Some(size_vec_bytes(128, 96))
+        );
+        // The non-feedback alias size still resolves.
+        assert_eq!(v.member_bytes("PREVSize"), Some(size_vec_bytes(128, 96)));
+    }
+
+    fn size_vec_bytes(w: u32, h: u32) -> Vec<u8> {
+        size_vec(w, h)
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+}
