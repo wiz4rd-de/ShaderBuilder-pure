@@ -179,6 +179,11 @@ struct PassResources {
     /// `mipmap_input` (#23): its FBO must carry a full mip chain that we
     /// regenerate each frame right after this pass draws (§10 mip timing).
     produces_mips: bool,
+    /// `true` if **this** pass reads its own input with `mipmap_input` (#23): its
+    /// input texture must carry a mip chain. For pass 0 this drives the source
+    /// texture's mip allocation (#23/F); for later passes it is already reflected
+    /// in the previous pass's `produces_mips`.
+    consumes_input_mips: bool,
     /// For an intermediate pass: its owned FBO, allocated on the first render and
     /// reallocated when its size/format/mip-count changes. `None` for the final
     /// pass, and for an intermediate pass before its first allocation.
@@ -230,7 +235,15 @@ pub struct Renderer {
     /// (#31) can flip it; `+1` for now.
     frame_direction: i32,
 
-    source_view: Option<wgpu::TextureView>,
+    /// The uploaded source texture as an [`Fbo`] (so it can carry a mip chain when
+    /// pass 0 declares `mipmap_input` — #23/F). Its `view` (all mips) is pass 0's
+    /// input. Reallocated with a full mip count + RENDER_ATTACHMENT when pass 0
+    /// wants mips; allocated with one level otherwise.
+    source: Option<Fbo>,
+    /// The source image's raw RGBA, retained so the source texture can be
+    /// reallocated (e.g. to add a mip chain for `mipmap_input0`) and re-uploaded
+    /// without the caller re-supplying the frame (#23/F).
+    source_rgba: Option<Vec<u8>>,
     /// The ordered pass chain. Empty until [`Renderer::set_shader`]/`set_chain`.
     passes: Vec<PassResources>,
 
@@ -365,7 +378,8 @@ impl Renderer {
             source_size: None,
             frame_count: 0,
             frame_direction: 1,
-            source_view: None,
+            source: None,
+            source_rgba: None,
             passes: Vec::new(),
             params: ParamStore::default(),
         })
@@ -395,22 +409,42 @@ impl Renderer {
         }
     }
 
-    /// Upload a source image into a sampled texture and (re)build pass 0's bind
-    /// group (its input is the source).
+    /// The source texture's format. Linear RGBA8 — a passthrough shader
+    /// reproduces the uploaded image byte-for-byte.
+    const SOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+    /// Upload a source image. The raw RGBA is retained so the source texture can
+    /// later be reallocated with a mip chain when pass 0 declares `mipmap_input`
+    /// (#23/F). The texture starts single-level; [`Renderer::ensure_source_mips`]
+    /// upgrades it on the next render if pass 0 needs mips.
     pub fn set_source(&mut self, frame: &Frame) {
-        let size = wgpu::Extent3d {
-            width: frame.width,
-            height: frame.height,
+        self.source_size = Some((frame.width, frame.height));
+        self.source_rgba = Some(frame.rgba.clone());
+        self.source = Some(self.build_source((frame.width, frame.height), &frame.rgba, 1));
+    }
+
+    /// Build the source texture as an [`Fbo`] of `size` with `mip_level_count`
+    /// levels and upload `rgba` into the base level (#23/F). When `mip_level_count
+    /// > 1` the texture also gets RENDER_ATTACHMENT usage so the mip-gen blit can
+    /// render the coarser levels. Coarser levels are filled by `generate_mips`.
+    fn build_source(&self, size: (u32, u32), rgba: &[u8], mip_level_count: u32) -> Fbo {
+        let extent = wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
             depth_or_array_layers: 1,
         };
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        if mip_level_count > 1 {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("source image"),
-            size,
-            mip_level_count: 1,
+            size: extent,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            format: Self::SOURCE_FORMAT,
+            usage,
             view_formats: &[],
         });
         self.queue.write_texture(
@@ -420,16 +454,29 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &frame.rgba,
+            rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(frame.width * 4),
-                rows_per_image: Some(frame.height),
+                bytes_per_row: Some(size.0 * 4),
+                rows_per_image: Some(size.1),
             },
-            size,
+            extent,
         );
-        self.source_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
-        self.source_size = Some((frame.width, frame.height));
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let base_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("source base level"),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        Fbo {
+            texture,
+            view,
+            base_view,
+            size,
+            format: Self::SOURCE_FORMAT,
+            mip_level_count,
+        }
     }
 
     /// Set a single shader as a degenerate **1-pass chain** (back-compat with the
@@ -658,6 +705,7 @@ impl Renderer {
             // The final pass renders into the offscreen target (no own FBO).
             intermediate: !is_final,
             produces_mips,
+            consumes_input_mips: pass.mipmap_input,
             fbo: None,
             bind_group: None,
         }
@@ -665,10 +713,12 @@ impl Renderer {
 
     /// Build a pass's input sampler from its `filter_linear`/`wrap_mode`/
     /// `mipmap_input` (#23). Address modes use [`Renderer::address_mode`] (which
-    /// applies the ClampToBorder→ClampToEdge fallback). When `mipmap_input` is
-    /// set, the mipmap filter is `Linear` and `lod_max_clamp` is left at its
-    /// default (`f32::MAX`) so coarse mips can be sampled; otherwise lod is
-    /// clamped to the base level so only mip 0 is read.
+    /// applies the ClampToBorder→ClampToEdge fallback). The mipmap filter follows
+    /// `filter_linear` (librashader's `mip_filter: filter`): `Linear` only when
+    /// both `mipmap_input` and `filter_linear` are set, else `Nearest`.
+    /// `lod_max_clamp` is left at its default (`f32::MAX`) when `mipmap_input` is
+    /// set so coarse mips can be sampled; otherwise lod is clamped to the base
+    /// level so only mip 0 is read.
     fn build_sampler(&self, pass: &Pass) -> wgpu::Sampler {
         let filter = if pass.filter_linear {
             wgpu::FilterMode::Linear
@@ -677,8 +727,15 @@ impl Renderer {
         };
         let address = self.address_mode(pass.wrap_mode);
         let (mipmap_filter, lod_max_clamp) = if pass.mipmap_input {
-            // Linear between mip levels; allow the full chain.
-            (wgpu::MipmapFilterMode::Linear, f32::MAX)
+            // Mips consumed: allow the full chain. The mip filter tracks
+            // `filter_linear` (librashader `mip_filter: filter`), so a nearest
+            // pass also samples mips with nearest.
+            let mip_filter = if pass.filter_linear {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
+            };
+            (mip_filter, f32::MAX)
         } else {
             // No mips consumed: pin to the base level.
             (wgpu::MipmapFilterMode::Nearest, 0.0)
@@ -729,11 +786,39 @@ impl Renderer {
         })
     }
 
+    /// Whether pass 0 reads its input (the source) with `mipmap_input` (#23/F).
+    fn pass0_wants_source_mips(&self) -> bool {
+        self.passes.first().is_some_and(|p| p.consumes_input_mips)
+    }
+
+    /// Upgrade (or downgrade) the source texture's mip chain to match pass 0's
+    /// `mipmap_input` (#23/F). When pass 0 wants mips and the source is currently
+    /// single-level, reallocate it with a full mip count + RENDER_ATTACHMENT and
+    /// re-upload the retained base image; the coarse levels are filled by
+    /// `generate_mips` each frame (before pass 0 draws). A no-op when the source's
+    /// current mip count already matches. Must run **before** `rebuild_chain` so
+    /// pass 0's bind group points at the (possibly new) source view.
+    fn ensure_source_mips(&mut self) {
+        let (Some(size), Some(rgba)) = (self.source_size, self.source_rgba.as_ref()) else {
+            return;
+        };
+        let want = if self.pass0_wants_source_mips() {
+            mip_level_count_for(size)
+        } else {
+            1
+        };
+        let have = self.source.as_ref().map(|s| s.mip_level_count).unwrap_or(0);
+        if want != have {
+            let rgba = rgba.clone();
+            self.source = Some(self.build_source(size, &rgba, want));
+        }
+    }
+
     /// (Re)allocate intermediate FBOs to the sizes the current source + viewport
     /// imply, and wire each pass's bind group to its input texture (pass 0 ←
     /// source; pass i ← pass i-1's FBO). Called at the top of [`render`].
     fn rebuild_chain(&mut self) {
-        let Some(source_view) = &self.source_view else {
+        let Some(source_view) = self.source.as_ref().map(|s| &s.view) else {
             return;
         };
         let source_size = self.source_size.unwrap_or((self.width, self.height));
@@ -883,7 +968,7 @@ impl Renderer {
     /// Whether the chain is ready to draw (a source, a non-empty chain, and
     /// every pass's bind group built).
     fn ready(&self) -> bool {
-        self.source_view.is_some()
+        self.source.is_some()
             && !self.passes.is_empty()
             && self.passes.iter().all(|p| p.bind_group.is_some())
     }
@@ -891,6 +976,10 @@ impl Renderer {
     /// Render one frame: run every pass in order into its target (intermediate →
     /// owned FBO, final → offscreen). Requires a source + a chain.
     pub fn render(&mut self) -> Result<(), RendererError> {
+        // Upgrade the source's mip chain if pass 0 reads it with `mipmap_input`
+        // (#23/F) — before `rebuild_chain` so pass 0's bind group points at the
+        // (possibly reallocated) source view.
+        self.ensure_source_mips();
         self.rebuild_chain();
         if !self.ready() {
             return Err(RendererError::NotReady);
@@ -899,13 +988,17 @@ impl Renderer {
 
         // Build the mip-generation resources up front (lazily, once) for every
         // FBO format that needs mips this frame, so the per-pass loop below can
-        // borrow `self.mip_gen` immutably alongside `self.passes`.
-        let mip_formats: Vec<wgpu::TextureFormat> = self
+        // borrow `self.mip_gen` immutably alongside `self.passes`. The source's
+        // own format is included when pass 0 needs source mips (#23/F).
+        let mut mip_formats: Vec<wgpu::TextureFormat> = self
             .passes
             .iter()
             .filter(|p| p.produces_mips)
             .map(|p| p.target_format)
             .collect();
+        if self.pass0_wants_source_mips() {
+            mip_formats.push(Self::SOURCE_FORMAT);
+        }
         if !mip_formats.is_empty() {
             self.ensure_mip_gen(&mip_formats);
         }
@@ -918,6 +1011,20 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+
+        // Source mips (#23/F): if pass 0 reads the source with `mipmap_input`, the
+        // source carries a mip chain; (re)generate it before pass 0 samples it
+        // (§10 mip timing — analogous to a producing pass's FBO).
+        if self.pass0_wants_source_mips() {
+            if let Some(source) = &self.source {
+                let mip_gen = self
+                    .mip_gen
+                    .as_ref()
+                    .expect("mip_gen built when pass 0 wants source mips");
+                generate_mips(&self.device, &mut encoder, mip_gen, source);
+            }
+        }
+
         for res in &self.passes {
             // Intermediate passes draw into their FBO's base mip level; the final
             // pass (no FBO) draws into the shared offscreen target. (Coarser mips,

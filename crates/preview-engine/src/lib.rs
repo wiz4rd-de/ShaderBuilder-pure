@@ -812,6 +812,62 @@ layout(set = 0, binding = 2) uniform sampler Smp;
             "without mipmap_input the base level is a sharp split (one channel), got {no_mips:?}"
         );
     }
+
+    // ---- 4b. mipmap_input on PASS 0 mips the SOURCE texture (#23/F). ----
+
+    /// A single pass reads the SOURCE with `mipmap_input` and samples a coarse LOD.
+    /// The source is a 64x64 left=red / right=green split, so a coarse mip averages
+    /// toward yellow. With `mipmap_input0` the source must carry a generated mip
+    /// chain; without it the source is single-level and the LOD request clamps to
+    /// the (sharp-split) base level.
+    fn source_mip_coarse_sample(mipmap_input0: bool) -> [u8; 4] {
+        // 64x64 source: left half red, right half green.
+        let mut data = Vec::with_capacity(64 * 64 * 4);
+        for _ in 0..64 {
+            for x in 0..64u32 {
+                if x < 32 {
+                    data.extend_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    data.extend_from_slice(&[0, 255, 0, 255]);
+                }
+            }
+        }
+        let src = Frame::new(64, 64, data);
+        // Pass 0 samples the source itself at a high LOD.
+        let probe = compile(
+            "void main() { FragColor = textureLod(sampler2D(Source, Smp), vec2(0.5, 0.5), 6.0); }\n",
+        );
+        let mut p0 = Pass::new(probe);
+        p0.mipmap_input = mipmap_input0;
+        // Nearest so the no-mips base read is a single (sharp-split) texel; the mip
+        // chain itself is built with a linear downsample, so the coarse LOD averages.
+        p0.filter_linear = false;
+        let out = render_chain(&[p0], &src, (8, 8));
+        center(&out)
+    }
+
+    #[test]
+    fn mipmap_input_on_pass0_mips_the_source() {
+        // With mipmap_input0: the source gets a real mip chain, so LOD 6 averages
+        // red+green (both channels lit, R~=G).
+        let with_mips = source_mip_coarse_sample(true);
+        assert!(
+            with_mips[0] > 60 && with_mips[1] > 60,
+            "mipmap_input0: coarse LOD should average red+green, got {with_mips:?}"
+        );
+        assert!(
+            (with_mips[0] as i32 - with_mips[1] as i32).abs() <= 60,
+            "mipmap_input0: averaged source mip should have R~=G, got {with_mips:?}"
+        );
+
+        // Without it: the source is single-level, so LOD 6 clamps to the base level
+        // — a single texel of the sharp split (one channel), NOT the average.
+        let no_mips = source_mip_coarse_sample(false);
+        assert!(
+            !(no_mips[0] > 60 && no_mips[1] > 60),
+            "without mipmap_input0 the source base level is a sharp split, got {no_mips:?}"
+        );
+    }
 }
 
 #[cfg(test)]
