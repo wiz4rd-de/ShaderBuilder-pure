@@ -140,11 +140,11 @@ pub enum WrapMode {
 pub struct ScaleAxis {
     /// The effective scale type for this axis, or `None` if the preset set no
     /// scale-type key for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub scale_type: Option<ScaleType>,
     /// The effective scale factor for this axis, or `None` if the preset set no
     /// scale-factor key for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub scale: Option<f32>,
 }
 
@@ -175,29 +175,29 @@ pub struct PassSettings {
     pub scale_y: ScaleAxis,
     /// `filter_linearN` — `true`=linear, `false`=nearest input filtering; `None`
     /// ⇒ unspecified (engine uses the §3 v1 default, linear).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub filter_linear: Option<bool>,
     /// `wrap_modeN` — sampler wrap for this pass's input; `None` ⇒ §3 default
     /// (`clampToBorder`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub wrap_mode: Option<WrapMode>,
     /// `mipmap_inputN` — generate a mip chain for this pass's input texture.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub mipmap_input: Option<bool>,
     /// `float_framebufferN` — `true` → RGBA16F render target (§3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub float_framebuffer: Option<bool>,
     /// `srgb_framebufferN` — `true` → RGBA8 sRGB render target (§3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub srgb_framebuffer: Option<bool>,
     /// `aliasN` — semantic name enabling `<alias>` / `<alias>Size` /
     /// `<alias>Feedback` bindings from later passes (§1/§4). Empty in the preset
     /// ⇒ `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub alias: Option<String>,
     /// `frame_count_modN` — if `>0`, the `FrameCount` fed to this pass wraps mod
     /// this value (§1). `None`/`0` ⇒ no wrap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub frame_count_mod: Option<u32>,
 }
 
