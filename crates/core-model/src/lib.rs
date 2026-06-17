@@ -69,6 +69,20 @@ pub struct Project {
     /// [`PipelineMetadata::default`] (empty) for hand-built projects.
     #[serde(default)]
     pub pipeline: PipelineMetadata,
+    /// The project's runtime parameter knobs — the **reconciled** set of
+    /// `#pragma parameter` declarations across every pass, with any `.slangp`
+    /// per-parameter overrides applied (#35). RetroArch parameters are global by
+    /// id: a parameter declared (identically) in several passes is **one** knob
+    /// here. This is the authoritative list the slider UI (#36 export) reads.
+    /// Distinct from a [`Pass`]'s own `parameters` (the raw per-pass
+    /// declarations). Defaults to `[]` for hand-built projects.
+    #[serde(default)]
+    pub parameters: Vec<Parameter>,
+    /// Imported LUT textures (the `.slangp` `textures` family, §7), with paths
+    /// already resolved relative to the preset directory and per-texture sampler
+    /// settings carried (#35). Empty for hand-built projects. Defaults to `[]`.
+    #[serde(default)]
+    pub luts: Vec<Lut>,
 }
 
 /// One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -426,6 +440,40 @@ pub struct Parameter {
     pub step: f32,
 }
 
+/// An imported LUT texture (the `.slangp` `textures` family,
+/// `docs/retroarch-slang-runtime.md` §7). A LUT is a static image loaded once and
+/// bindable from any pass by its [`Lut::name`] (`<NAME>` / `<NAME>Size`). Carries
+/// the per-texture sampler settings RetroArch reads from the `<NAME>_*` keys.
+///
+/// The `.slangp` per-texture keys are each optional: `None` means the preset did
+/// not set the key, so the engine applies the RetroArch LUT default (filtering =
+/// nearest, wrap = `clampToBorder`, no mipmaps) rather than this baking one in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Lut {
+    /// The LUT name as listed in `textures = "A;B"` and bound as `<NAME>` from a
+    /// pass body (§7). Unique within a project.
+    pub name: String,
+    /// The image path, **already resolved** against the preset directory at import
+    /// time (#35) — an absolute path, or a normalized relative path that may point
+    /// outside the preset dir (e.g. `../shared/foo.png`). Stored as a string (the
+    /// model is the serde/TS contract; the parser uses `PathBuf` internally).
+    pub path: String,
+    /// `<NAME>_linear` — `true`=linear, `false`=nearest filtering; `None` ⇒ the
+    /// preset did not set it (engine default: nearest, §7).
+    #[serde(default)]
+    pub filter_linear: Option<bool>,
+    /// `<NAME>_wrap_mode` — sampler wrap for the LUT; `None` ⇒ unset (engine
+    /// default `clampToBorder`).
+    #[serde(default)]
+    pub wrap_mode: Option<WrapMode>,
+    /// `<NAME>_mipmap` — generate a mip chain for the LUT; `None` ⇒ unset
+    /// (engine default: no mipmaps).
+    #[serde(default)]
+    pub mipmap: Option<bool>,
+}
+
 /// A 2D vector, used for editor node positions.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +516,8 @@ impl Project {
             passes: Vec::new(),
             feedback_pass: None,
             pipeline: PipelineMetadata::default(),
+            parameters: Vec::new(),
+            luts: Vec::new(),
         }
     }
 }
@@ -508,6 +558,21 @@ mod tests {
                     },
                 ],
             },
+            parameters: vec![Parameter {
+                name: "BRIGHTNESS".to_owned(),
+                label: "Brightness".to_owned(),
+                default: 1.5,
+                min: 0.0,
+                max: 2.0,
+                step: 0.01,
+            }],
+            luts: vec![Lut {
+                name: "BORDER".to_owned(),
+                path: "luts/border.png".to_owned(),
+                filter_linear: Some(true),
+                wrap_mode: Some(WrapMode::ClampToEdge),
+                mipmap: None,
+            }],
             passes: vec![
                 Pass {
                     id: "pass-0".to_owned(),
@@ -682,5 +747,49 @@ mod tests {
         .expect("project without pipeline deserializes");
         assert_eq!(project.pipeline, PipelineMetadata::default());
         assert!(project.passes[0].references.is_empty());
+    }
+
+    #[test]
+    fn project_parameters_and_luts_default_to_empty() {
+        // An omitted `parameters`/`luts` on the project deserializes to `[]` so
+        // older project files (schemaVersion 1, pre-#35) still load.
+        let project: Project =
+            serde_json::from_str(r#"{"schemaVersion":1,"name":"x","passes":[]}"#)
+                .expect("project without parameters/luts deserializes");
+        assert!(project.parameters.is_empty());
+        assert!(project.luts.is_empty());
+        assert_eq!(Project::empty("x").parameters, Vec::<Parameter>::new());
+        assert_eq!(Project::empty("x").luts, Vec::<Lut>::new());
+    }
+
+    #[test]
+    fn lut_optional_sampler_keys_default_to_none() {
+        // A LUT with only name+path (no `_linear`/`_wrap_mode`/`_mipmap`) loads
+        // with all sampler settings `None` so the engine applies §7 defaults.
+        let lut: Lut = serde_json::from_str(r#"{"name":"BORDER","path":"luts/border.png"}"#)
+            .expect("minimal LUT deserializes");
+        assert_eq!(lut.name, "BORDER");
+        assert_eq!(lut.path, "luts/border.png");
+        assert_eq!(lut.filter_linear, None);
+        assert_eq!(lut.wrap_mode, None);
+        assert_eq!(lut.mipmap, None);
+    }
+
+    #[test]
+    fn lut_round_trips_with_sampler_settings() {
+        let lut = Lut {
+            name: "OVERLAY".to_owned(),
+            path: "../shared/overlay.png".to_owned(),
+            filter_linear: Some(false),
+            wrap_mode: Some(WrapMode::Repeat),
+            mipmap: Some(true),
+        };
+        let json = serde_json::to_value(&lut).unwrap();
+        // camelCase field names per the §A convention.
+        assert_eq!(json["filterLinear"], serde_json::json!(false));
+        assert_eq!(json["wrapMode"], serde_json::json!("repeat"));
+        assert_eq!(json["mipmap"], serde_json::json!(true));
+        let back: Lut = serde_json::from_value(json).unwrap();
+        assert_eq!(lut, back);
     }
 }

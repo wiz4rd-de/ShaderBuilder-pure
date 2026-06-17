@@ -16,6 +16,7 @@ export type { Graph } from "./bindings/Graph";
 export type { Node } from "./bindings/Node";
 export type { Edge } from "./bindings/Edge";
 export type { Parameter } from "./bindings/Parameter";
+export type { Lut } from "./bindings/Lut";
 export type { Vec2 } from "./bindings/Vec2";
 export type { TextureRef } from "./bindings/TextureRef";
 export type { TextureRefKind } from "./bindings/TextureRefKind";
@@ -33,4 +34,6 @@ export const EMPTY_PROJECT: Project = {
   passes: [],
   feedbackPass: null,
   pipeline: { aliases: [], availability: [] },
+  parameters: [],
+  luts: [],
 };
