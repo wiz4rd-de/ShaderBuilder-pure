@@ -194,6 +194,16 @@ pub struct Preset {
     pub extras: BTreeMap<String, String>,
 }
 
+/// Upper bound on the declared `shaders` pass count we will accept (B1). The
+/// `shaders` value comes from an untrusted preset file fed to a registered Tauri
+/// command (`load_preset`), so it must be validated before it is used to size a
+/// `Vec`: an absurd count (e.g. `shaders = 8800000000000`) would otherwise make
+/// `Vec::with_capacity` request terabytes and `SIGABRT` the whole process — an
+/// allocation abort that `catch_unwind` does NOT contain. RetroArch's
+/// `GFX_MAX_SHADERS` is 26; we use a generous-but-sane cap so any real preset
+/// passes while a hostile/garbage count fails cleanly with a [`ParseError`].
+const MAX_PASSES: usize = 64;
+
 /// Errors parsing a `.slangp` preset.
 #[derive(Debug)]
 pub enum ParseError {
@@ -207,6 +217,9 @@ pub enum ParseError {
     BadScaleType(String),
     /// A LUT named in `textures` has no `<NAME> = path` entry.
     MissingLut(String),
+    /// The declared `shaders` count exceeds [`MAX_PASSES`] — refused rather than
+    /// trusted, so an untrusted preset cannot drive an unbounded allocation (B1).
+    TooManyPasses { declared: usize, max: usize },
 }
 
 impl std::fmt::Display for ParseError {
@@ -222,6 +235,10 @@ impl std::fmt::Display for ParseError {
                 "unknown scale type `{s}` (expected source/viewport/absolute)"
             ),
             ParseError::MissingLut(n) => write!(f, "LUT `{n}` listed in `textures` has no path"),
+            ParseError::TooManyPasses { declared, max } => write!(
+                f,
+                "preset declares {declared} passes, which exceeds the maximum of {max}"
+            ),
         }
     }
 }
@@ -248,7 +265,19 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
 
     let shaders: usize = require_parse(&map, "shaders")?;
 
-    let mut passes = Vec::with_capacity(shaders);
+    // VALIDATE the untrusted count BEFORE using it to size anything (B1). A
+    // hostile preset (`shaders = 8800000000000`) would otherwise make
+    // `Vec::with_capacity` request terabytes and `SIGABRT` the whole process —
+    // an allocation abort `catch_unwind` cannot contain. Refuse anything above
+    // the sane cap; `Vec::new()` then grows as real `shaderN` keys are found.
+    if shaders > MAX_PASSES {
+        return Err(ParseError::TooManyPasses {
+            declared: shaders,
+            max: MAX_PASSES,
+        });
+    }
+
+    let mut passes = Vec::new();
     for n in 0..shaders {
         passes.push(parse_pass(&map, n, base_dir)?);
     }
@@ -804,6 +833,32 @@ CONTRAST = 0.75
         let err =
             parse_slangp_str("shaders = 2\nshader0 = a.slang\n", Path::new("/p")).unwrap_err();
         assert!(matches!(err, ParseError::MissingKey(k) if k == "shader1"));
+    }
+
+    #[test]
+    fn absurd_shader_count_errors_cleanly_without_aborting() {
+        // B1: a hostile/garbage `shaders` count must NOT be trusted to pre-size a
+        // Vec (which would request terabytes and SIGABRT the whole process — an
+        // allocation abort `catch_unwind` does not contain). It must return a
+        // clean Err instead, so `load_preset` (a Tauri command on a frontend path)
+        // cannot take down the app.
+        let err = parse_slangp_str("shaders = 8800000000000\n", Path::new("/p")).unwrap_err();
+        assert!(
+            matches!(err, ParseError::TooManyPasses { declared, max }
+                if declared == 8_800_000_000_000 && max == MAX_PASSES),
+            "huge shader count must error as TooManyPasses, got {err:?}"
+        );
+
+        // A count just over the cap is also refused (boundary), and the cap itself
+        // is accepted up to the point a `shaderN` key is actually missing.
+        let err = parse_slangp_str(&format!("shaders = {}\n", MAX_PASSES + 1), Path::new("/p"))
+            .unwrap_err();
+        assert!(matches!(err, ParseError::TooManyPasses { .. }));
+        // At the cap, the count is allowed through to normal per-pass parsing
+        // (which then fails on the first missing `shaderN`, NOT on allocation).
+        let err =
+            parse_slangp_str(&format!("shaders = {MAX_PASSES}\n"), Path::new("/p")).unwrap_err();
+        assert!(matches!(err, ParseError::MissingKey(k) if k == "shader0"));
     }
 
     #[test]
