@@ -34,6 +34,7 @@
 use crate::bindtable::{self, PlaceholderResolver, TextureClass, TextureResolver};
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
 use crate::uniforms::{self, BuiltinValues, ParamStore, ParamView};
+use crate::viewport::ViewportConfig;
 use slang_compile::{BlockBinding, CompiledShader, Parameter, SpirvReflection, UniformBlock};
 use source::Frame;
 
@@ -347,6 +348,17 @@ pub struct Renderer {
     height: u32,
     offscreen: wgpu::Texture,
 
+    /// The **simulated viewport** (#30): the output resolution + integer-scale the
+    /// final pass renders at, distinct from the pane (`width`/`height`). `None` =
+    /// the viewport tracks the pane (the default, byte-identical to pre-#30
+    /// behavior). When `Some`, the final pass renders into a content-rect-sized FBO
+    /// (the §9 aspect-fit / integer-scale rectangle of the current source within
+    /// the output) which is then composited — centered, with black letterbox bars —
+    /// into the pane offscreen. `viewport`-scaled FBOs, the final pass's
+    /// `OutputSize`, and `FinalViewportSize` all reflect this content size (via
+    /// [`Renderer::viewport_size`]). See [`crate::viewport`] for the rect math.
+    simulated_viewport: Option<ViewportConfig>,
+
     /// Size of the uploaded source image, for the `*Size` uniforms.
     source_size: Option<(u32, u32)>,
     /// Frames rendered so far; written into `FrameCount` and bumped per frame.
@@ -504,6 +516,7 @@ impl Renderer {
             width,
             height,
             offscreen,
+            simulated_viewport: None,
             source_size: None,
             frame_count: 0,
             frame_direction: 1,
@@ -528,9 +541,13 @@ impl Renderer {
         (self.width, self.height)
     }
 
-    /// Resize the offscreen / final-viewport target. Intermediate FBO sizes are
-    /// recomputed lazily on the next [`Renderer::render`] (a `viewport`-scaled
-    /// pass reallocates when the viewport changes, §2).
+    /// Resize the offscreen / **pane** target — the read-back/stream surface
+    /// (Architecture §F). This is NOT the simulated viewport (#30): a simulated
+    /// viewport set via [`Renderer::set_simulated_viewport`] is the output
+    /// resolution the final pass renders at, and is composited down into this pane.
+    /// Intermediate FBO sizes are recomputed lazily on the next
+    /// [`Renderer::render`] (a `viewport`-scaled pass reallocates when the viewport
+    /// changes, §2).
     pub fn set_viewport(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -539,6 +556,71 @@ impl Renderer {
             self.height = height;
             self.offscreen = create_offscreen(&self.device, width, height);
         }
+    }
+
+    /// Set (or clear) the **simulated viewport** (#30, Architecture §D/§E): the
+    /// output resolution + integer-scale the final pass renders at. `None` makes
+    /// the viewport track the pane — the default, pre-#30 behavior where the final
+    /// no-scale pass renders straight into the pane offscreen.
+    ///
+    /// When `Some(cfg)`, the next [`Renderer::render`] sizes `viewport`-scaled FBOs,
+    /// the final pass's `OutputSize`, and `FinalViewportSize` to the **content
+    /// rect** (`cfg.content_rect(source).{width,height}` — the §9 aspect-fit /
+    /// integer-scale rectangle of the source within `cfg`), renders the final pass
+    /// into a content-sized FBO, and composites it — centered, with black letterbox
+    /// bars — into the pane. Reconfiguring forces the affected FBOs/builtins to
+    /// recompute on the next frame (they resolve from [`Renderer::viewport_size`]).
+    pub fn set_simulated_viewport(&mut self, config: Option<ViewportConfig>) {
+        self.simulated_viewport = config;
+    }
+
+    /// The current simulated viewport, if one is set (#30).
+    pub fn simulated_viewport(&self) -> Option<ViewportConfig> {
+        self.simulated_viewport
+    }
+
+    /// The **viewport size** all viewport-relative builtins/FBOs resolve against
+    /// (#30): when a simulated viewport is active, the **content rect size** (the
+    /// §9 aspect-fit / integer-scale rectangle of the current source within the
+    /// output resolution) — what `viewport`-scaled FBOs multiply, and what the
+    /// final pass reports as `OutputSize` / `FinalViewportSize`. With no simulated
+    /// viewport this is just the pane (`width`/`height`), so the pre-#30 path is
+    /// byte-identical. The source falls back to the pane when none is loaded yet.
+    fn viewport_size(&self) -> (u32, u32) {
+        match self.simulated_viewport {
+            Some(cfg) => {
+                let source = self.source_size.unwrap_or((self.width, self.height));
+                let rect = cfg.content_rect(source);
+                (rect.width, rect.height)
+            }
+            None => (self.width, self.height),
+        }
+    }
+
+    /// The destination rectangle (in **pane** pixel space) the final content FBO
+    /// is composited into (#30): the §9 content rect mapped from output-resolution
+    /// space into the pane. The full output rect scales to fill the pane, so the
+    /// content (with its centered offset) lands at
+    /// `(offset · pane/output, content · pane/output)`, leaving black bars. Sub-
+    /// pixel results are rounded to whole pixels and clamped into the pane.
+    /// `None` when no simulated viewport is active (the final pass draws straight
+    /// to the pane, no composite). Returns `(x, y, w, h)`.
+    fn final_composite_rect(&self) -> Option<(u32, u32, u32, u32)> {
+        let cfg = self.simulated_viewport?;
+        let source = self.source_size.unwrap_or((self.width, self.height));
+        let rect = cfg.content_rect(source);
+        let out_w = cfg.width.max(1) as f32;
+        let out_h = cfg.height.max(1) as f32;
+        let sx = self.width as f32 / out_w;
+        let sy = self.height as f32 / out_h;
+        let x = (rect.offset_x as f32 * sx).round() as u32;
+        let y = (rect.offset_y as f32 * sy).round() as u32;
+        // Round the content size into pane space and clamp so x+w / y+h never
+        // exceed the pane (a rounding overshoot at the far edge would otherwise
+        // make `set_viewport` reject the draw rect).
+        let w = ((rect.width as f32 * sx).round() as u32).min(self.width.saturating_sub(x));
+        let h = ((rect.height as f32 * sy).round() as u32).min(self.height.saturating_sub(y));
+        Some((x, y, w.max(1), h.max(1)))
     }
 
     /// The source texture's format. Linear RGBA8 — a passthrough shader
@@ -1253,17 +1335,43 @@ impl Renderer {
             return;
         };
         let source_size = self.source_size.unwrap_or((self.width, self.height));
-        let viewport = (self.width, self.height);
+        // The viewport size all viewport-relative sizing resolves against (#30):
+        // the simulated content rect when active, else the pane. So `viewport`-
+        // scaled FBOs (and the final pass under a simulated viewport) size to the
+        // simulated viewport, not the pane.
+        let viewport = self.viewport_size();
+        // Under a simulated viewport the FINAL pass renders into its own
+        // (content-rect-sized) FBO that is later composited into the pane with
+        // letterbox bars (#30) — analogous to the #22 explicit-scale / #24 feedback
+        // upgrades that already force a no-scale final pass to own an FBO. A
+        // no-scale final pass's `target_format` is `OFFSCREEN_FORMAT`, which is what
+        // we allocate it as, so no pipeline rebuild is needed.
+        let sim_active = self.simulated_viewport.is_some();
+        let last = self.passes.len().saturating_sub(1);
 
         // Pass 1: resolve + (re)allocate every owned FBO, tracking the running
         // input size down the chain (§2: a `source` scale on pass n is relative to
         // FBO n-1, not to Original). A final pass with an explicit scale also owns
         // an FBO here (#22); it is later stretched into the offscreen target.
         let mut input_size = source_size;
-        for res in &mut self.passes {
-            if res.owns_fbo {
-                let scale = Self::intermediate_scale(res.scale);
-                let size = scale.resolve(input_size, viewport);
+        for (i, res) in self.passes.iter_mut().enumerate() {
+            // The final pass owns an FBO this frame when it already does (an
+            // explicit `scale` — #22, or a feedback target — #24) OR a simulated
+            // viewport is active (#30). The pre-#30 no-scale final pass with no
+            // simulated viewport keeps `owns_fbo == false` and renders straight to
+            // the pane, byte-identical to before.
+            let owns_fbo_now = res.owns_fbo || (i == last && sim_active);
+            if owns_fbo_now {
+                // A no-scale final pass forced to own an FBO by the simulated
+                // viewport (#30) is sized to the content rect (`viewport`), not its
+                // `source × 1.0` default; any pass with an explicit scale (incl. an
+                // explicitly-scaled final pass, #22) keeps its scale resolution.
+                let size = if i == last && sim_active && res.scale.is_none() {
+                    viewport
+                } else {
+                    let scale = Self::intermediate_scale(res.scale);
+                    scale.resolve(input_size, viewport)
+                };
                 // An FBO read downstream with `mipmap_input` carries a full mip
                 // chain; otherwise just the base level (#23). Reallocate when
                 // size, format, or mip-count changes.
@@ -1320,8 +1428,13 @@ impl Renderer {
                 }
                 input_size = size;
             } else {
-                // Final pass with no FBO: output is the viewport.
-                input_size = viewport;
+                // Final pass with no FBO: it renders straight to the pane offscreen,
+                // so its output IS the pane. Drop any FBO a previously-active
+                // simulated viewport left behind (#30) so toggling the simulated
+                // viewport back to `None` reverts to the byte-identical direct path
+                // (the render loop routes a `None` fbo to the offscreen target).
+                res.fbo = None;
+                input_size = (self.width, self.height);
             }
         }
 
@@ -1545,7 +1658,10 @@ impl Renderer {
     /// `PassOutputKSize` (§7).
     fn write_uniforms(&self) {
         let original = self.source_size.unwrap_or((self.width, self.height));
-        let viewport = (self.width, self.height);
+        // `FinalViewportSize` and every `viewport`-relative builtin report the
+        // simulated viewport's content size when one is active (#30), else the pane
+        // — the same size `rebuild_chain` sized FBOs against, kept consistent.
+        let viewport = self.viewport_size();
         let mut input_size = original;
         // Every pass's output size (NOT just causal ones): a feedback twin shares
         // its pass's output dimensions, and feedback is causal in time, so any pass
@@ -1694,13 +1810,21 @@ impl Renderer {
             self.ensure_mip_gen(&mip_formats);
         }
 
-        // A final pass with an explicit scale renders into its own FBO and is then
-        // stretched into the offscreen target (#22): build the blit resources up
+        // The FINAL pass renders into its own FBO and is then composited into the
+        // pane offscreen when: it declares an explicit scale (#22, stretch blit) OR
+        // a simulated viewport is active (#30, content-rect blit with letterbox
+        // bars). In both cases `rebuild_chain` gave the final pass an FBO, so detect
+        // it as "the last pass owns an FBO this frame". Build the blit resources up
         // front so the per-pass loop can borrow them immutably alongside `passes`.
-        let final_owns_fbo = self.passes.last().is_some_and(|p| p.final_owns_fbo);
-        if final_owns_fbo {
+        let final_needs_composite = self.passes.last().is_some_and(|p| p.fbo.is_some());
+        if final_needs_composite {
             self.ensure_blit();
         }
+        // Where the final content FBO is composited (#30): a centered sub-rect with
+        // black bars when a simulated viewport is active, else `None` (the #22 path
+        // fills the whole pane — see `blit_to_offscreen`).
+        let composite_rect = self.final_composite_rect();
+        let last_index = self.passes.len().saturating_sub(1);
 
         let offscreen_view = self
             .offscreen
@@ -1724,7 +1848,7 @@ impl Renderer {
             }
         }
 
-        for res in &self.passes {
+        for (i, res) in self.passes.iter().enumerate() {
             // Intermediate passes draw into their FBO's base mip level; the final
             // pass (no FBO) draws into the shared offscreen target. (Coarser mips,
             // if any, are filled by `generate_mips` after the draw.)
@@ -1769,17 +1893,36 @@ impl Renderer {
                     generate_mips(&self.device, &mut encoder, mip_gen, fbo);
                 }
             }
-            // #22: a final pass with an explicit scale drew into its own scaled
-            // FBO; stretch it into the viewport-sized offscreen target with a
-            // linear sampler so the read-back is the resampled result.
-            if res.final_owns_fbo {
-                if let Some(fbo) = &res.fbo {
-                    let blit = self
-                        .blit
-                        .as_ref()
-                        .expect("blit built when a final pass owns an FBO");
-                    blit_to_offscreen(&self.device, &mut encoder, blit, fbo, &offscreen_view);
-                }
+            // The FINAL pass that drew into its own FBO is composited into the pane
+            // offscreen with a linear sampler:
+            //   - #22 (explicit scale, no simulated viewport): a full-pane stretch
+            //     blit — `composite_rect` is `None`, so `blit_to_offscreen` fills
+            //     the whole pane exactly as before.
+            //   - #30 (simulated viewport active): the content FBO is drawn into a
+            //     centered `composite_rect` (mapped from the §9 content rect into
+            //     pane space), the clear-to-black leaving the letterbox bars.
+            if let (true, Some(fbo)) = (i == last_index, &res.fbo) {
+                // Invariant: with no simulated viewport, a final pass owning an FBO
+                // can only be the #22 explicit-scale / #24 feedback upgrade — which
+                // is exactly `final_owns_fbo`. A simulated viewport adds the #30
+                // case (a no-scale final pass forced to own a content-rect FBO).
+                debug_assert!(
+                    res.final_owns_fbo || self.simulated_viewport.is_some(),
+                    "final pass owns an FBO only via #22/#24 (final_owns_fbo) or #30 \
+                     (simulated viewport)"
+                );
+                let blit = self
+                    .blit
+                    .as_ref()
+                    .expect("blit built when the final pass owns an FBO");
+                blit_to_offscreen(
+                    &self.device,
+                    &mut encoder,
+                    blit,
+                    fbo,
+                    &offscreen_view,
+                    composite_rect,
+                );
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -2181,16 +2324,25 @@ fn generate_mips(
     }
 }
 
-/// Stretch a final pass's scaled FBO into the viewport-sized offscreen target
-/// (#22): a fullscreen-quad passthrough samples `fbo` (its full `view`, mip 0)
-/// with a **linear** sampler and writes the offscreen target, so a final pass
-/// declaring an explicit `scaleN` is resampled to the viewport before read-back.
+/// Composite a final pass's FBO into the pane offscreen target with a **linear**
+/// sampler (#22/#30): a fullscreen-quad passthrough samples `fbo` (its full
+/// `view`, mip 0) and writes the offscreen target. The pass clears the offscreen
+/// to black first, so any area the draw doesn't cover becomes a black bar.
+///
+/// `dest_rect` controls where the FBO lands:
+/// - `None` (#22): the draw fills the whole pane — a plain stretch blit, so an
+///   explicitly-scaled final pass is resampled to the pane exactly as before #30.
+/// - `Some((x, y, w, h))` (#30): the draw is confined (via [`wgpu::RenderPass::
+///   set_viewport`]) to that centered content sub-rect in pane space, leaving the
+///   cleared-black remainder as letterbox/pillarbox bars. When the content fills
+///   the pane (output == pane, content == pane) this is identical to `None`.
 fn blit_to_offscreen(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     blit: &Blit,
     fbo: &Fbo,
     offscreen_view: &wgpu::TextureView,
+    dest_rect: Option<(u32, u32, u32, u32)>,
 ) {
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("blit bind group"),
@@ -2207,12 +2359,14 @@ fn blit_to_offscreen(
         ],
     });
     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("final stretch blit"),
+        label: Some("final composite blit"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: offscreen_view,
             resolve_target: None,
             depth_slice: None,
             ops: wgpu::Operations {
+                // Clear the whole pane to black first; the (possibly sub-rect) draw
+                // then overwrites the content area, leaving the rest as bars (#30).
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 store: wgpu::StoreOp::Store,
             },
@@ -2224,6 +2378,11 @@ fn blit_to_offscreen(
     });
     rp.set_pipeline(&blit.pipeline);
     rp.set_bind_group(0, &bind_group, &[]);
+    // #30: clip the draw to the content sub-rect so the cleared black around it is
+    // the letterbox. A `None` rect leaves the default full-target viewport (#22).
+    if let Some((x, y, w, h)) = dest_rect {
+        rp.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+    }
     rp.draw(0..3, 0..1);
 }
 

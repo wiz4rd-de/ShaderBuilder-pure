@@ -69,6 +69,12 @@ pub enum RenderCommand {
     /// Resize the offscreen target — i.e. the preview-pane size that frames are
     /// downsampled to.
     SetViewport(u32, u32),
+    /// Set (or clear) the **simulated viewport** (#30): the output resolution +
+    /// integer-scale the final pass renders at, distinct from the pane. `None`
+    /// makes the viewport track the pane (the default). When `Some`, `viewport`-
+    /// scaled FBOs, the final pass's `OutputSize`, and `FinalViewportSize` reflect
+    /// the §9 content rect, which is composited (with letterbox bars) into the pane.
+    SetSimulatedViewport(Option<crate::ViewportConfig>),
     /// Update a `#pragma parameter`'s current value live (#29). Applied to the
     /// chain's global-by-name parameter store; the next frame re-packs it — no
     /// recompile or pipeline rebuild. An unknown name is a no-op.
@@ -131,6 +137,11 @@ impl RenderSource {
                 }
                 RenderCommand::SetViewport(width, height) => {
                     self.renderer.set_viewport(width, height);
+                }
+                RenderCommand::SetSimulatedViewport(config) => {
+                    // #30: takes effect next frame — `viewport`-scaled FBOs and the
+                    // final-pass composite recompute from the new content rect.
+                    self.renderer.set_simulated_viewport(config);
                 }
                 RenderCommand::SetParameter { name, value } => {
                     // Live param update: no recompile, takes effect next frame.

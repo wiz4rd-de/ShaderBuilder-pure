@@ -340,6 +340,34 @@ pub fn set_viewport(state: State<'_, PreviewState>, width: u32, height: u32) -> 
     state.send(RenderCommand::SetViewport(width, height))
 }
 
+/// Configure the **simulated viewport** (#30, Architecture §D/§E): the output
+/// resolution + integer-scale the final pass renders at, distinct from the pane
+/// (which [`set_viewport`] controls). `enabled = false` clears it so the viewport
+/// tracks the pane (the default); `enabled = true` sets `width × height` with the
+/// `integer_scale` toggle. The change takes effect on the next frame: `viewport`-
+/// scaled FBOs, the final pass's `OutputSize`, and `FinalViewportSize` recompute to
+/// the §9 content rect, which is composited (with black letterbox bars) into the
+/// pane. Dimensions are clamped to at least 1.
+#[tauri::command]
+pub fn set_simulated_viewport(
+    state: State<'_, PreviewState>,
+    enabled: bool,
+    width: u32,
+    height: u32,
+    integer_scale: bool,
+) -> Result<(), String> {
+    let config = if enabled {
+        Some(preview_engine::ViewportConfig {
+            width: width.max(1),
+            height: height.max(1),
+            integer_scale,
+        })
+    } else {
+        None
+    };
+    state.send(RenderCommand::SetSimulatedViewport(config))
+}
+
 /// Drive a [`FrameSource`], sending each rendered frame over `channel` as raw
 /// binary, paced to `period`, until `running` is cleared or the channel closes.
 ///

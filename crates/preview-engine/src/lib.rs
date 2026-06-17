@@ -16,6 +16,7 @@ pub mod pass;
 pub mod render_source;
 pub mod renderer;
 pub mod uniforms;
+pub mod viewport;
 
 pub use bindtable::{PlaceholderResolver, TextureClass, TextureResolver};
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
@@ -23,6 +24,7 @@ pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
 pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
 pub use renderer::{LutSpec, Renderer, RendererError, OFFSCREEN_FORMAT};
 pub use uniforms::{BuiltinUniforms, BuiltinValues, ParamDef, ParamStore, ParamView};
+pub use viewport::{ViewportConfig, ViewportRect};
 
 /// Crate identity marker. See `core_model::NAME`.
 pub const NAME: &str = "preview-engine";
@@ -2447,5 +2449,261 @@ mod lut_size_tests {
         assert_eq!(v.member_bytes("PALSize"), Some(want));
         // An unregistered LUT size is unknown (member stays zero).
         assert_eq!(v.member_bytes("OtherSize"), None);
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    //! Simulated-viewport tests (#30, Architecture §D, §9): the final pass renders
+    //! at the simulated viewport (output) resolution — NOT the pane — and is then
+    //! composited into the pane with black letterbox/pillarbox bars. Real GPU,
+    //! read-back style (mirrors `chain_tests`): a probe shader encodes a `*Size`
+    //! builtin into a uniform color so the read-back decodes the size the final
+    //! pass actually saw, and a solid-color content shader lets us read the bars.
+    use super::{Pass, Renderer, ViewportConfig};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    // Builtin UBO carrying OutputSize + FinalViewportSize + separate tex/sampler.
+    const PREAMBLE: &str = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat4 MVP;
+    vec4 SourceSize;
+    vec4 OriginalSize;
+    vec4 OutputSize;
+    vec4 FinalViewportSize;
+    uint FrameCount;
+} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+";
+
+    fn compile(frag_body: &str) -> CompiledShader {
+        compile_slang(&format!("{PREAMBLE}{frag_body}"), None).expect("compile #30 fixture")
+    }
+
+    /// Encodes the final pass's own `OutputSize` into a uniform color (R = w/512,
+    /// G = h/512) so the read-back decodes the size the final pass rendered at.
+    fn output_size_probe() -> CompiledShader {
+        compile("void main() { FragColor = vec4(global.OutputSize.x / 512.0, global.OutputSize.y / 512.0, 0.0, 1.0); }\n")
+    }
+
+    /// Encodes `FinalViewportSize` the same way.
+    fn final_viewport_size_probe() -> CompiledShader {
+        compile("void main() { FragColor = vec4(global.FinalViewportSize.x / 512.0, global.FinalViewportSize.y / 512.0, 0.0, 1.0); }\n")
+    }
+
+    /// A pass that ignores its input and writes a constant color — used to fill the
+    /// simulated-viewport content region so the surrounding letterbox bars read as
+    /// the (cleared) black and the content reads the constant.
+    fn constant(rgba: [f32; 4]) -> CompiledShader {
+        compile(&format!(
+            "void main() {{ FragColor = vec4({:?}, {:?}, {:?}, {:?}); }}\n",
+            rgba[0], rgba[1], rgba[2], rgba[3]
+        ))
+    }
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&rgba);
+        }
+        Frame::new(width, height, data)
+    }
+
+    fn size_close(got: (u32, u32), want: (u32, u32)) -> bool {
+        got.0.abs_diff(want.0) <= 3 && got.1.abs_diff(want.1) <= 3
+    }
+
+    /// Render `passes` with a simulated viewport set, returning the pane read-back.
+    fn render_with_viewport(
+        passes: &[Pass],
+        frame: &Frame,
+        pane: (u32, u32),
+        sim: ViewportConfig,
+    ) -> Frame {
+        let mut r = Renderer::new(pane.0, pane.1).expect("wgpu device");
+        r.set_source(frame);
+        r.set_simulated_viewport(Some(sim));
+        r.set_chain(passes).expect("set chain");
+        r.render().expect("render");
+        r.read_back().expect("read back")
+    }
+
+    fn decode(b: u8) -> u32 {
+        (b as f32 / 255.0 * 512.0).round() as u32
+    }
+
+    fn px(f: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * f.width + x) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2], f.rgba[i + 3]]
+    }
+
+    #[test]
+    fn final_pass_output_size_is_the_simulated_viewport_not_the_pane() {
+        // Pane 256x256, simulated viewport 100x80 with a source of the SAME aspect
+        // (50x40 -> aspect-fit fills 100x80 exactly, content == output, no bars).
+        // The final OutputSize probe must decode the SIMULATED content size
+        // (100x80), NOT the pane (256). A center pixel is inside the (full-pane)
+        // content, so it reads the encoded size cleanly.
+        let sim = ViewportConfig {
+            width: 100,
+            height: 80,
+            integer_scale: false,
+        };
+        let out = render_with_viewport(
+            &[Pass::new(output_size_probe())],
+            &solid(50, 40, [0, 0, 0, 255]),
+            (256, 256),
+            sim,
+        );
+        assert_eq!(
+            (out.width, out.height),
+            (256, 256),
+            "read-back is pane-sized"
+        );
+        let c = px(&out, out.width / 2, out.height / 2);
+        let got = (decode(c[0]), decode(c[1]));
+        assert!(
+            size_close(got, (100, 80)),
+            "final pass must see OutputSize == the simulated content (100x80), not \
+             the pane (256); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn final_viewport_size_is_the_simulated_viewport_not_the_pane() {
+        // Same setup, probing FinalViewportSize instead of OutputSize.
+        let sim = ViewportConfig {
+            width: 120,
+            height: 90,
+            integer_scale: false,
+        };
+        let out = render_with_viewport(
+            &[Pass::new(final_viewport_size_probe())],
+            &solid(40, 30, [0, 0, 0, 255]),
+            (300, 300),
+            sim,
+        );
+        let c = px(&out, out.width / 2, out.height / 2);
+        let got = (decode(c[0]), decode(c[1]));
+        assert!(
+            size_close(got, (120, 90)),
+            "FinalViewportSize must be the simulated viewport (120x90), not the pane \
+             (300); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn viewport_scaled_intermediate_uses_the_simulated_viewport() {
+        // A `viewport × 1.0` INTERMEDIATE pass must size to the simulated content,
+        // not the pane. Pane 256x256; simulated 100x80 (source 50x40 -> content
+        // 100x80). Pass 0 (viewport×1, the OutputSize probe) thus has a 100x80 FBO;
+        // a passthrough final pass carries the (uniform) encoded size to the pane.
+        use super::{AxisScale, ScaleConfig};
+        let sim = ViewportConfig {
+            width: 100,
+            height: 80,
+            integer_scale: false,
+        };
+        let pass0 = Pass::new(output_size_probe()).with_scale(ScaleConfig {
+            x: AxisScale::VIEWPORT_1X,
+            y: AxisScale::VIEWPORT_1X,
+        });
+        let passthrough =
+            compile("void main() { FragColor = texture(sampler2D(Source, Smp), vTexCoord); }\n");
+        let out = render_with_viewport(
+            &[pass0, Pass::new(passthrough)],
+            &solid(50, 40, [0, 0, 0, 255]),
+            (256, 256),
+            sim,
+        );
+        let c = px(&out, out.width / 2, out.height / 2);
+        let got = (decode(c[0]), decode(c[1]));
+        assert!(
+            size_close(got, (100, 80)),
+            "viewport×1 intermediate must size to the simulated viewport (100x80), \
+             not the pane (256); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn integer_scale_letterboxes_the_content_in_the_pane() {
+        // Pane == output (100x100) so the composite maps the content rect 1:1 into
+        // the pane. Integer-scale a 30x30 source: n = floor(100/30) = 3 -> content
+        // 90x90 centered at offset (5,5). The final pass writes a constant RED into
+        // the content FBO; the composite clears the pane to black and draws the
+        // content into the centered 90x90 sub-rect — so:
+        //   - the pane CENTER (50,50) reads red (inside the content), and
+        //   - the pane CORNER (1,1) reads black (a letterbox bar; offset is 5px).
+        let sim = ViewportConfig {
+            width: 100,
+            height: 100,
+            integer_scale: true,
+        };
+        let out = render_with_viewport(
+            &[Pass::new(constant([1.0, 0.0, 0.0, 1.0]))],
+            &solid(30, 30, [0, 0, 0, 255]),
+            (100, 100),
+            sim,
+        );
+        assert_eq!((out.width, out.height), (100, 100));
+        let center = px(&out, 50, 50);
+        assert!(
+            center[0] > 200 && center[1] < 60 && center[2] < 60,
+            "content center should be red, got {center:?}"
+        );
+        // Corner is well inside the 5px bar (sample (1,1) to dodge edge sampling).
+        let corner = px(&out, 1, 1);
+        assert!(
+            corner[0] < 40 && corner[1] < 40 && corner[2] < 40,
+            "letterbox corner should be black, got {corner:?}"
+        );
+        // And a point just inside the bar on the left edge mid-height is black,
+        // while just inside the content is red — proving the bar is at the offset.
+        assert!(px(&out, 2, 50)[0] < 40, "left bar at x=2 should be black");
+        assert!(px(&out, 50, 50)[0] > 200, "content at x=50 should be red");
+    }
+
+    #[test]
+    fn clearing_the_simulated_viewport_reverts_to_full_pane() {
+        // Setting then clearing the simulated viewport must restore the pre-#30
+        // direct path: the no-scale final pass fills the whole pane (no bars).
+        let mut r = Renderer::new(64, 64).expect("wgpu device");
+        r.set_source(&solid(30, 30, [0, 0, 0, 255]));
+        r.set_chain(&[Pass::new(constant([1.0, 0.0, 0.0, 1.0]))])
+            .expect("set chain");
+
+        // With an integer-scale simulated viewport the corner is a black bar.
+        r.set_simulated_viewport(Some(ViewportConfig {
+            width: 64,
+            height: 64,
+            integer_scale: true,
+        }));
+        r.render().expect("render");
+        let with_sim = r.read_back().expect("read back");
+        assert!(
+            px(&with_sim, 1, 1)[0] < 40,
+            "simulated viewport: corner is a letterbox bar"
+        );
+
+        // Clear it: the final pass again fills the whole pane, so the corner is red.
+        r.set_simulated_viewport(None);
+        r.render().expect("render");
+        let no_sim = r.read_back().expect("read back");
+        assert!(
+            px(&no_sim, 1, 1)[0] > 200,
+            "after clearing, the whole pane is content (no bars), got {:?}",
+            px(&no_sim, 1, 1)
+        );
     }
 }
