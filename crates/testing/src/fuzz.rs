@@ -10,8 +10,10 @@
 //! * pointed at the committed [`fixtures`](crate) it is a fast, deterministic CI
 //!   smoke test that the engine still imports every feature-exercising fixture;
 //! * pointed at a cloned `slang-shaders` checkout it is the **real corpus run**
-//!   — documented as a manual gate in `docs/golden-image-harness.md`, since that
-//!   corpus is a large external clone and is intentionally NOT vendored here.
+//!   — driven by the `#[ignore]`d `corpus_fuzz.rs` (keyed off `FUZZ_CORPUS_DIR`),
+//!   which prints a categorized compile/render/failure summary. The corpus is a
+//!   large external clone and is intentionally NOT vendored here; see
+//!   `docs/golden-image-harness.md` §2 for the latest results + failure worklist.
 
 use std::path::{Path, PathBuf};
 

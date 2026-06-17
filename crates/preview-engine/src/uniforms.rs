@@ -506,42 +506,66 @@ impl BuiltinValues {
     }
 }
 
+/// Parse the index out of an indexed-size semantic for a given `base`, accepting
+/// **both** spellings RetroArch's `slang_process.cpp` produces and accepts:
+///
+/// * the canonical *uniform* spelling `<base>Size<N>` — what RetroArch actually
+///   emits (it builds the size-member name as `names[semantic]` (e.g.
+///   `"PassFeedbackSize"`, `"PassOutputSize"`, `"OriginalHistorySize"`) **then**
+///   appends the index), so the real corpus uses `PassFeedbackSize0`,
+///   `PassOutputSize1`, `OriginalHistorySize2`, … (Size BEFORE the number); and
+/// * the *alias* spelling `<base><N>Size` (Size AFTER the number) — the form a
+///   `#pragma name`/alias produces (`name + "Size"`) and the spelling earlier
+///   tickets assumed.
+///
+/// Returns the parsed `N` for either spelling, `None` otherwise. The `<base>Size<N>`
+/// branch is tried first because for `base = "Pass"` the alias branch would
+/// otherwise mis-read `PassFeedbackSize0` / `PassOutputSize0` (its remainder is
+/// non-numeric, so it would still reject — but ordering keeps intent clear).
+fn parse_indexed_size(name: &str, base: &str) -> Option<usize> {
+    // Canonical RetroArch uniform spelling: `<base>Size<N>`.
+    if let Some(rest) = name.strip_prefix(base).and_then(|r| r.strip_prefix("Size")) {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return rest.parse().ok();
+        }
+    }
+    // Alias spelling: `<base><N>Size`.
+    if let Some(digits) = name.strip_prefix(base).and_then(|r| r.strip_suffix("Size")) {
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
 /// Parse a per-pass output-size semantic name into its pass index, accepting
-/// both spellings RetroArch uses (§7/§11): `PassOutputKSize` and the `PassKSize`
-/// alias. Returns `None` for any other name (including `PassFeedbackKSize`,
-/// which is a *different*, not-yet-wired semantic — #24).
+/// every spelling RetroArch uses/accepts (§7/§11): the canonical `PassOutputSizeK`
+/// it emits, plus the `PassOutputKSize` and `PassKSize` alias forms. Returns
+/// `None` for any other name (including a `PassFeedback…` name, which is a
+/// *different* semantic handled by [`parse_pass_feedback_size_index`]).
 fn parse_pass_size_index(name: &str) -> Option<usize> {
-    let digits = name
-        .strip_prefix("PassOutput")
-        .or_else(|| name.strip_prefix("Pass"))?
-        .strip_suffix("Size")?;
-    // Must be all digits (rejects e.g. `PassFeedback…Size`, `PassOutputSize`).
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // Reject the feedback family explicitly so `PassFeedbackSize0` is never read as
+    // a pass-output size (it shares the `Pass` prefix).
+    if name.starts_with("PassFeedback") {
         return None;
     }
-    digits.parse().ok()
+    parse_indexed_size(name, "PassOutput").or_else(|| parse_indexed_size(name, "Pass"))
 }
 
-/// Parse a `PassFeedbackKSize` semantic name into its pass index `K` (#24, §4).
-/// Returns `None` for any other name. Distinct from [`parse_pass_size_index`],
-/// which deliberately rejects the `Feedback` spelling.
+/// Parse a feedback-size semantic name into its pass index `K` (#24, §4),
+/// accepting the canonical `PassFeedbackSizeK` RetroArch emits and the
+/// `PassFeedbackKSize` alias form. Returns `None` for any other name. Distinct
+/// from [`parse_pass_size_index`], which rejects the `Feedback` family.
 fn parse_pass_feedback_size_index(name: &str) -> Option<usize> {
-    let digits = name.strip_prefix("PassFeedback")?.strip_suffix("Size")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+    parse_indexed_size(name, "PassFeedback")
 }
 
-/// Parse an `OriginalHistoryKSize` semantic name into its depth `K` (#25, §5),
-/// accepting `K = 0` (which the caller maps to `OriginalSize`). Returns `None`
-/// for any other name.
+/// Parse an original-history-size semantic name into its depth `K` (#25, §5),
+/// accepting the canonical `OriginalHistorySizeK` RetroArch emits and the
+/// `OriginalHistoryKSize` alias form, with `K = 0` (which the caller maps to
+/// `OriginalSize`). Returns `None` for any other name.
 fn parse_history_size_index(name: &str) -> Option<usize> {
-    let digits = name.strip_prefix("OriginalHistory")?.strip_suffix("Size")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+    parse_indexed_size(name, "OriginalHistory")
 }
 
 /// Pack the builtin semantics into the byte image of one reflected uniform block
@@ -743,16 +767,41 @@ mod tests {
 
     #[test]
     fn parse_pass_size_index_accepts_both_spellings() {
+        // Canonical RetroArch uniform spelling (`<base>Size<N>`, Size BEFORE the
+        // number) — what `slang_process.cpp` emits and the corpus actually uses.
+        assert_eq!(parse_pass_size_index("PassOutputSize0"), Some(0));
+        assert_eq!(parse_pass_size_index("PassOutputSize1"), Some(1));
+        // Alias spellings (Size AFTER the number) RetroArch also accepts.
         assert_eq!(parse_pass_size_index("Pass0Size"), Some(0));
         assert_eq!(parse_pass_size_index("PassOutput0Size"), Some(0));
         assert_eq!(parse_pass_size_index("Pass12Size"), Some(12));
         assert_eq!(parse_pass_size_index("PassOutput3Size"), Some(3));
-        // Not a pass-output size: feedback is a distinct (deferred) semantic.
+        // Not a pass-output size: feedback is a distinct semantic (its own parser),
+        // and must NOT be read here in either spelling.
+        assert_eq!(parse_pass_size_index("PassFeedbackSize0"), None);
         assert_eq!(parse_pass_size_index("PassFeedback0Size"), None);
         // No index / no Size suffix.
         assert_eq!(parse_pass_size_index("PassOutputSize"), None);
         assert_eq!(parse_pass_size_index("Pass0"), None);
         assert_eq!(parse_pass_size_index("SourceSize"), None);
+    }
+
+    #[test]
+    fn parse_feedback_and_history_size_accept_retroarch_spelling() {
+        // The bug #32 closed: RetroArch emits `PassFeedbackSize<N>` /
+        // `OriginalHistorySize<N>` (Size BEFORE the number); the old parsers only
+        // accepted the `<base><N>Size` alias, so `feedback.slang`'s
+        // `PassFeedbackSize0` member was left zero — making the shader sample texel
+        // (0,0) everywhere and "accumulate to white".
+        assert_eq!(parse_pass_feedback_size_index("PassFeedbackSize0"), Some(0));
+        assert_eq!(parse_pass_feedback_size_index("PassFeedbackSize2"), Some(2));
+        assert_eq!(parse_pass_feedback_size_index("PassFeedback0Size"), Some(0)); // alias
+        assert_eq!(parse_pass_feedback_size_index("PassOutputSize0"), None);
+
+        assert_eq!(parse_history_size_index("OriginalHistorySize1"), Some(1));
+        assert_eq!(parse_history_size_index("OriginalHistorySize5"), Some(5));
+        assert_eq!(parse_history_size_index("OriginalHistory1Size"), Some(1)); // alias
+        assert_eq!(parse_history_size_index("OriginalHistorySize0"), Some(0));
     }
 
     #[test]
@@ -861,8 +910,11 @@ mod tests {
             Some(2u32.to_le_bytes().to_vec())
         );
         assert!(values.member_bytes("MVP").is_some());
-        // Not-yet-wired / unknown semantics return None (member left zero).
+        // A recognized history-size semantic whose ring slot is empty returns None
+        // (member left zero) — in BOTH the RetroArch and alias spellings.
+        assert!(values.member_bytes("OriginalHistorySize1").is_none());
         assert!(values.member_bytes("OriginalHistory1Size").is_none());
+        // A truly unknown member name also returns None.
         assert!(values.member_bytes("SomeUserParam").is_none());
     }
 

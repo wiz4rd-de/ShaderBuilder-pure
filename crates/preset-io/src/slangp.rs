@@ -260,9 +260,10 @@ pub fn parse_slangp_str(text: &str, base_dir: &Path) -> Result<Preset, ParseErro
     })
 }
 
-/// Parse the flat INI body into a `key -> value` map. Comments (`#`/`//`) and
-/// blank lines are skipped; surrounding whitespace and a single pair of quotes
-/// are stripped from each value. Later duplicate keys win (RetroArch behavior).
+/// Parse the flat INI body into a `key -> value` map. Whole-line and **inline**
+/// comments (`#`/`//`) and blank lines are skipped; surrounding whitespace and a
+/// single pair of quotes are stripped from each value. Later duplicate keys win
+/// (RetroArch behavior).
 fn parse_ini(text: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for raw in text.lines() {
@@ -277,9 +278,31 @@ fn parse_ini(text: &str) -> BTreeMap<String, String> {
         if key.is_empty() {
             continue;
         }
-        map.insert(key, unquote(value.trim()).to_string());
+        // Strip a trailing inline comment before unquoting: many real presets
+        // (e.g. crt-royale) write `scale_y5 = "0.0625" # note` or
+        // `filter_linear7 = "true" // note`. Only a comment marker OUTSIDE quotes
+        // counts, so a quoted value containing `#`/`//` (e.g. a path) is preserved.
+        map.insert(key, unquote(strip_inline_comment(value).trim()).to_string());
     }
     map
+}
+
+/// Truncate `value` at the first `#` or `//` comment marker that is NOT inside a
+/// double-quoted span. A value with no such marker is returned unchanged.
+fn strip_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b'#' if !in_quotes => return &value[..i],
+            b'/' if !in_quotes && bytes.get(i + 1) == Some(&b'/') => return &value[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    value
 }
 
 /// Strip one pair of surrounding double quotes from a value, if present.
@@ -612,6 +635,49 @@ CONTRAST = 0.75
         assert!(!p.parameter_overrides.contains_key("shaders"));
         assert!(!p.parameter_overrides.contains_key("BORDER"));
         assert!(!p.parameter_overrides.contains_key("frame_count_mod1"));
+    }
+
+    #[test]
+    fn strips_inline_comments_after_values() {
+        // Real presets (crt-royale) write inline `#`/`//` comments after a value,
+        // including after a quoted bool/number. Both must be stripped, and a `#`
+        // INSIDE quotes (e.g. a path) must be preserved.
+        assert_eq!(
+            strip_inline_comment("\"0.0625\" # Safe for >= 341 triads"),
+            "\"0.0625\" "
+        );
+        assert_eq!(
+            strip_inline_comment("\"true\" // could be nearest"),
+            "\"true\" "
+        );
+        assert_eq!(strip_inline_comment("2.4"), "2.4");
+        assert_eq!(
+            strip_inline_comment("\"shaders/a#b.slang\""),
+            "\"shaders/a#b.slang\""
+        );
+        assert_eq!(
+            strip_inline_comment("\"path//x.slang\""),
+            "\"path//x.slang\""
+        );
+
+        // End-to-end: a preset whose pass keys carry inline comments parses the
+        // clean values (the crt-royale failure mode).
+        let p = parse_slangp_str(
+            "shaders = 1 # one pass\n\
+             shader0 = a.slang\n\
+             filter_linear0 = \"true\" # could be nearest\n\
+             scale_x0 = \"2.0\"  // double width\n\
+             scale_type_x0 = source\n",
+            Path::new("/p"),
+        )
+        .expect("inline-comment preset parses");
+        assert_eq!(p.passes.len(), 1, "`shaders = 1 # ...` parses to 1");
+        assert_eq!(p.passes[0].filter_linear, Some(true), "trailing # stripped");
+        assert_eq!(
+            p.passes[0].scale_factor_x(),
+            Some(2.0),
+            "trailing // stripped"
+        );
     }
 
     #[test]

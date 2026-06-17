@@ -1,0 +1,24 @@
+# RetroArch reference capture metadata (#32, PART B). See crt-geom.toml for the
+# full capture procedure; only the preset-specific fields differ here.
+#
+# ACTUAL RetroArch screenshot, NOT a self-oracle golden.
+
+preset = "scanlines/scanline.slangp"
+corpus = "slang-shaders"
+corpus_commit = "74bf541845e65cca7f09b3c6b3baeeea8f52afb3"
+source = "references/src/testcard_320x240.png"
+viewport_width = 320
+viewport_height = 240
+frame_index = 60
+retroarch_version = "1.22.2 (Git 69a4f0ea1e)"
+retroarch_video_driver = "glcore"
+gpu = "llvmpipe (software, LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe)"
+core = "imageviewer (built from libretro/RetroArch cores/libretro-imageviewer)"
+
+# Calibrated thresholds. scanline is a single-pass `mix` of the source with a
+# sine-scanline modulation; flat regions match exactly, the remaining differences
+# are at the color-bar edges and the high-frequency checker (sub-pixel sampling /
+# rounding between the two software paths). Observed: max_abs=12, mean_abs=0.155,
+# 1.2% of pixels over tolerance 2, 0.01% over tolerance 8.
+diff_tolerance = 16
+diff_max_fraction = 0.02

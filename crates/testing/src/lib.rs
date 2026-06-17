@@ -16,12 +16,17 @@
 //! and (b) that the whole compile → chain → feedback/history → LUT → render →
 //! read-back path runs end-to-end and that the diff / re-baseline flow works.
 //!
-//! They do **not** prove fidelity *versus RetroArch*. The Phase-2 fidelity exit
-//! gate ("CRT-Royale, an NTSC preset, and a feedback shader render within
-//! threshold of RetroArch reference images") needs real RetroArch reference PNGs,
-//! which cannot be captured in this headless CI/dev environment. That capture is
-//! documented as a **manual gate** in `docs/golden-image-harness.md`; the diff
-//! functions here are exactly what wires those references in once captured.
+//! They do **not** prove fidelity *versus RetroArch* — that is the job of the
+//! **real-RetroArch reference suite** (`tests/references.rs`, #32 PART B), whose
+//! `references/retroarch/*.png` are ACTUAL RetroArch 1.22.2 captures (distinct from
+//! the self-oracle goldens). On a box with a working software GL, `crt-geom`, a
+//! `scanline` preset, and an NTSC preset render within calibrated thresholds of the
+//! RetroArch capture (near-exact for `crt-geom`); feedback + `crt-royale` are
+//! documented divergences. The capture procedure (imageviewer core, the forced
+//! `--appendconfig` geometry, frame alignment, calibration) and the corpus-fuzz
+//! results live in `docs/golden-image-harness.md`. The `references`/`corpus_fuzz`
+//! tests are `#[ignore]`d (they need the external `slang-shaders` clone), so CI
+//! stays green without the corpus.
 //!
 //! ## Modules
 //! * [`render`] — [`render::render_preset_to_image`]: parse a `.slangp`, compile

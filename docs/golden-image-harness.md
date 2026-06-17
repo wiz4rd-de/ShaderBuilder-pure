@@ -6,16 +6,23 @@ diffs images with a numeric metric + a visual diff artifact, and import-and-
 renders a whole *directory* of presets as a smoke/fidelity fuzzer.
 
 This document explains what the harness automates, the self-oracle goldens and
-how to re-baseline them, and — crucially — the **manual procedure for capturing
-real RetroArch reference images** that closes the Phase-2 fidelity exit gate on a
-machine with a working RetroArch + display.
+how to re-baseline them, the **corpus fuzzer over a real `slang-shaders` clone**,
+and the **real-RetroArch reference capture** that closes the Phase-2 fidelity exit
+gate.
 
-> **Honest scope.** Everything under "Automated" below runs in CI on a headless
-> lavapipe (software Vulkan) adapter. The "Manual gate" below is **NOT done** in
-> the headless CI/dev environment and is not claimed to pass here. The committed
-> goldens are produced by *our own engine* (a self-oracle), not captured from
-> RetroArch; they prove the machinery and determinism, **not fidelity vs
-> RetroArch**.
+> **Honest scope.** Everything under "Automated (runs in CI)" below runs in CI on
+> a headless lavapipe (software Vulkan) adapter. The committed `goldens/*.png` are
+> produced by *our own engine* (a self-oracle): they prove machinery + determinism,
+> **not fidelity vs RetroArch**. Section 2 (corpus fuzz) and section 3 (real
+> RetroArch references) are now **partly automated and demonstrated on a dev box
+> with a working software GL** — `crt-geom`, `scanline`, and an NTSC preset match
+> RetroArch within calibrated thresholds (metrics in §3). They are `#[ignore]`d
+> opt-in suites (they need the external corpus clone and were calibrated on this
+> box's llvmpipe), so CI stays green without the corpus. `crt-geom`, `scanline`,
+> an NTSC preset, and (after the #32 `PassFeedbackSize0` fix) `feedback` match
+> RetroArch within calibrated thresholds (metrics in §3). What remains un-closed is
+> documented in §4: `crt-royale` now compiles + renders (after the #32 inlining
+> fix) but diverges in fidelity, and part of the corpus (the failure-mode worklist).
 
 ---
 
@@ -82,7 +89,23 @@ On failure the test writes `target/golden-artifacts/<name>.rendered.png` and
 
 `fuzz_fixtures.rs` runs `fuzz_presets` over `fixtures/` and asserts every fixture
 imports-and-renders without error. This is the CI-fast stand-in for the real
-corpus run (section 3 below).
+corpus run (section 2 below).
+
+### push-constant → UBO normalization (#32)
+
+Real `slang-shaders` put their per-pass parameter block (`FrameCount` + every
+`#pragma parameter`) in a Vulkan **`push_constant`** block — **72 %** of the
+corpus's `.slang` files (1134 / 1571 at the pinned commit). wgpu ingests SPIR-V
+through naga, which reports a push-constant global as the `IMMEDIATES` capability,
+and the engine's device is not created with it — so before #32 every such shader
+failed `create_shader_module` with *"Capability Capabilities(IMMEDIATES) is not
+supported"*. `slang_compile::push_to_ubo` rewrites the push-constant block into an
+ordinary UBO at a binding free across both stages (a SPIR-V→SPIR-V transform in
+the same vein as `split_samplers`), so the existing reflection-driven bind table +
+`pack_builtins`/`pack_params` handle it with **no renderer change**. The renderer
+also now packs builtins+params into *both* reflected blocks, since the standard
+layout splits them across `UBO{MVP,…Size}` and `Push{FrameCount,params}`. Together
+these took the curated-category corpus run from **4 % → 63 %** rendered (§2).
 
 ### Re-baselining the goldens
 
@@ -109,105 +132,227 @@ multi-GPU boxes (a known flake; see CONTRIBUTING / the engine tests).
 
 ---
 
-## 2. Why the RetroArch comparison is a *manual* gate here
+## 2. The real corpus fuzz (`corpus_fuzz.rs`, opt-in)
 
-This repository's CI and the current dev box are **headless** (a blanking
-display, software-Vulkan only). RetroArch is installed but:
+`crates/testing/tests/corpus_fuzz.rs` runs `fuzz_presets` over a cloned
+`slang-shaders` checkout and prints a categorized summary: per-top-level-category
+compile/render/ok counts, then the distinct failure messages grouped by
+normalized kind (paths/ids/numbers stripped so semantically equal failures
+group). That failure list is the corpus-fidelity worklist. The test is
+`#[ignore]`d and keyed off `FUZZ_CORPUS_DIR`, so CI — which has no corpus — skips
+it cleanly; it only fails if it found **zero** presets (a mis-pointed dir).
 
-- it has no simple "render this `.slangp` over this PNG to that PNG" batch CLI,
-  and
-- driving its GUI to a deterministic single-frame capture needs a real display /
-  compositor.
+```bash
+# A curated, bounded subset (recommended — the full 2526 is slow on software GPU):
+FUZZ_CORPUS_DIR=/path/to/slang-shaders \
+  FUZZ_CORPUS_CATEGORIES=crt,ntsc,blurs,denoisers,interpolation,scanlines,sharpen \
+  WGPU_BACKEND=vulkan cargo test -p testing --test corpus_fuzz \
+  -- --ignored --nocapture --test-threads=1
 
-So real RetroArch reference PNGs cannot be captured in this environment. The
-machinery to *use* them, however, is complete: `diff_images` / `diff_image` are
-exactly what compares a harness render to a captured reference. The remaining
-work is to capture the references on a suitable machine and drop them in.
-
----
-
-## 3. Manual gate — capturing real RetroArch references (Phase-2 fidelity exit)
-
-Do this on a machine with a working RetroArch **and a display/GPU**. The goal is
-the exit-criteria trio: **CRT-Royale, an NTSC preset, and a feedback shader**
-render within threshold of RetroArch reference images.
-
-### 3.1 Fix the inputs (determinism)
-
-1. **Source frame(s).** Pick fixed source PNG(s) at a fixed resolution (e.g. a
-   320×240 test card, or a captured core framebuffer). Commit them under
-   `crates/testing/references/sources/` so both RetroArch and the harness render
-   the *same* input. For an animated/feedback preset, also fix the **frame
-   index** (how many frames to advance before the capture).
-2. **Viewport.** Pick a fixed output resolution (e.g. 1280×960, integer scale
-   off) and use it for *both* RetroArch and the harness.
-3. **Preset.** Pick the exact `.slangp` (e.g. CRT-Royale, an NTSC preset, a
-   feedback preset) from a known `slang-shaders` commit; record the commit hash.
-
-### 3.2 Capture in RetroArch
-
-1. Launch RetroArch with the chosen core + the fixed source, load the `.slangp`
-   via Quick Menu → Shaders, and set the window/viewport to the fixed resolution
-   (Settings → Video; disable integer scale / overlays / bezels to match the
-   harness).
-2. Advance to the fixed frame index (pause + frame-advance), then take a
-   screenshot of the **shader output** (RetroArch screenshot hotkey captures the
-   final framebuffer). For a feedback preset, frame-advance the recorded number of
-   frames first so the feedback state matches what the harness produces at the
-   same `frame_index`.
-3. Save the screenshot as a PNG.
-
-### 3.3 Wire the references in
-
-1. Commit each reference PNG under `crates/testing/references/<preset>.png` with a
-   small sidecar (`<preset>.toml` or a comment) recording: preset path + corpus
-   commit, source PNG, viewport, frame index, RetroArch version, and the GPU/OS
-   the capture ran on.
-2. Add a test (mirroring `golden.rs`) that, for each reference:
-   - loads the committed source PNG,
-   - `render_preset_to_image(<preset>.slangp, source, viewport, frame_index)`,
-   - `diff_images(rendered, reference, tolerance, max_fraction)` and asserts
-     `passed`,
-   - writes `diff_image(...)` on failure.
-3. **Pick the threshold from the data.** CRT/NTSC shaders are full of high-
-   frequency detail (scanlines, masks, ringing) where exact pixels never match
-   across renderers, so use a *perceptual* threshold: a per-channel `tolerance`
-   that absorbs sub-pixel filtering differences and a `max_fraction` chosen so a
-   faithful render passes but a structural regression (wrong mask, missing
-   curvature, broken feedback) fails. Record the chosen values and *why* in the
-   test and here. Start permissive, then tighten against several known-good
-   captures.
-
-### 3.4 The real corpus fuzz
-
-Clone `slang-shaders` somewhere (do **not** vendor it into this repo) and point
-the fuzzer at it:
-
-```rust
-let results = testing::fuzz_presets(
-    Path::new("/path/to/slang-shaders"),
-    &source_frame,
-    (1280, 960),
-    0,
-);
-// Report every PresetResult where !r.ok().
+# Or cap the count, sampled deterministically across the tree:
+FUZZ_CORPUS_DIR=/path/to/slang-shaders FUZZ_CORPUS_MAX=300 ...
 ```
 
-This import-and-renders a broad slice and reports per-preset failures without
-aborting. Run it as an opt-in (`#[ignore]`d, or behind an env var pointing at the
-clone) so CI — which has no corpus — stays green, and treat the failure list as
-the corpus-fidelity worklist.
+### Results on this box (curated categories, 246 presets)
+
+After the #32 `spirv-opt` function-inlining fix (§3.7), **211 / 246 (85.8 %)**
+import-and-render without error — up from **171 / 246 (69.5 %)** before inlining
+(itself up from **10 / 246 (4 %)** before #32's push-constant→UBO work). The +40
+presets are the formerly-rejected sampler-in-function shaders. Per category
+(rendered ok, before-inlining → after-inlining):
+
+| Category | total | before | after |
+| --- | --- | --- | --- |
+| crt | 131 | 75 | 103 |
+| ntsc | 32 | 28 | 29 |
+| interpolation | 44 | 41 | 42 |
+| scanlines | 9 | 9 | 9 |
+| blurs | 17 | 8 | 17 |
+| denoisers | 7 | 6 | 6 |
+| sharpen | 6 | 4 | 5 |
+
+The 38-strong "sampler passed to a function" failure category is now **entirely
+gone** from the grouped failure report; the 35 remaining failures are all other
+kinds (nested `#reference` presets with no `shaders` key, naga function/entry-point
+shapes, missing `#include` files, non-UTF-8 sources, one `float_framebuffer`
+parser edge case) — the worklist for future tickets.
+
+The remaining failures fall in a small number of distinct ways — the **engine-gap
+worklist for future tickets** (none crash the run; each is caught per preset):
+
+| Failures | Kind | Cause |
+| --- | --- | --- |
+| 38 → **0** | sampler passed to a function | **CLOSED (#32):** `spirv-opt --merge-return --inline-entry-points-exhaustive` inlines the helper into the entry point before `split_samplers`, so only the inline `OpLoad` form (which it handles) remains. |
+| 10 | `missing required preset key shaders` | `#reference`-style nested presets the parser doesn't follow. |
+| 6 | pipeline interface mismatch | a stage's varyings/bindings don't match across VS/FS as our pipeline expects. |
+| ~8 | naga `Function … is invalid` | naga rejects a SPIR-V function shape (`testPattern(vf2;`, `ratios(`, `slot(vf2;`, some `main`) — a front-end limitation. |
+| ~7 | parser: inline `#`/`//` comment after a value, quoted numbers, `true"` | the `.slangp` parser doesn't strip trailing comments / tolerate stray quotes (blocks `crt-royale` and its variants). |
+| 3 each | missing `#include` file; non-UTF-8 source | corpus files our `#include`/read path can't load. |
+
+The earlier **20 `Conflicting binding at index 1`** failures (push block bound at
+two different bindings across the vertex/fragment stages) are **resolved** by
+`push_to_ubo::free_binding_across` choosing one cross-stage binding — they moved
+into the rendered set, which is most of the 63 % → 69.5 % gain.
 
 ---
 
-## 4. Status
+## 3. Real RetroArch references (Phase-2 fidelity exit) — automated here
 
-- **Automated and passing in CI:** headless deterministic render-to-PNG; the
-  image diff + visual artifact; the corpus fuzzer over local fixtures; the
-  self-oracle goldens for a multi-pass, a feedback, and a LUT preset; the
-  re-baseline flow.
-- **Manual gate, NOT done in this headless environment:** capturing real
-  RetroArch reference images and confirming the CRT-Royale / NTSC / feedback trio
-  pass within threshold, plus the fuzz over a real `slang-shaders` clone. These
-  close the Phase-2 fidelity exit gate and must be run on a machine with a working
-  RetroArch + display, per section 3.
+This is now **demonstrated on a dev box with a working software GL** (no GUI, no
+hardware GPU needed). The pieces:
+
+### 3.1 The imageviewer core (deterministic FIXED source)
+
+RetroArch needs *content* to run a shader over. To feed a deterministic still
+image, build the bundled `imageviewer` core from the RetroArch source (it loads a
+PNG as content):
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/libretro/RetroArch
+cd RetroArch && git sparse-checkout set cores/libretro-imageviewer libretro-common deps/stb
+make -C cores/libretro-imageviewer          # -> image_core.so
+cp cores/libretro-imageviewer/image_core.so ~/.config/retroarch/cores/imageviewer_libretro.so
+```
+
+### 3.2 The fixed source image
+
+`cargo run -p testing --example gen_reference_source` writes the committed,
+deterministic 320×240 test card to `crates/testing/references/src/testcard_320x240.png`
+(eight color bars + a luma gradient with a fine checker — real signal for
+CRT/NTSC/blur shaders). **Both** RetroArch and our engine consume this exact PNG.
+
+### 3.3 Capture in RetroArch (headless, slang backend)
+
+The slang shader backend needs the **`glcore`** (or `vulkan`) video driver — the
+plain `gl` driver only does GLSL and silently falls back to stock shaders. An
+`--appendconfig` forces a clean, predictable, full-frame 1:1 geometry so the
+output WxH is known and matches what our engine renders:
+
+```ini
+video_driver = "glcore"          # slang backend (gl = GLSL only!)
+video_shader_enable = "true"
+menu_driver = "null"
+video_scale_integer = "false"
+aspect_ratio_index = "23"        # custom — full-frame, no bars
+custom_viewport_width  = "320"   # the known output WxH
+custom_viewport_height = "240"
+video_smooth = "false"
+video_threaded = "false"
+video_vsync = "false"
+```
+
+```bash
+env DISPLAY=:1 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe retroarch \
+  -L ~/.config/retroarch/cores/imageviewer_libretro.so \
+  crates/testing/references/src/testcard_320x240.png \
+  --appendconfig=fidelity.cfg \
+  --set-shader=/path/to/slang-shaders/crt/crt-geom.slangp \
+  --max-frames=60 --max-frames-ss --max-frames-ss-path=crt-geom.png
+```
+
+**Gotchas found and worked around:**
+
+- The headless `glcore` path occasionally emits a **black first frame**; capture
+  twice and verify non-black (the two non-black captures are byte-identical — the
+  reference IS deterministic once non-black).
+- A still source needs a handful of frames to load + present through the slang
+  pipeline; `--max-frames=2` can be black. Use `--max-frames=60`.
+- **Frame alignment:** imageviewer re-presents the same still each frame, so the
+  *content* is fixed and only `FrameCount` advances — exactly our pump's
+  still-image behavior. We render through our engine at `frame_index = 60` to
+  match `--max-frames=60`.
+
+### 3.4 Wire-in + calibration (`references.rs`)
+
+Each reference PNG lives under `crates/testing/references/retroarch/<name>.png`
+with a `<name>.toml` sidecar (preset, source, viewport, frame, RA version, driver,
+GPU, calibrated `diff_tolerance`/`diff_max_fraction`). `references.rs` renders the
+preset through our engine and `diff_images` against the capture. It is `#[ignore]`d
+(needs the `slang-shaders` clone via `SLANG_SHADERS_DIR`, and was calibrated on
+this box's llvmpipe — CI's lavapipe may round differently at the tight `crt-geom`
+tolerance):
+
+```bash
+SLANG_SHADERS_DIR=/path/to/slang-shaders \
+  WGPU_BACKEND=vulkan cargo test -p testing --test references \
+  -- --ignored --test-threads=1
+```
+
+### 3.5 What matches vs what diverges
+
+| Preset | Result | tol / max_frac | Observed (our engine vs RetroArch) |
+| --- | --- | --- | --- |
+| `crt/crt-geom.slangp` | **MATCH** (near-exact) | 4 / 0.001 | max_abs **2**, mean 0.001, 0 % over tol |
+| `scanlines/scanline.slangp` | **MATCH** | 16 / 0.02 | max_abs 12, mean 0.155, 0.01 % over tol 8 |
+| `ntsc/ntsc-256px-svideo-scanline.slangp` | **MATCH** | 24 / 0.05 | max_abs 53, mean 0.166, 0.73 % over tol 16 |
+| `test/feedback.slangp` | **MATCH** (converged) | 4 / 0.001 | max_abs **4**, mean 0.67, 0 % over tol 4 at frame 60 |
+| `crt/crt-royale.slangp` | **RENDERS, DIVERGES** (no test) | — | compiles all 12 passes + renders after the spirv-opt inlining fix, but max_abs **205**, mean 81.6, 85 % over tol 4 vs RA — our output is systematically brighter. Suspected: the sRGB-framebuffer (10/12 passes) gamma encode/decode and/or the mask-resize scale chain don't match RA's exact tonal response. A multi-feature fidelity gap — future ticket. |
+
+The near-exact `crt-geom` match is because BOTH renderers ran on llvmpipe
+(software): same rasterizer, same rounding. That such a non-trivial CRT shader
+(curvature, vignette, dot-mask, interlace, gamma) lands within `max_abs = 2` is
+strong evidence the engine's uniform packing, scaling, sampler attribution, and
+fragment math are faithful to RetroArch.
+
+### 3.6 feedback — the `PassFeedbackSize0` builtin fix (#32)
+
+`test/feedback.slang` is `FragColor = mix(current, prev, 0.8)` =
+`0.2*Source + 0.8*PassFeedback0`, whose fixed point is the source: after ~60
+frames the previous-frame term has decayed and the output equals the source up
+to 8-bit accumulation rounding. RetroArch converges to `source − ~2` and so does
+our engine — they agree within `max_abs 4`.
+
+Closing this required a **real engine fix**, not just frame alignment. The
+shader snaps its sample coordinate with `floor(PassFeedbackSize0.xy * vTexCoord)`,
+but our `BuiltinValues::member_bytes` never populated `PassFeedbackSize0`: the
+size-member parser accepted only the alias spelling `PassFeedback0Size`, while
+RetroArch's `slang_process.cpp` builds the name as `"PassFeedbackSize"` **then**
+appends the index → `PassFeedbackSize0` (Size BEFORE the number). With the member
+left zero the shader did `floor(0 · uv) = 0` and sampled texel (0,0) everywhere —
+the source's white corner — so every pixel converged to ~253 ("accumulated to
+white"), which is exactly the divergence the earlier report saw. The same
+off-by-spelling affected `PassOutputSizeN` and `OriginalHistorySizeN` (the corpus
+uses the `…SizeN` spelling exclusively). `parse_indexed_size` in
+`crates/preview-engine/src/uniforms.rs` now accepts BOTH spellings RetroArch
+emits/accepts.
+
+### 3.7 crt-royale — the sampler-in-function inlining fix (#32)
+
+crt-royale (and ~38 other corpus presets) factor sampling through GLSL helper
+functions that take a `sampler2D` parameter. glslang lowers those to an
+`OpFunctionCall` carrying the combined-sampler variable, which `split_samplers`
+(handling only an inline `OpLoad` of a `sampler2D` global) correctly refused to
+rewrite. `slang_compile::spirv_opt::inline_functions` now runs `spirv-opt
+--merge-return --inline-entry-points-exhaustive --eliminate-dead-functions` as the
+FIRST normalization step, folding every helper into the entry point so only the
+inline form remains. (`--merge-return` is required: the inliner skips functions
+with an early/multiple return, which crt-royale's mask-apply pass has.) It
+degrades to a no-op skip when `spirv-opt` is absent. With it, all 12 crt-royale
+passes compile and the preset renders — but it **diverges** from RetroArch (§3.5),
+so no passing reference is committed; the divergence is the documented finding.
+
+---
+
+## 4. Status — how much of the Phase-2 fidelity gate is closed
+
+- **Automated and passing in CI:** headless deterministic render-to-PNG; the image
+  diff + visual artifact; the corpus fuzzer over local fixtures; the self-oracle
+  goldens (multi-pass, feedback, LUT); the re-baseline flow.
+- **Automated + demonstrated here (opt-in `#[ignore]`, needs the corpus clone):**
+  - the **real corpus fuzz** over `slang-shaders` — a curated 246-preset slice,
+    further improved by #32's `spirv-opt` inlining unblocking the 38
+    sampler-in-function presets (§2);
+  - **real RetroArch references**: `crt-geom`, `scanline`, an NTSC preset, **and
+    `feedback`** match RetroArch within calibrated thresholds (§3.5/§3.6).
+- **Closed by #32:**
+  - **feedback fidelity** — was a real engine bug (the `PassFeedbackSize0` builtin
+    was never populated; §3.6). Now matches RetroArch (`max_abs 4`).
+  - **`crt-royale` parse + compile** — the inline-comment `.slangp` parser gap and
+    the sampler-in-function compile gap are both fixed; crt-royale now renders all
+    12 passes (§3.7).
+- **Still open (documented findings, NOT forced to pass):**
+  - **`crt-royale` fidelity** — renders but diverges from RetroArch (`max_abs 205`,
+    systematically brighter; suspected sRGB-framebuffer gamma / mask-resize scale
+    chain — §3.5). A multi-feature gap for a future ticket.
+  - **the remaining corpus worklist** — nested `#reference` presets, naga function
+    shapes, and the other §2 failure kinds.
