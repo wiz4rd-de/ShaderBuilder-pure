@@ -7,6 +7,27 @@
 //! [`ImportDiagnostics`] describing anything noteworthy (preserved unknown keys,
 //! shader files that could not be read).
 //!
+//! ## Whole-pass code nodes — bodies are NOT decomposed (#34, Architecture §C)
+//!
+//! Each parsed pass becomes **exactly one** [`core_model::PassSource::WholePassCode`]
+//! node holding the `.slang` source **byte-for-byte** (the file is read with no
+//! normalization — line endings, trailing whitespace, and any BOM are preserved
+//! so import → re-export is lossless). The pass body is *intentionally* never
+//! reverse-engineered into a visual node graph: whole-pass nodes bypass the
+//! node-IR. The only thing we recover from the body is a **light textual scan**
+//! ([`crate::scan::scan_references`]) of the RetroArch textures/aliases it
+//! references, for pipeline wiring + a LUT cross-check — not a parse.
+//!
+//! ## Pipeline wiring metadata (#34)
+//!
+//! Beyond the per-pass settings, the bridge reconstructs the chain *wiring* as
+//! [`core_model::PipelineMetadata`]: passes are sequenced by index, each
+//! `aliasN` becomes an `alias → pass index` binding (so a later pass's `<alias>`
+//! reference resolves), and each pass records the set of RetroArch textures it
+//! may legally bind (the always-available `Original`/`Source`, earlier
+//! `PassOutputK`, earlier aliases, and all LUTs). This is *metadata about* the
+//! chain, never a graph-internal IR.
+//!
 //! ## Scale precedence (`docs/retroarch-slang-runtime.md` §2)
 //!
 //! The preset may set scale combined (`scale_typeN`/`scaleN`, both axes) or
@@ -19,8 +40,10 @@
 //! scale key at all maps to a default [`core_model::ScaleAxis`] (both fields
 //! `None`) so the engine applies the position-dependent §2 default.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::scan::scan_references;
 use crate::slangp::{Pass, Preset, ScaleType, WrapMode};
 
 /// The severity of an [`ImportDiagnostic`].
@@ -118,8 +141,22 @@ pub fn import_parsed_preset(
         )));
     }
 
+    // The preset's alias + LUT name tables — used both to classify references in
+    // each pass body (a matched alias/LUT name is `TextureRefKind::Alias`) and to
+    // cross-check that every referenced alias/LUT actually resolves.
+    let alias_names: BTreeSet<String> = preset
+        .passes
+        .iter()
+        .filter_map(|p| p.alias.clone())
+        .collect();
+    let lut_names: BTreeSet<String> = preset.luts.iter().map(|l| l.name.clone()).collect();
+
     let mut passes = Vec::with_capacity(preset.passes.len());
     for (n, pass) in preset.passes.iter().enumerate() {
+        // Read the `.slang` BYTE-FOR-BYTE with no normalization (line endings,
+        // trailing whitespace, BOM all preserved) so import → re-export is
+        // lossless. `read_to_string` errors only on invalid UTF-8, never mutates
+        // bytes; slang sources are UTF-8 text.
         let source = match std::fs::read_to_string(&pass.shader) {
             Ok(text) => text,
             Err(e) => {
@@ -131,16 +168,36 @@ pub fn import_parsed_preset(
             }
         };
 
+        let filename = pass
+            .shader
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned);
+
+        // Light textual scan of the (opaque) body for referenced textures — for
+        // wiring + the LUT cross-check below. NOT a parse of the pass body.
+        let references = scan_references(&source, &alias_names, &lut_names);
+
         let name = pass.alias.clone().unwrap_or_else(|| format!("Pass {n}"));
 
         passes.push(core_model::Pass {
             id: format!("pass-{n}"),
             name,
-            source: core_model::PassSource::WholePassCode { source },
+            // Exactly one whole-pass code node per pass, source verbatim, marked
+            // opaque/non-decomposable (the body is never lowered to node-IR).
+            source: core_model::PassSource::WholePassCode {
+                source,
+                filename,
+                opaque: true,
+            },
             parameters: Vec::new(),
             settings: map_settings(pass),
+            references,
         });
     }
+
+    let pipeline = build_pipeline_metadata(preset, &passes);
+    cross_check_references(&passes, &pipeline, &lut_names, &mut diagnostics);
 
     let feedback_pass = map_feedback_pass(preset.feedback_pass);
 
@@ -149,8 +206,130 @@ pub fn import_parsed_preset(
         name: project_name.to_owned(),
         passes,
         feedback_pass,
+        pipeline,
     };
     (project, ImportDiagnostics { diagnostics })
+}
+
+/// Reconstruct the chain's wiring as [`core_model::PipelineMetadata`] (#34):
+/// passes are sequenced by index; each `aliasN` becomes an `alias → pass index`
+/// binding; and each pass records the RetroArch texture names it may bind. This
+/// is *metadata about* the pipeline — ordering, alias resolution, causal
+/// availability — and never a graph-internal IR (Architecture §C).
+fn build_pipeline_metadata(
+    preset: &Preset,
+    passes: &[core_model::Pass],
+) -> core_model::PipelineMetadata {
+    // alias -> pass index, in pass order (a later duplicate alias keeps the
+    // first; RetroArch reflection binds the first matching name).
+    let mut aliases = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (n, pass) in preset.passes.iter().enumerate() {
+        if let Some(alias) = &pass.alias {
+            if seen.insert(alias.clone()) {
+                aliases.push(core_model::AliasBinding {
+                    alias: alias.clone(),
+                    pass_index: n as u32,
+                });
+            }
+        }
+    }
+
+    // All LUT names are available to every pass (loaded once, static; §7).
+    let lut_names: Vec<String> = preset.luts.iter().map(|l| l.name.clone()).collect();
+
+    // Per-pass availability: the always-present built-ins, then every EARLIER
+    // pass's `PassOutputK` and its alias (causality: `PassOutputK`/`<alias>` is
+    // an error for `K >= i`, §7), then all LUTs. Feedback twins are implied.
+    let mut availability = Vec::with_capacity(passes.len());
+    for i in 0..passes.len() {
+        let mut available = vec!["Original".to_owned(), "Source".to_owned()];
+        for k in 0..i {
+            available.push(format!("PassOutput{k}"));
+            if let Some(alias) = &preset.passes[k].alias {
+                available.push(alias.clone());
+            }
+        }
+        available.extend(lut_names.iter().cloned());
+        availability.push(core_model::PassAvailability {
+            pass_index: i as u32,
+            available,
+        });
+    }
+
+    core_model::PipelineMetadata {
+        aliases,
+        availability,
+    }
+}
+
+/// Cross-check each pass's scanned references against the reconstructed wiring
+/// (#34): warn when a pass references a `PassOutputK`/`<alias>` that is not
+/// available to it (a forward/missing reference) or a LUT-shaped name that has no
+/// `textures=` entry. This catches broken presets without parsing the body —
+/// the references and availability were both recovered shallowly above.
+fn cross_check_references(
+    passes: &[core_model::Pass],
+    pipeline: &core_model::PipelineMetadata,
+    lut_names: &BTreeSet<String>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) {
+    use core_model::TextureRefKind;
+
+    let alias_to_index: std::collections::BTreeMap<&str, u32> = pipeline
+        .aliases
+        .iter()
+        .map(|b| (b.alias.as_str(), b.pass_index))
+        .collect();
+
+    for (i, pass) in passes.iter().enumerate() {
+        for r in &pass.references {
+            match r.kind {
+                // A `PassOutputK`/`PassK` read must name an earlier pass.
+                TextureRefKind::PassOutput => {
+                    // Canonicalize `PassK` → `PassOutputK` for the availability set.
+                    let idx = r
+                        .name
+                        .strip_prefix("PassOutput")
+                        .or_else(|| r.name.strip_prefix("Pass"))
+                        .and_then(|d| d.parse::<usize>().ok());
+                    if let Some(k) = idx {
+                        if k >= i {
+                            diagnostics.push(ImportDiagnostic::warning(format!(
+                                "pass {i}: references `{}` but pass {k} is not earlier in the \
+                                 chain (PassOutput is causal — only passes < {i} are available)",
+                                r.name
+                            )));
+                        }
+                    }
+                }
+                // An alias read must resolve to an EARLIER pass (or a LUT, which
+                // is classified as Alias and is always available).
+                TextureRefKind::Alias => {
+                    if lut_names.contains(&r.name) {
+                        continue; // a LUT — always available.
+                    }
+                    match alias_to_index.get(r.name.as_str()) {
+                        Some(&k) if (k as usize) < i => {}
+                        Some(&k) => diagnostics.push(ImportDiagnostic::warning(format!(
+                            "pass {i}: references alias `{}` (pass {k}) which is not earlier in \
+                             the chain",
+                            r.name
+                        ))),
+                        None => diagnostics.push(ImportDiagnostic::warning(format!(
+                            "pass {i}: references `{}` which is neither a known pass alias nor a \
+                             `textures=` LUT",
+                            r.name
+                        ))),
+                    }
+                }
+                // Original/Source/History/Feedback/User are always resolvable
+                // (built-ins, the history/feedback ring, or the un-aliased LUT
+                // fallback); no cross-check needed here.
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Map a parsed [`Pass`]'s RetroArch keys into a [`core_model::PassSettings`],
@@ -342,7 +521,7 @@ mystery_setting = banana
         assert!(diags.has_warnings());
         for pass in &project.passes {
             match &pass.source {
-                PassSource::WholePassCode { source } => assert!(source.is_empty()),
+                PassSource::WholePassCode { source, .. } => assert!(source.is_empty()),
                 other => panic!("expected whole-pass code, got {other:?}"),
             }
         }
@@ -375,8 +554,208 @@ mystery_setting = banana
         assert_eq!(project.name, "p", "name from the preset file stem");
         assert!(!diags.has_warnings(), "shader read OK -> no warnings");
         match &project.passes[0].source {
-            PassSource::WholePassCode { source } => assert!(source.contains("#version 450")),
+            PassSource::WholePassCode {
+                source,
+                filename,
+                opaque,
+            } => {
+                assert!(source.contains("#version 450"));
+                assert_eq!(filename.as_deref(), Some("a.slang"));
+                assert!(opaque, "imported whole-pass code is opaque");
+            }
             other => panic!("expected whole-pass code, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn imported_source_is_byte_for_byte_on_disk_bytes() {
+        // ACCEPTANCE (#34): the imported whole-pass source must equal the on-disk
+        // file BYTES exactly — no normalization of line endings, trailing
+        // whitespace, or a leading BOM.
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately gnarly: CRLF, a BOM, trailing spaces, no final newline.
+        let raw: &[u8] = b"\xEF\xBB\xBF#version 450\r\n#pragma stage fragment   \r\nvoid main(){}";
+        std::fs::write(dir.path().join("p0.slang"), raw).unwrap();
+        std::fs::write(dir.path().join("p1.slang"), raw).unwrap();
+        std::fs::write(
+            dir.path().join("two.slangp"),
+            "shaders = 2\nshader0 = p0.slang\nshader1 = p1.slang\n",
+        )
+        .unwrap();
+
+        let (project, _) = import_preset(dir.path().join("two.slangp")).expect("imports");
+        assert_eq!(project.passes.len(), 2, "exactly N whole-pass nodes");
+
+        for (n, pass) in project.passes.iter().enumerate() {
+            let on_disk = std::fs::read(dir.path().join(format!("p{n}.slang"))).unwrap();
+            match &pass.source {
+                PassSource::WholePassCode {
+                    source,
+                    filename,
+                    opaque,
+                } => {
+                    assert_eq!(
+                        source.as_bytes(),
+                        on_disk.as_slice(),
+                        "pass {n} source must be the on-disk bytes verbatim"
+                    );
+                    assert_eq!(filename.as_deref(), Some(format!("p{n}.slang").as_str()));
+                    assert!(opaque);
+                }
+                other => panic!("expected whole-pass code, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn alias_is_referenceable_via_pipeline_metadata() {
+        // ACCEPTANCE (#34): aliases + feedback_pass are representable such that a
+        // pass can be referenced by its alias.
+        let preset = parse_slangp_str(
+            "shaders = 3\n\
+             feedback_pass = 1\n\
+             shader0 = a.slang\n\
+             alias0 = First\n\
+             shader1 = b.slang\n\
+             alias1 = Second\n\
+             shader2 = c.slang\n",
+            Path::new("/p"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+
+        // alias -> pass index resolves both aliases.
+        let resolve = |name: &str| {
+            project
+                .pipeline
+                .aliases
+                .iter()
+                .find(|b| b.alias == name)
+                .map(|b| b.pass_index)
+        };
+        assert_eq!(resolve("First"), Some(0));
+        assert_eq!(resolve("Second"), Some(1));
+        assert_eq!(resolve("Missing"), None);
+        // feedback_pass carried through.
+        assert_eq!(project.feedback_pass, Some(1));
+    }
+
+    #[test]
+    fn per_pass_availability_is_causal() {
+        // Each pass may bind only EARLIER passes' PassOutputK/aliases, plus the
+        // always-available Original/Source and all LUTs.
+        let preset = parse_slangp_str(
+            "shaders = 3\n\
+             shader0 = a.slang\n\
+             alias0 = First\n\
+             shader1 = b.slang\n\
+             shader2 = c.slang\n\
+             textures = LUT\n\
+             LUT = lut.png\n",
+            Path::new("/p"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+
+        let avail = |i: usize| -> Vec<String> {
+            project
+                .pipeline
+                .availability
+                .iter()
+                .find(|a| a.pass_index == i as u32)
+                .map(|a| a.available.clone())
+                .unwrap_or_default()
+        };
+
+        // Pass 0: only built-ins + LUT, no PassOutput*, no aliases.
+        let a0 = avail(0);
+        assert!(a0.contains(&"Original".to_owned()) && a0.contains(&"Source".to_owned()));
+        assert!(a0.contains(&"LUT".to_owned()));
+        assert!(!a0.iter().any(|s| s.starts_with("PassOutput")));
+        assert!(!a0.contains(&"First".to_owned()));
+
+        // Pass 2: PassOutput0, PassOutput1 and alias `First` are now available.
+        let a2 = avail(2);
+        assert!(a2.contains(&"PassOutput0".to_owned()));
+        assert!(a2.contains(&"PassOutput1".to_owned()));
+        assert!(a2.contains(&"First".to_owned()));
+        assert!(a2.contains(&"LUT".to_owned()));
+    }
+
+    #[test]
+    fn references_are_scanned_and_cross_checked() {
+        // A pass body that reads Source, an earlier alias, a LUT, and a forward
+        // PassOutput (which must warn).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.slang"), "uniform sampler2D Source;\n").unwrap();
+        std::fs::write(
+            dir.path().join("b.slang"),
+            "uniform sampler2D First;\n\
+             uniform sampler2D BORDER;\n\
+             uniform sampler2D PassOutput2;\n", // forward ref -> warn
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("c.slang"), "void main(){}\n").unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 3\n\
+             shader0 = a.slang\n\
+             alias0 = First\n\
+             shader1 = b.slang\n\
+             shader2 = c.slang\n\
+             textures = BORDER\n\
+             BORDER = border.png\n",
+        )
+        .unwrap();
+
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+
+        // Pass 1's scanned references include the alias, LUT, and forward pass.
+        let p1_refs: Vec<&str> = project.passes[1]
+            .references
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(p1_refs.contains(&"First"), "alias ref scanned: {p1_refs:?}");
+        assert!(p1_refs.contains(&"BORDER"), "LUT ref scanned: {p1_refs:?}");
+        assert!(p1_refs.contains(&"PassOutput2"));
+
+        // The forward PassOutput2 reference from pass 1 must warn.
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("PassOutput2")
+                    && d.message.contains("pass 1")),
+            "forward PassOutput must warn: {:?}",
+            diags.diagnostics
+        );
+    }
+
+    #[test]
+    fn unresolved_alias_reference_warns() {
+        // A pass references an alias that no pass declares and no LUT provides.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.slang"), "uniform sampler2D Source;\n").unwrap();
+        std::fs::write(dir.path().join("b.slang"), "uniform sampler2D GhostPass;\n").unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 2\n\
+             shader0 = a.slang\n\
+             alias0 = GhostPass\n\
+             shader1 = b.slang\n",
+        )
+        .unwrap();
+        // alias0 = GhostPass DOES exist, so this resolves to pass 0 (earlier) — OK.
+        let (_, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+        assert!(
+            !diags
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("GhostPass") && d.severity == Severity::Warning),
+            "GhostPass resolves to pass 0: {:?}",
+            diags.diagnostics
+        );
     }
 }

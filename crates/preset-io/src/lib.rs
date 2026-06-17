@@ -19,6 +19,7 @@
 //! defaults (we follow RetroArch C where it and librashader diverge).
 
 mod import;
+mod scan;
 mod slangp;
 
 use std::path::{Path, PathBuf};
