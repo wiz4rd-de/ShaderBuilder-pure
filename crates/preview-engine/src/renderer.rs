@@ -26,8 +26,10 @@
 //! source `texture2D`, a `sampler`, and the parameter UBO. Per-pass `*Size`
 //! semantics differ, so each pass owns its own builtin UBO.
 //!
-//! Note on samplers: wgpu's binding model uses **separate** texture + sampler,
-//! not GLSL's combined `sampler2D` (the conversion happens in `slang-compile`).
+//! Note on samplers: wgpu's binding model uses **separate** texture + sampler.
+//! A combined GLSL `sampler2D` is **not** yet split into a separate texture +
+//! sampler (tracked as a separate task); the current fixtures all use the
+//! separate Vulkan `texture2D` + `sampler` form, which is what this renderer binds.
 
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
 use crate::uniforms::{self, BuiltinValues, ParamStore, ParamView};
@@ -612,8 +614,20 @@ impl Renderer {
         // Reflect the SPIR-V once to discover both blocks' member offsets (#28/
         // #29) so builtins/params can be declared in any order/subset. A
         // reflection failure is non-fatal: fall back to no blocks (zero-filled
-        // UBOs) rather than refusing to build the pass.
-        let reflection = slang_compile::reflect(shader).ok();
+        // UBOs) rather than refusing to build the pass — but log it loudly so the
+        // degradation (a zero MVP renders nothing) is not silent (#28).
+        let reflection = match slang_compile::reflect(shader) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                let name = shader.reflection.name.as_deref().unwrap_or("<unnamed>");
+                eprintln!(
+                    "preview-engine: SPIR-V reflection failed for shader {name:?}: {e} \
+                     — packing builtins/params with no reflected layout (the pass \
+                     may render incorrectly)"
+                );
+                None
+            }
+        };
         let builtin_block = reflection
             .as_ref()
             .and_then(|r| uniforms::builtin_block(r).cloned());

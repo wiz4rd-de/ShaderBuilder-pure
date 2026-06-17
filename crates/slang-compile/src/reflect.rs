@@ -128,8 +128,10 @@ pub struct SpirvReflection {
     /// Uniform + push-constant blocks declared by either stage, merged by
     /// `(set, binding)` (a block shared by both stages appears once).
     pub blocks: Vec<UniformBlock>,
-    /// Sampled-texture globals (combined images are split into texture+sampler
-    /// by `slang-compile` upstream, so these are pure `texture2D`s).
+    /// Sampled-texture globals. A combined GLSL `sampler2D` is **not** yet split
+    /// into a separate texture + sampler (tracked as a separate task); current
+    /// fixtures use the separate Vulkan `texture2D` + `sampler` form, so these are
+    /// pure `texture2D`s.
     pub textures: Vec<ResourceBinding>,
     /// Sampler globals.
     pub samplers: Vec<ResourceBinding>,
