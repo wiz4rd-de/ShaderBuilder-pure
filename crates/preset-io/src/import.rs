@@ -251,6 +251,12 @@ pub fn import_parsed_preset(
         pipeline,
         parameters,
         luts,
+        // An imported preset carries no native-project-file document metadata or
+        // library refs (#38): those are authored in the editor, not present in a
+        // `.slangp`. They stay empty here so import → edit → save is the only path
+        // that ever populates them.
+        metadata: core_model::ProjectMetadata::default(),
+        library_refs: Vec::new(),
     };
     (project, ImportDiagnostics { diagnostics })
 }

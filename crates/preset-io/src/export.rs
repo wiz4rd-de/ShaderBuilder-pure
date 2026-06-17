@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use core_model::{Lut, Parameter, Pass, PassSource, Project, ScaleAxis, ScaleType, WrapMode};
+use core_model::{Lut, Parameter, PassSource, Project, ScaleAxis, ScaleType, WrapMode};
 
 /// The canonical name of the preset file written at the bundle root.
 pub const PRESET_FILENAME: &str = "preset.slangp";
@@ -251,9 +251,9 @@ fn sanitize_stem(s: &str) -> String {
         .collect()
 }
 
-/// Render the full `preset.slangp` text from a project, the resolved relative pass
-/// + texture file names, and the preserved `extras`. Canonical RetroArch key
-/// ordering (see the function body).
+/// Render the full `preset.slangp` text from a project, the resolved relative
+/// pass and texture file names, and the preserved `extras`. Canonical RetroArch
+/// key ordering (see the function body).
 fn render_slangp(
     project: &Project,
     pass_files: &[String],
@@ -467,7 +467,7 @@ fn fmt_f32(v: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_model::{PassSettings, PipelineMetadata};
+    use core_model::{Pass, PassSettings, PipelineMetadata};
 
     fn wpc(source: &str, filename: &str) -> PassSource {
         PassSource::WholePassCode {
@@ -572,6 +572,10 @@ mod tests {
                     references: vec![],
                 },
             ],
+            // Document metadata + library refs (#38) play no part in export — the
+            // bundle writer ignores them — but the literal must be complete.
+            metadata: core_model::ProjectMetadata::default(),
+            library_refs: Vec::new(),
         }
     }
 
