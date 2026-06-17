@@ -8,7 +8,8 @@ renders a whole *directory* of presets as a smoke/fidelity fuzzer.
 This document explains what the harness automates, the self-oracle goldens and
 how to re-baseline them, the **corpus fuzzer over a real `slang-shaders` clone**,
 and the **real-RetroArch reference capture** that closes the Phase-2 fidelity exit
-gate.
+gate. §4 covers the Phase-3 **lossless import → export → re-import** harness (the
+Phase-3 exit gate); §5 is the overall status.
 
 > **Honest scope.** Everything under "Automated (runs in CI)" below runs in CI on
 > a headless lavapipe (software Vulkan) adapter. The committed `goldens/*.png` are
@@ -21,7 +22,7 @@ gate.
 > box's llvmpipe), so CI stays green without the corpus. `crt-geom`, `scanline`,
 > an NTSC preset, and (after the #32 `PassFeedbackSize0` fix) `feedback` match
 > RetroArch within calibrated thresholds (metrics in §3). What remains un-closed is
-> documented in §4: `crt-royale` now compiles + renders (after the #32 inlining
+> documented in §5: `crt-royale` now compiles + renders (after the #32 inlining
 > fix) but diverges in fidelity, and part of the corpus (the failure-mode worklist).
 
 ---
@@ -333,7 +334,94 @@ so no passing reference is committed; the divergence is the documented finding.
 
 ---
 
-## 4. Status — how much of the Phase-2 fidelity gate is closed
+## 4. Lossless round-trip (#37, Phase-3 EXIT gate)
+
+Phase 3 added preset **import** (`.slangp` → `core_model::Project`) and **export**
+(the inverse bundle writer). Its exit gate is **losslessness**: import → export →
+re-import must preserve the project, and an unmodified pass's `.slang` must export
+byte-for-byte. The harness lives in `crates/testing/src/roundtrip.rs`
+(`compare_projects` → a canonicalized `ProjectDiff`; `round_trip` drives one
+preset and reports the structural diff + per-pass byte equality).
+
+### Documented canonicalization
+
+A round trip is compared modulo a few **deterministic identity rewrites the export
+performs by design** (never value changes) — `compare_projects` canonicalizes
+them so they are not false mismatches:
+
+- **LUT path → basename**, since the export copies LUT images into `textures/`.
+  The basename is further compared modulo (a) unsafe-char **sanitization**
+  (`psp border.png` → `psp_border.png`) and (b) the shared-source **de-dup suffix**
+  (several LUTs pointing at one image → `foo.png`, `foo_1.png`, …). The LUT name +
+  bytes + sampler settings are unchanged.
+- **Pass `filename`**, since the export may rename a `.slang` to avoid a collision
+  (`dup.slang` → `dup_1.slang`); pass sources are compared by their bytes.
+- **Not part of the `.slangp` round trip:** project `name`, document `metadata`,
+  `library_refs`, and the *derived* pipeline `availability`/per-pass `references`
+  (re-derived deterministically from the chain).
+
+### Suites
+
+- **CI (always-on, no GPU, no corpus):** `tests/roundtrip_fixtures.rs` sweeps every
+  `.slangp` under `crates/testing/fixtures/` — including the
+  `fixtures/roundtrip/kitchen_sink.slangp` "kitchen sink" that exercises every
+  parsed feature in one bundle (multi-pass, all scale types, feedback, aliases,
+  varied-sampler LUTs, parameter overrides, a preserved unknown key) — and asserts
+  structure-lossless + per-pass byte equality. `tests/retroarch_export.rs` guards
+  the committed RetroArch bundle (§ below).
+- **Corpus losslessness fuzzer (opt-in, `#[ignore]` + `FUZZ_CORPUS_DIR`):**
+  `tests/roundtrip_corpus.rs` runs the round trip over the real `slang-shaders`
+  corpus (pinned commit `74bf541845e65cca7f09b3c6b3baeeea8f52afb3`) and asserts
+  per-preset losslessness. Unlike the render fuzzer (§2), losslessness is the gate:
+  a non-lossless preset is a **failure** unless it is a **classified exclusion**
+  (reported with a reason — never a silent skip).
+
+  ```bash
+  FUZZ_CORPUS_DIR=/home/mfunk/Code/slang-shaders \
+    cargo test -p testing --test roundtrip_corpus -- --ignored --nocapture
+  ```
+
+### Results on this box
+
+- **Curated default subset** (`crt, ntsc, blurs, denoisers, interpolation,
+  handheld, scanlines` — 310 presets): **297 lossless, 13 documented exclusions, 0
+  failures**.
+- **Full 33-category tree** (2210 presets): **1498 lossless, 712 documented
+  exclusions, 0 failures**.
+
+### Documented exclusions (the two classes — both intrinsic, neither a writer bug)
+
+1. **Not parseable by the importer** — presets that use a `.slangp` feature the
+   parser does not model, chiefly `#reference`-style **nested presets** (no
+   `shaders` key of their own — e.g. all of `crt-yah/*`, the Mega_Bezel preset
+   tree), plus the occasional malformed preset (e.g. a stray-quote value
+   `float_framebuffer0 = true"`). This is the **same** pre-existing parser worklist
+   as §2; the round trip can only cover what the parser accepts. Following
+   `#reference` is a future parser ticket.
+2. **Non-UTF-8 `.slang` source** — the model stores a pass body as a UTF-8
+   `String`, so a shader file with non-UTF-8 bytes (e.g. an author name in Latin-1:
+   `interpolation/quilez.slang` byte `0xf1`, `catmull-rom-4-taps.slang` byte
+   `0x96`) cannot round-trip byte-for-byte. `round_trip` detects this
+   (`RoundTrip::non_utf8_passes`) and the corpus test classifies it as an
+   exclusion. Holding pass bodies as raw bytes would be a model change for a future
+   ticket.
+
+To add a *new* documented exclusion, add a `(path-substring, reason)` entry to
+`KNOWN_EXCLUSIONS` in `tests/roundtrip_corpus.rs` and record it here, with a ticket
+— there are no silent skips.
+
+### Checked-in RetroArch-loadable bundle
+
+`crates/testing/fixtures/retroarch_export/` is a real export bundle (produced by
+the import → export path over the corpus `scanlines/scanline.slangp`, the same
+preset §3 confirms renders in RetroArch 1.22.2). Its `README.md` documents the
+manual RetroArch-1.22.2 load procedure; `examples/gen_retroarch_bundle.rs`
+regenerates it; `tests/retroarch_export.rs` is the corpus-free CI gate that it
+stays well-formed and round-trips losslessly.
+
+---
+
+## 5. Status — how much of the Phase-2 fidelity gate is closed
 
 - **Automated and passing in CI:** headless deterministic render-to-PNG; the image
   diff + visual artifact; the corpus fuzzer over local fixtures; the self-oracle
