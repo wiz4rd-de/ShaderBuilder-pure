@@ -144,6 +144,10 @@ pub struct Pass {
     pub shader: CompiledShader,
     /// Explicit scale config, or `None` to take the position default (§2).
     pub scale: Option<ScaleConfig>,
+    /// `aliasN` / `#pragma name` — the pass's semantic name (#26). When set, a
+    /// later pass can sample this pass's output as `<alias>` (and read its
+    /// `<alias>Size`); `<alias>Feedback` lands in #24. `None` = no alias.
+    pub alias: Option<String>,
 
     // ---- Format / sampler state (consumed by #23). ----
     /// `srgb_framebufferN` (#23). When set the FBO uses an sRGB format
@@ -173,6 +177,7 @@ impl Pass {
         Self {
             shader,
             scale: None,
+            alias: None,
             srgb_framebuffer: false,
             float_framebuffer: false,
             filter_linear: true,

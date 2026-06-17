@@ -10,12 +10,14 @@
 //! (Architecture §F) is proven end-to-end before any real rendering. Phase 1
 //! swaps in a wgpu-backed `FrameSource` without changing the `app` transport.
 
+pub mod bindtable;
 pub mod frame;
 pub mod pass;
 pub mod render_source;
 pub mod renderer;
 pub mod uniforms;
 
+pub use bindtable::{PlaceholderResolver, TextureClass, TextureResolver};
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
 pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};

@@ -31,9 +31,10 @@
 //! sampler (tracked as a separate task); the current fixtures all use the
 //! separate Vulkan `texture2D` + `sampler` form, which is what this renderer binds.
 
+use crate::bindtable::{self, PlaceholderResolver, TextureClass, TextureResolver};
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
 use crate::uniforms::{self, BuiltinValues, ParamStore, ParamView};
-use slang_compile::{CompiledShader, Parameter, UniformBlock};
+use slang_compile::{BlockBinding, CompiledShader, Parameter, SpirvReflection, UniformBlock};
 use source::Frame;
 
 /// The offscreen color format. Linear RGBA8 so a passthrough shader reproduces
@@ -143,9 +144,42 @@ impl std::fmt::Display for RendererError {
 
 impl std::error::Error for RendererError {}
 
+/// A reflected texture slot on a pass: the wgpu `binding` number it occupies,
+/// and the [`TextureClass`] its GLSL name resolves to (#26). The renderer
+/// resolves the class to a live view + the producing pass's sampler each frame in
+/// [`Renderer::rebuild_chain`].
+struct TextureSlot {
+    binding: u32,
+    class: TextureClass,
+}
+
+/// A reflected sampler slot on a pass: its wgpu `binding` number (#26). The
+/// renderer binds the sampler of whichever texture this sampler reads — by §3/§7
+/// the *producing* pass's sampler. With one texture+sampler per pass (the common
+/// case) the sampler pairs with the pass's single texture slot; the renderer
+/// pairs them positionally (first sampler ↔ first texture).
+struct SamplerSlot {
+    binding: u32,
+}
+
 /// GPU resources for one pass in the chain.
 struct PassResources {
     pipeline: wgpu::RenderPipeline,
+    /// This pass's reflection-driven bind-group layout (#26): built from the
+    /// SPIR-V's uniform blocks + textures + samplers at their reflected bindings,
+    /// replacing the old single fixed layout. The bind group and pipeline layout
+    /// are derived from this.
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// The reflected texture slots this pass declares, each a `(binding, class)`
+    /// (#26). Resolved to live views every frame.
+    texture_slots: Vec<TextureSlot>,
+    /// The reflected sampler slots this pass declares (#26). Bound to the
+    /// producing-pass sampler of the paired texture.
+    sampler_slots: Vec<SamplerSlot>,
+    /// The reflected uniform-block bindings (set-0 UBOs) this pass declares: the
+    /// builtin block's binding and the param block's binding, in reflection order
+    /// (#26). Used to attach the right UBO buffer at each block's binding number.
+    block_bindings: Vec<u32>,
     /// Parameter UBO (binding 3). Re-packed + re-uploaded each frame from the
     /// chain's global [`ParamStore`] — no recompile/pipeline rebuild (#29).
     param_buffer: wgpu::Buffer,
@@ -163,11 +197,21 @@ struct PassResources {
     /// dedicated params block. `None` when the pass has no such block (the param
     /// UBO is then a zero-filled vec4). #29 packs current param values here.
     param_block: Option<UniformBlock>,
+    /// The set-0 binding the **builtin** UBO buffer attaches at (#26): the builtin
+    /// block's reflected binding (legacy `0` when absent).
+    builtin_binding: u32,
+    /// The set-0 binding the **param** UBO buffer attaches at (#26): the param
+    /// block's reflected binding (legacy `3` when absent).
+    param_binding: u32,
     /// `frame_count_modN` (#28): the `FrameCount` this pass sees is pre-wrapped
     /// by this modulus (`0` = no wrap).
     frame_count_mod: u32,
-    /// This pass's **input** sampler (binding 2): filter/wrap/mip per the pass's
-    /// `filter_linear`/`wrap_mode`/`mipmap_input` (#23). Built once at
+    /// This pass's **producing** sampler: filter/wrap/mip per the pass's own
+    /// `filter_linear`/`wrap_mode`/`mipmap_input` (#23). Per §3/§7 a texture is
+    /// sampled with the sampler of the pass that **produced** it, so a *consumer*
+    /// reading this pass's output binds *this* sampler — not its own (#26). For a
+    /// pass's `Source` input that means pass `i-1`'s sampler; pass 0's `Source`
+    /// (and any `Original`) uses [`Renderer::original_sampler`]. Built once at
     /// [`Renderer::build_pass`].
     sampler: wgpu::Sampler,
     /// The render-target format this pass writes (its FBO format for an
@@ -224,7 +268,19 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     vertex_buffer: wgpu::Buffer,
-    bind_group_layout: wgpu::BindGroupLayout,
+    /// A default source-defaults sampler (linear, clamp-to-border, no mips) used
+    /// only as a **fallback** when the chain is empty (#26). Normally the source /
+    /// `Original` is sampled with pass 0's sampler (the "K+1" rule with the source
+    /// produced by "pass -1"); see [`Renderer::sampler_after_source`].
+    original_sampler: wgpu::Sampler,
+    /// The chain's alias table: each pass's `alias` (its `#pragma name`/preset
+    /// `aliasN`) mapped to its pass index (#26). A `<alias>` texture binds the
+    /// output of `aliases[alias]`. Rebuilt by `set_chain`.
+    aliases: std::collections::HashMap<String, usize>,
+    /// The deferred-resource resolver (#26): the hook #24 (feedback) / #25
+    /// (history) / #27 (LUTs) implement. Defaults to a [`PlaceholderResolver`]
+    /// returning a 1×1 black texture so unimplemented semantics still bind.
+    resolver: PlaceholderResolver,
     /// Whether the device supports `AddressMode::ClampToBorder` (#23). When
     /// `false`, a pass asking for `WrapMode::ClampToBorder` falls back to
     /// `ClampToEdge` (so lavapipe/CI without the feature still works).
@@ -345,49 +401,28 @@ impl Renderer {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&QUAD));
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pass bind group layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Parameter UBO. Present even for shaders that declare no
-                // parameters: a layout may carry bindings the shader doesn't use.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+        // The sampler for `Original` (and pass 0's `Source == Original`): §3 v1
+        // source defaults — linear filter, clamp-to-border wrap, no mips (#26).
+        let original_address = if clamp_to_border_supported {
+            wgpu::AddressMode::ClampToBorder
+        } else {
+            wgpu::AddressMode::ClampToEdge
+        };
+        let original_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Original sampler"),
+            address_mode_u: original_address,
+            address_mode_v: original_address,
+            address_mode_w: original_address,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            border_color: Some(wgpu::SamplerBorderColor::TransparentBlack),
+            ..Default::default()
         });
+
+        let resolver = PlaceholderResolver::new(&device, &queue);
 
         let offscreen = create_offscreen(&device, width, height);
 
@@ -395,7 +430,9 @@ impl Renderer {
             device,
             queue,
             vertex_buffer,
-            bind_group_layout,
+            original_sampler,
+            aliases: std::collections::HashMap::new(),
+            resolver,
             clamp_to_border_supported,
             mip_gen: None,
             blit: None,
@@ -522,6 +559,19 @@ impl Renderer {
         if passes.is_empty() {
             return Err(RendererError::EmptyChain);
         }
+        // The chain's alias table (#26): each pass's `alias` → its index, so a
+        // later pass sampling `<alias>` (or reading `<alias>Size`) resolves to the
+        // aliased pass's output. Built before the passes so classification can use
+        // it. A duplicate alias keeps the first (lowest-index) pass.
+        let mut aliases = std::collections::HashMap::new();
+        for (i, pass) in passes.iter().enumerate() {
+            if let Some(name) = &pass.alias {
+                aliases.entry(name.clone()).or_insert(i);
+            }
+        }
+        let alias_names: Vec<String> = aliases.keys().cloned().collect();
+        self.aliases = aliases;
+
         let last = passes.len() - 1;
         let mut resources = Vec::with_capacity(passes.len());
         for (i, pass) in passes.iter().enumerate() {
@@ -530,7 +580,7 @@ impl Renderer {
             // with `mipmap_input` (its input is this pass's FBO). The final pass
             // never produces mips (nothing reads it as Source).
             let produces_mips = !is_final && passes[i + 1].mipmap_input;
-            resources.push(self.build_pass(pass, is_final, produces_mips));
+            resources.push(self.build_pass(pass, is_final, produces_mips, &alias_names));
         }
         self.passes = resources;
 
@@ -584,7 +634,13 @@ impl Renderer {
     /// shader's reflected `#pragma parameter` defaults), the per-pass builtin
     /// UBO, and — for an intermediate pass — a placeholder FBO slot (sized on the
     /// first render).
-    fn build_pass(&self, pass: &Pass, is_final: bool, produces_mips: bool) -> PassResources {
+    fn build_pass(
+        &self,
+        pass: &Pass,
+        is_final: bool,
+        produces_mips: bool,
+        alias_names: &[String],
+    ) -> PassResources {
         let shader = &pass.shader;
 
         // A final pass with an EXPLICIT scale owns its own FBO (sized by that
@@ -628,6 +684,37 @@ impl Renderer {
                 None
             }
         };
+        // The reflection-driven bind layout + texture/sampler slots (#26). When
+        // reflection failed we fall back to an empty reflection: the legacy
+        // fixtures all reflect cleanly, and a failed reflection already renders
+        // incorrectly (logged above), so an empty layout is acceptable degradation.
+        let empty = SpirvReflection::default();
+        let refl = reflection.as_ref().unwrap_or(&empty);
+        let bind_group_layout = bindtable::pass_layout(&self.device, refl);
+        let texture_slots: Vec<TextureSlot> = refl
+            .textures
+            .iter()
+            .filter(|t| t.set == 0)
+            .map(|t| TextureSlot {
+                binding: t.binding,
+                class: TextureClass::classify(&t.name, alias_names),
+            })
+            .collect();
+        let sampler_slots: Vec<SamplerSlot> = refl
+            .samplers
+            .iter()
+            .filter(|s| s.set == 0)
+            .map(|s| SamplerSlot { binding: s.binding })
+            .collect();
+        let block_bindings: Vec<u32> = refl
+            .blocks
+            .iter()
+            .filter_map(|b| match b.binding {
+                BlockBinding::Uniform { set: 0, binding } => Some(binding),
+                _ => None,
+            })
+            .collect();
+
         let builtin_block = reflection
             .as_ref()
             .and_then(|r| uniforms::builtin_block(r).cloned());
@@ -689,7 +776,7 @@ impl Renderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("pass pipeline layout"),
-                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                bind_group_layouts: &[Some(&bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -739,12 +826,26 @@ impl Renderer {
                 cache: None,
             });
 
+        // The binding number each UBO buffer attaches at (#26): the builtin block's
+        // and the param block's reflected `binding` within set 0. Default to the
+        // legacy 0 / 3 if a block is absent (the buffer is then a zero-filled vec4
+        // bound at a binding the layout may not list — harmless, but normally the
+        // layout carries it because the shader declares the block).
+        let builtin_binding = block_binding(builtin_block.as_ref()).unwrap_or(0);
+        let param_binding = block_binding(param_block.as_ref()).unwrap_or(3);
+
         PassResources {
             pipeline,
+            bind_group_layout,
+            texture_slots,
+            sampler_slots,
+            block_bindings,
             param_buffer,
             ubo,
             builtin_block,
             param_block,
+            builtin_binding,
+            param_binding,
             frame_count_mod: pass.frame_count_mod,
             sampler,
             target_format,
@@ -911,42 +1012,167 @@ impl Renderer {
             }
         }
 
-        // Pass 2: build each pass's bind group, chaining input views. Each pass's
-        // input is the previous FBO view (or the source for pass 0).
-        let mut prev_view: Option<&wgpu::TextureView> = None;
+        // Pass 2: build each pass's reflection-driven bind group (#26). For every
+        // reflected texture the pass declares we resolve its [`TextureClass`] to a
+        // live view + the *producing* pass's sampler (§3/§7), then assemble the
+        // bind group with the UBO/param buffers at their reflected bindings,
+        // textures at theirs, and samplers paired positionally to the textures.
+        //
+        // Bind groups for all passes are built into one Vec first (borrowing
+        // `&self.passes` immutably so a pass can read *other* passes' FBO views for
+        // `PassOutputN`/`<alias>`), then assigned back in a second loop.
         let count = self.passes.len();
+        let mut new_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(count);
         for i in 0..count {
-            let input_view = match prev_view {
-                None => source_view,
-                Some(v) => v,
-            };
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("pass bind group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.passes[i].ubo.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(input_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.passes[i].sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.passes[i].param_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-            self.passes[i].bind_group = Some(bind_group);
-            // Next pass's input is this pass's FBO output (final pass has none,
-            // and is always last, so prev_view is irrelevant after it).
-            prev_view = self.passes[i].fbo.as_ref().map(|f| &f.view);
+            let res = &self.passes[i];
+            let mut entries: Vec<wgpu::BindGroupEntry> = Vec::new();
+
+            // Uniform blocks at their reflected bindings: the builtin UBO and the
+            // param UBO. (A block the shader doesn't declare isn't in the layout,
+            // so we only attach buffers for bindings the layout lists.)
+            for &binding in &res.block_bindings {
+                let buffer = if binding == res.param_binding && binding != res.builtin_binding {
+                    &res.param_buffer
+                } else {
+                    &res.ubo
+                };
+                entries.push(wgpu::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                });
+            }
+
+            // Resolve each texture slot to (view, producing sampler). The sampler
+            // is paired to the texture by position (slot j ↔ texture j).
+            let mut resolved_samplers: Vec<&wgpu::Sampler> =
+                Vec::with_capacity(res.texture_slots.len());
+            for slot in &res.texture_slots {
+                let (view, sampler) = self.resolve_texture(&slot.class, i, source_view);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: slot.binding,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+                resolved_samplers.push(sampler);
+            }
+            for (j, slot) in res.sampler_slots.iter().enumerate() {
+                // Pair sampler j with texture j's producing sampler; if a pass has
+                // more samplers than textures, fall back to the Original sampler.
+                let sampler = resolved_samplers
+                    .get(j)
+                    .copied()
+                    .unwrap_or(&self.original_sampler);
+                entries.push(wgpu::BindGroupEntry {
+                    binding: slot.binding,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                });
+            }
+
+            new_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pass bind group (reflection-driven)"),
+                layout: &res.bind_group_layout,
+                entries: &entries,
+            }));
         }
+        for (i, group) in new_groups.into_iter().enumerate() {
+            self.passes[i].bind_group = Some(group);
+        }
+    }
+
+    /// Resolve a reflected texture's [`TextureClass`] to its live `(view,
+    /// sampler)` for consuming pass `i` (#26, §3/§7).
+    ///
+    /// **Sampler attribution — the "producer's-successor" (K+1) rule.** RetroArch's
+    /// real behavior (libretro/RetroArch#14437): a texture produced by pass `K` is
+    /// sampled with the `filter_linear`/`wrap_mode`/`mipmap_input` of pass `K+1`
+    /// (the pass *immediately after* its producer), **not** the producer itself and
+    /// not the (possibly much later) consumer. This reconciles #23: a pass's
+    /// `Source` is its predecessor's output (`K = i-1`), so it is sampled with pass
+    /// `(i-1)+1 = i`'s config — the consuming pass itself, exactly what #23 built
+    /// per-pass. `Original`/pass-0 `Source` is "produced by pass -1", so it is
+    /// sampled with pass 0's config. We implement this by selecting
+    /// [`Self::sampler_after`]`(K)` = the sampler of pass `K+1` (clamped to the
+    /// last pass), where `K` is the producing pass index (`-1` → pass 0).
+    ///
+    /// Texture mapping (§7): `Source` → pass `i-1`'s output (pass 0: the source
+    /// image); `Original` → the source image (any pass); `PassOutputN`/`<alias>` →
+    /// pass `N`'s output (causal `N < i`); deferred classes
+    /// (`PassFeedbackN`/`OriginalHistoryN`/LUT) → the resolver hook (a 1×1 black
+    /// placeholder today). A non-causal / unsatisfiable resource falls back to the
+    /// placeholder so the bind never fails.
+    fn resolve_texture<'a>(
+        &'a self,
+        class: &TextureClass,
+        pass_index: usize,
+        source_view: &'a wgpu::TextureView,
+    ) -> (&'a wgpu::TextureView, &'a wgpu::Sampler) {
+        // A pass's output FBO view, if it owns one and is causal (earlier than the
+        // consumer). The final pass owns no FBO, so reading it as PassOutput is
+        // unsatisfiable. Paired with the producer's-successor sampler (K+1 rule).
+        let pass_output = |n: usize| -> Option<(&wgpu::TextureView, &wgpu::Sampler)> {
+            if n >= pass_index {
+                return None; // causal: only earlier passes are available this frame
+            }
+            let view = &self.passes.get(n)?.fbo.as_ref()?.view;
+            Some((view, self.sampler_after(n)))
+        };
+        match class {
+            // Pass 0's Source IS the source image, produced by "pass -1" → sampled
+            // with pass 0's sampler. Pass i's Source is pass i-1's output → pass
+            // (i-1)+1 = i's sampler (the consuming pass, matching #23).
+            TextureClass::Source => {
+                if pass_index == 0 {
+                    (source_view, self.sampler_after_source())
+                } else {
+                    pass_output(pass_index - 1)
+                        .unwrap_or((source_view, self.sampler_after_source()))
+                }
+            }
+            // Original is the source image (produced by "pass -1") → pass 0's
+            // sampler, for any consuming pass.
+            TextureClass::Original => (source_view, self.sampler_after_source()),
+            TextureClass::PassOutput(n) => {
+                pass_output(*n).unwrap_or_else(|| self.placeholder_resource())
+            }
+            TextureClass::Alias(name) => self
+                .aliases
+                .get(name)
+                .and_then(|&n| pass_output(n))
+                .unwrap_or_else(|| self.placeholder_resource()),
+            // Deferred resources (#24/#25/#27): the resolver hook returns a
+            // placeholder black view today. Sampled with the source sampler.
+            other => {
+                let view = self
+                    .resolver
+                    .resolve(other, pass_index)
+                    .unwrap_or_else(|| self.resolver.black());
+                (view, self.sampler_after_source())
+            }
+        }
+    }
+
+    /// The sampler for a texture produced by pass `producer` — pass `producer+1`'s
+    /// sampler (the "K+1" rule, §3/§7 / RetroArch#14437), clamped to the last
+    /// pass so a final-pass producer reuses its own sampler.
+    fn sampler_after(&self, producer: usize) -> &wgpu::Sampler {
+        let idx = (producer + 1).min(self.passes.len().saturating_sub(1));
+        &self.passes[idx].sampler
+    }
+
+    /// The sampler for the source image / `Original` ("produced by pass -1") —
+    /// pass 0's sampler (the K+1 rule with K = -1). Falls back to the dedicated
+    /// [`Renderer::original_sampler`] only if the chain is somehow empty.
+    fn sampler_after_source(&self) -> &wgpu::Sampler {
+        self.passes
+            .first()
+            .map(|p| &p.sampler)
+            .unwrap_or(&self.original_sampler)
+    }
+
+    /// The placeholder `(view, sampler)` for an unsatisfiable renderer-resolved
+    /// texture (a non-causal `PassOutputN`, an unknown alias): a 1×1 black view +
+    /// the source sampler, so the bind succeeds with a defined value.
+    fn placeholder_resource(&self) -> (&wgpu::TextureView, &wgpu::Sampler) {
+        (self.resolver.black(), self.sampler_after_source())
     }
 
     /// Compute and upload each pass's builtin UBO for the current frame (#28),
@@ -1452,6 +1678,16 @@ impl Fbo {
             format,
             mip_level_count,
         }
+    }
+}
+
+/// The set-0 binding number of a reflected uniform block, or `None` for a
+/// push-constant block / absent block (#26). Used to attach the builtin/param UBO
+/// buffers at their reflected bindings instead of the legacy fixed 0/3.
+fn block_binding(block: Option<&UniformBlock>) -> Option<u32> {
+    match block?.binding {
+        BlockBinding::Uniform { set: 0, binding } => Some(binding),
+        _ => None,
     }
 }
 

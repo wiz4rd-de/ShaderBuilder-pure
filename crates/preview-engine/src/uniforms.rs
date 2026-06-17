@@ -942,7 +942,11 @@ mod tests {
         let store = ParamStore::collect([params.as_slice()], &aliases);
         pack_params(&mut bytes, &blk, &store);
         // The builtin OutputSize survives untouched (param did NOT overwrite it).
-        assert_eq!(f32x4(&bytes, 0), size_vec(640, 480), "builtin wins over param");
+        assert_eq!(
+            f32x4(&bytes, 0),
+            size_vec(640, 480),
+            "builtin wins over param"
+        );
     }
 
     #[test]
