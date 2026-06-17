@@ -396,12 +396,12 @@ fn parse_luts(
     let Some(list) = map.get("textures") else {
         return Ok(Vec::new());
     };
-    let mut luts = Vec::new();
+    let mut luts: Vec<LutEntry> = Vec::new();
     for name in list.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let path_rel = map
             .get(name)
             .ok_or_else(|| ParseError::MissingLut(name.to_string()))?;
-        luts.push(LutEntry {
+        let entry = LutEntry {
             name: name.to_string(),
             path: resolve(base_dir, path_rel),
             linear: opt_bool(map, &format!("{name}_linear"))?,
@@ -409,7 +409,19 @@ fn parse_luts(
                 .get(&format!("{name}_wrap_mode"))
                 .map(|s| WrapMode::parse(s)),
             mipmap: opt_bool(map, &format!("{name}_mipmap"))?,
-        });
+        };
+        // De-duplicate by bind name (B4): a `textures = "L;L"` list naming the same
+        // LUT twice must NOT produce two model entries — a real RetroArch load keeps
+        // only the LAST `L = path` (its config is a flat map). All `L`/`L_*` keys
+        // resolve to the same value here (BTreeMap = last wins) so the two entries
+        // are identical; we keep a single entry at the LAST listed position to match
+        // RetroArch's ordering. Without this, export would emit `textures = "L;L"`
+        // of which a re-load silently keeps one.
+        if let Some(existing) = luts.iter_mut().find(|l| l.name == entry.name) {
+            *existing = entry;
+        } else {
+            luts.push(entry);
+        }
     }
     Ok(luts)
 }
@@ -692,6 +704,31 @@ CONTRAST = 0.75
         assert_eq!(border.wrap_mode, Some(WrapMode::ClampToEdge));
         assert_eq!(border.mipmap, None);
         assert_eq!(p.luts[1].name, "OVERLAY");
+    }
+
+    #[test]
+    fn duplicate_lut_names_are_deduped() {
+        // B4: a `textures` list naming the same LUT twice must collapse to ONE
+        // model entry — a real RetroArch load keeps only the last `L = path` (flat
+        // map), and export would otherwise emit `textures = "L;L"` of which a
+        // re-load silently keeps one.
+        let p = parse_slangp_str(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             textures = \"L;OTHER;L\"\n\
+             L = luts/l.png\n\
+             L_linear = true\n\
+             OTHER = luts/other.png\n",
+            Path::new("/p"),
+        )
+        .expect("parses");
+        // Exactly one `L` and one `OTHER`.
+        assert_eq!(p.luts.len(), 2, "duplicate `L` de-duped: {:?}", p.luts);
+        assert_eq!(p.luts.iter().filter(|l| l.name == "L").count(), 1);
+        let l = p.luts.iter().find(|l| l.name == "L").unwrap();
+        assert_eq!(l.path, PathBuf::from("/p/luts/l.png"));
+        assert_eq!(l.linear, Some(true));
+        assert!(p.luts.iter().any(|l| l.name == "OTHER"));
     }
 
     #[test]
