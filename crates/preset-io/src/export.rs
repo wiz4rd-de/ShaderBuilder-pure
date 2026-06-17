@@ -443,9 +443,15 @@ fn wrap_mode_str(w: WrapMode) -> &'static str {
 /// Format a scale factor: an `absolute` factor is a literal integer pixel count
 /// (§2), so it is written without a fractional part; every other type writes the
 /// float via [`fmt_f32`].
+///
+/// The `absolute` factor is **truncated** (not rounded) to match RetroArch, which
+/// parses it with `config_get_int` (truncation) — so a hand-built `319.6` exports
+/// as `319`, agreeing with the import-side truncation (B2). Import already stores
+/// absolute factors truncated, so for an imported project this is a no-op; the
+/// `trunc` here keeps a directly-constructed project conformant too.
 fn fmt_scale(ty: Option<ScaleType>, factor: f32) -> String {
     if ty == Some(ScaleType::Absolute) {
-        format!("{}", factor.round() as i64)
+        format!("{}", factor.trunc() as i64)
     } else {
         fmt_f32(factor)
     }
@@ -769,6 +775,48 @@ mod tests {
         assert_eq!(fmt_f32(2.4), "2.4");
         assert_eq!(fmt_scale(Some(ScaleType::Absolute), 320.0), "320");
         assert_eq!(fmt_scale(Some(ScaleType::Source), 2.0), "2.0");
+        // B2: a fractional `absolute` factor is TRUNCATED (not rounded), matching
+        // RetroArch's config_get_int. `319.6 -> 319`, never `320`.
+        assert_eq!(fmt_scale(Some(ScaleType::Absolute), 319.6), "319");
+        assert_eq!(fmt_scale(Some(ScaleType::Absolute), 12.9), "12");
+    }
+
+    #[test]
+    fn fractional_absolute_scale_round_trips_truncated() {
+        // B2 end-to-end: a fractional `absolute` factor survives import -> export
+        // -> re-import as the conformant truncated integer (a fixed point), never
+        // drifting upward (319.6 -> 320) as `round()` on export would have done.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.slang"), "void main(){}\n").unwrap();
+        std::fs::write(
+            src.path().join("p.slangp"),
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             scale_type0 = absolute\n\
+             scale0 = 319.6\n",
+        )
+        .unwrap();
+
+        let (project, _) = crate::import_preset(src.path().join("p.slangp")).expect("import");
+        // Import already truncated the model value (no upward round).
+        assert_eq!(project.passes[0].settings.scale_x.scale, Some(319.0));
+
+        let out = tempfile::tempdir().unwrap();
+        export_preset(&project, out.path(), &BTreeMap::new()).expect("export");
+        let text = std::fs::read_to_string(out.path().join(PRESET_FILENAME)).unwrap();
+        assert!(
+            text.contains("scale0 = 319"),
+            "exports truncated int:\n{text}"
+        );
+        assert!(!text.contains("320"), "must not round up to 320:\n{text}");
+
+        let (reimported, _) =
+            crate::import_preset(out.path().join(PRESET_FILENAME)).expect("re-import");
+        assert_eq!(
+            reimported.passes[0].settings.scale_x.scale,
+            Some(319.0),
+            "absolute factor is a fixed point across the round trip"
+        );
     }
 
     // ---- import → export → re-import round-trip fidelity (#36) ---------------

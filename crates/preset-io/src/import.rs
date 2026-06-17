@@ -447,14 +447,8 @@ fn cross_check_references(
 /// resolving the combined-vs-per-axis scale precedence (see the module docs).
 fn map_settings(pass: &Pass) -> core_model::PassSettings {
     core_model::PassSettings {
-        scale_x: core_model::ScaleAxis {
-            scale_type: pass.scale_type_x().map(map_scale_type),
-            scale: pass.scale_factor_x(),
-        },
-        scale_y: core_model::ScaleAxis {
-            scale_type: pass.scale_type_y().map(map_scale_type),
-            scale: pass.scale_factor_y(),
-        },
+        scale_x: map_scale_axis(pass.scale_type_x(), pass.scale_factor_x()),
+        scale_y: map_scale_axis(pass.scale_type_y(), pass.scale_factor_y()),
         filter_linear: pass.filter_linear,
         wrap_mode: pass.wrap_mode.map(map_wrap_mode),
         mipmap_input: pass.mipmap_input,
@@ -463,6 +457,22 @@ fn map_settings(pass: &Pass) -> core_model::PassSettings {
         alias: pass.alias.clone(),
         frame_count_mod: pass.frame_count_mod,
     }
+}
+
+/// Map one resolved (type, factor) scale axis into a [`core_model::ScaleAxis`],
+/// truncating the factor for an `absolute` axis (B2). RetroArch parses an
+/// `absolute` scale as an int (`config_get_int`, i.e. truncation), so the model
+/// stores the truncated integer at IMPORT time — keeping it conformant with both
+/// RetroArch and the exporter, and making a re-import a fixed point (no drift,
+/// and no upward ROUND that `319.6 -> 320` would introduce). Non-absolute axes
+/// (`source`/`viewport`) keep their fractional factor verbatim.
+fn map_scale_axis(ty: Option<ScaleType>, factor: Option<f32>) -> core_model::ScaleAxis {
+    let scale_type = ty.map(map_scale_type);
+    let scale = match (ty, factor) {
+        (Some(ScaleType::Absolute), Some(f)) => Some(f.trunc()),
+        (_, f) => f,
+    };
+    core_model::ScaleAxis { scale_type, scale }
 }
 
 /// Map the parser's `feedback_pass` (RetroArch `int`, default `-1` = none) to the
@@ -557,6 +567,41 @@ mystery_setting = banana
         assert_eq!(s.scale_x.scale, Some(2.0));
         assert_eq!(s.scale_y.scale_type, Some(MScale::Source));
         assert_eq!(s.scale_y.scale, Some(2.0));
+    }
+
+    #[test]
+    fn fractional_absolute_scale_is_truncated_at_import() {
+        // B2: RetroArch parses an `absolute` scale factor as an int
+        // (config_get_int = truncation). A fractional value like `319.6` must be
+        // truncated to `319` at IMPORT time so the model and the exporter agree
+        // and a re-import is a fixed point (no drift, no ROUND-up to 320). A
+        // `source`/`viewport` factor stays fractional.
+        let preset = parse_slangp_str(
+            "shaders = 2\n\
+             shader0 = a.slang\n\
+             scale_type0 = absolute\n\
+             scale0 = 319.6\n\
+             shader1 = b.slang\n\
+             scale_type_x1 = absolute\n\
+             scale_x1 = 12.9\n\
+             scale_type_y1 = source\n\
+             scale_y1 = 1.5\n",
+            Path::new("/p"),
+        )
+        .expect("parses");
+        let (project, _) = import_parsed_preset(&preset, "x");
+
+        // Combined absolute -> both axes truncated (319.6 -> 319.0, NOT 320).
+        let s0 = &project.passes[0].settings;
+        assert_eq!(s0.scale_x.scale, Some(319.0));
+        assert_eq!(s0.scale_y.scale, Some(319.0));
+
+        // Per-axis: absolute X truncates; source Y stays fractional.
+        let s1 = &project.passes[1].settings;
+        assert_eq!(s1.scale_x.scale_type, Some(MScale::Absolute));
+        assert_eq!(s1.scale_x.scale, Some(12.0), "absolute X truncated");
+        assert_eq!(s1.scale_y.scale_type, Some(MScale::Source));
+        assert_eq!(s1.scale_y.scale, Some(1.5), "non-absolute Y unchanged");
     }
 
     #[test]
