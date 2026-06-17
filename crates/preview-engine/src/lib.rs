@@ -487,8 +487,93 @@ layout(set = 0, binding = 2) uniform sampler Smp;
     }
 
     #[test]
+    fn final_pass_with_explicit_scale_renders_scaled_then_stretches() {
+        // #22 §2/§10: a LAST pass declaring an explicit `scale` must render into
+        // its OWN FBO sized by that scale (receiving OutputSize == that size) and
+        // THEN be stretched into the viewport-sized offscreen target.
+        //
+        // The final pass is the OutputSize probe with an absolute 64x64 scale, in a
+        // 256x256 viewport. Its FBO is 64x64, so OutputSize == (64,64). The probe
+        // writes that encoded size as a UNIFORM color into the 64x64 FBO, which is
+        // then stretched to 256x256 — so:
+        //   (1) decoding any read-back pixel yields OutputSize == 64x64 (NOT 256),
+        //       proving the final shader saw its scaled FBO size; and
+        //   (2) the read-back frame is the full viewport size (256x256), proving
+        //       the stretch/blit actually ran.
+        let viewport = (256, 256);
+        let scale = ScaleConfig {
+            x: axis(ScaleType::Absolute, 64.0),
+            y: axis(ScaleType::Absolute, 64.0),
+        };
+        let input = solid(100, 50, [0, 0, 0, 255]);
+        let final_pass = Pass::new(output_size_probe()).with_scale(scale);
+        let out = render_chain(&[final_pass], &input, viewport);
+
+        // (2) The read-back is at the viewport size (the stretch target).
+        assert_eq!(
+            (out.width, out.height),
+            viewport,
+            "read-back must be the viewport size (stretched)"
+        );
+        // (1) Decode OutputSize from the (uniform, stretched) result — it is the
+        // SCALED FBO size, not the viewport.
+        let center = (((out.height / 2) * out.width + out.width / 2) * 4) as usize;
+        let decode = |b: u8| (b as f32 / 255.0 * 512.0).round() as u32;
+        let got = (decode(out.rgba[center]), decode(out.rgba[center + 1]));
+        assert!(
+            size_close(got, (64, 64)),
+            "final pass must see OutputSize == its scaled FBO (64x64), not the \
+             viewport (256); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn final_pass_explicit_downscale_stretches_a_distinguishable_pattern() {
+        // A two-pass chain whose FINAL pass downscales to a tiny FBO then stretches
+        // to the viewport. Pass 0 writes a left=red / right=green split into a wide
+        // intermediate; the final pass downsamples it to an absolute 2x2 FBO with a
+        // linear sampler (averaging) and is stretched up. The left-edge and
+        // right-edge of the viewport must still read red-ish vs green-ish — proving
+        // the scaled FBO content (not a viewport-sized direct render) was stretched.
+        let split = compile(
+            "void main() { FragColor = vTexCoord.x < 0.5 ? vec4(1.0,0.0,0.0,1.0) : vec4(0.0,1.0,0.0,1.0); }\n",
+        );
+        let pass0 = Pass::new(split).with_scale(ScaleConfig {
+            x: axis(ScaleType::Absolute, 64.0),
+            y: axis(ScaleType::Absolute, 8.0),
+        });
+        // Final pass: a passthrough downscaled to an absolute 4x4 FBO, then
+        // stretched to the 64x16 viewport.
+        let final_pass = Pass::new(passthrough()).with_scale(ScaleConfig {
+            x: axis(ScaleType::Absolute, 4.0),
+            y: axis(ScaleType::Absolute, 4.0),
+        });
+        let out = render_chain(&[pass0, final_pass], &solid(8, 8, [0, 0, 0, 255]), (64, 16));
+        assert_eq!((out.width, out.height), (64, 16), "stretched to viewport");
+        // Left quarter is red-dominant; right quarter is green-dominant.
+        let px = |x: u32, y: u32| {
+            let i = ((y * out.width + x) * 4) as usize;
+            [out.rgba[i], out.rgba[i + 1]]
+        };
+        let left = px(8, 8);
+        let right = px(56, 8);
+        assert!(
+            left[0] > left[1],
+            "left edge should stay red-dominant, got {left:?}"
+        );
+        assert!(
+            right[1] > right[0],
+            "right edge should stay green-dominant, got {right:?}"
+        );
+    }
+
+    #[test]
     fn viewport_change_resizes_viewport_scaled_pass() {
-        // A viewport×1 intermediate must reallocate when the viewport changes.
+        // A viewport×1 intermediate must reallocate when the viewport changes
+        // (stale `f.size != size` path). Render ONCE at the initial viewport and
+        // assert the intermediate FBO is sized to it, THEN change the viewport and
+        // assert the intermediate reallocates — so a missing realloc would fail the
+        // SECOND assertion (the first proves the initial size was real, not 1x1).
         let scale = ScaleConfig {
             x: AxisScale::VIEWPORT_1X,
             y: AxisScale::VIEWPORT_1X,
@@ -500,15 +585,27 @@ layout(set = 0, binding = 2) uniform sampler Smp;
         let mut r = Renderer::new(128, 96).expect("wgpu device");
         r.set_source(&input);
         r.set_chain(&[pass0, pass1]).expect("set chain");
-        r.set_viewport(1, 1); // shrink to 1x1 so the probe pixel is readable
+
+        // First render at 128x96: the viewport×1 intermediate FBO is 128 wide.
         r.render().expect("render");
-        let out = r.read_back().expect("read back");
-        // Now the viewport is 1x1, so the intermediate viewport×1 FBO is 1x1.
+        let out0 = r.read_back().expect("read back");
+        let center0 = (((out0.height / 2) * out0.width + out0.width / 2) * 4) as usize;
         let decode = |b: u8| (b as f32 / 255.0 * 512.0).round() as u32;
-        let got = (decode(out.rgba[0]), decode(out.rgba[1]));
+        let got0 = (decode(out0.rgba[center0]), decode(out0.rgba[center0 + 1]));
         assert!(
-            size_close(got, (1, 1)),
-            "viewport-change realloc: got {got:?}"
+            size_close(got0, (128, 96)),
+            "initial viewport×1 FBO should be 128x96, got {got0:?}"
+        );
+
+        // Change the viewport to 1x1 and render again: the intermediate viewport×1
+        // FBO must reallocate to 1x1 (the realloc-on-change path).
+        r.set_viewport(1, 1);
+        r.render().expect("render");
+        let out1 = r.read_back().expect("read back");
+        let got1 = (decode(out1.rgba[0]), decode(out1.rgba[1]));
+        assert!(
+            size_close(got1, (1, 1)),
+            "viewport-change realloc: FBO should become 1x1, got {got1:?}"
         );
     }
 }

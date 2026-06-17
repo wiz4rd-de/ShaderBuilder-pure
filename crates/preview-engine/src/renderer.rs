@@ -6,10 +6,13 @@
 //! ## Chain model (#22)
 //! Pass 0's `Source` is the input [`Frame`] (`Original`); pass `i`'s `Source` is
 //! pass `i-1`'s output texture. Intermediate passes render into **owned FBOs**
-//! sized by their scale type (§2); the **final pass renders into the
-//! viewport/pane** (the offscreen target, preserving the existing read-back /
-//! downsample path). FBO sizes are recomputed whenever the viewport or source
-//! size changes.
+//! sized by their scale type (§2). The **final pass** renders into the
+//! viewport/pane (the offscreen target) directly **when it has no explicit
+//! `scale`** (the `viewport × 1.0` default). When the final pass declares an
+//! explicit `scaleN`, it instead renders into its OWN scaled FBO (receiving
+//! `OutputSize == that FBO size`) and is then **stretched** (a fullscreen-quad
+//! blit with a linear sampler) into the viewport-sized offscreen target (§2/§10).
+//! FBO sizes are recomputed whenever the viewport or source size changes.
 //!
 //! ## Back-compat
 //! A single `.slang` shader still works as a degenerate 1-pass chain:
@@ -171,10 +174,15 @@ struct PassResources {
     target_format: wgpu::TextureFormat,
     /// Explicit scale config, or `None` to take the §2 position default.
     scale: Option<ScaleConfig>,
-    /// `true` for an **intermediate** pass (owns an FBO, sized by its scale);
-    /// `false` for the **final** pass, which renders into the shared offscreen
-    /// target and has no FBO of its own.
-    intermediate: bool,
+    /// `true` if this pass owns an FBO (sized by its scale) that it renders into:
+    /// every **intermediate** pass, plus a **final** pass that declares an
+    /// explicit `scale` (#22). A final pass with no explicit scale owns no FBO and
+    /// renders straight into the shared offscreen target.
+    owns_fbo: bool,
+    /// `true` only for a **final** pass that owns an FBO (explicit `scaleN`): after
+    /// it draws into its scaled FBO, the FBO is stretched (fullscreen-quad blit
+    /// with a linear sampler) into the viewport-sized offscreen target (#22 §2/§10).
+    final_owns_fbo: bool,
     /// `true` if a **downstream** consumer reads this pass's output with
     /// `mipmap_input` (#23): its FBO must carry a full mip chain that we
     /// regenerate each frame right after this pass draws (§10 mip timing).
@@ -222,6 +230,10 @@ pub struct Renderer {
     /// Lazily-built resources for mipmap generation (pipeline + sampler), shared
     /// across passes and formats keyed by target format.
     mip_gen: Option<MipGen>,
+    /// Lazily-built resources for the final-pass stretch blit (#22): used only
+    /// when the last pass declares an explicit `scale` and renders into its own
+    /// FBO that must then be stretched into the offscreen target.
+    blit: Option<Blit>,
 
     width: u32,
     height: u32,
@@ -263,6 +275,18 @@ struct MipGen {
     pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
     pipelines: std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+}
+
+/// Resources for the final-pass **stretch blit** (#22): a fullscreen-quad
+/// passthrough (reusing [`MIP_WGSL`], which samples its source at LOD 0) that
+/// reads a final pass's own scaled FBO and stretches it into the viewport-sized
+/// offscreen target with a **linear** sampler. The pipeline targets
+/// [`OFFSCREEN_FORMAT`] (the offscreen target's format), so a single cached
+/// pipeline suffices.
+struct Blit {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    pipeline: wgpu::RenderPipeline,
 }
 
 /// Fallback builtin-UBO size when a pass declares no builtin block (#28): one
@@ -372,6 +396,7 @@ impl Renderer {
             bind_group_layout,
             clamp_to_border_supported,
             mip_gen: None,
+            blit: None,
             width,
             height,
             offscreen,
@@ -560,14 +585,22 @@ impl Renderer {
     fn build_pass(&self, pass: &Pass, is_final: bool, produces_mips: bool) -> PassResources {
         let shader = &pass.shader;
 
-        // The format this pass writes: the final pass always writes the 8-bit
-        // read-back target (OFFSCREEN_FORMAT); an intermediate pass writes its
-        // selected per-pass format (§3). The pipeline's color target MUST match
-        // the FBO it renders into, so build the pipeline for this format.
-        let target_format = if is_final {
-            OFFSCREEN_FORMAT
-        } else {
+        // A final pass with an EXPLICIT scale owns its own FBO (sized by that
+        // scale) and is then stretched into the viewport-sized offscreen target
+        // (#22, §2/§10). A final pass with no explicit scale keeps the direct
+        // `viewport × 1.0` default: it renders straight into the offscreen target.
+        let final_owns_fbo = is_final && pass.scale.is_some();
+        let owns_fbo = !is_final || final_owns_fbo;
+
+        // The format this pass writes: a pass that owns an FBO (any intermediate,
+        // or a final pass with an explicit scale) writes its selected per-pass
+        // format (§3); a final pass with no FBO writes the 8-bit read-back target
+        // (OFFSCREEN_FORMAT). The pipeline's color target MUST match the FBO it
+        // renders into, so build the pipeline for this format.
+        let target_format = if owns_fbo {
             pass.fbo_format()
+        } else {
+            OFFSCREEN_FORMAT
         };
 
         // This pass's input sampler (binding 2): filter + wrap + mip per its
@@ -702,8 +735,8 @@ impl Renderer {
             sampler,
             target_format,
             scale: pass.scale,
-            // The final pass renders into the offscreen target (no own FBO).
-            intermediate: !is_final,
+            owns_fbo,
+            final_owns_fbo,
             produces_mips,
             consumes_input_mips: pass.mipmap_input,
             fbo: None,
@@ -824,12 +857,13 @@ impl Renderer {
         let source_size = self.source_size.unwrap_or((self.width, self.height));
         let viewport = (self.width, self.height);
 
-        // Pass 1: resolve + (re)allocate every intermediate FBO, tracking the
-        // running input size down the chain (§2: a `source` scale on pass n is
-        // relative to FBO n-1, not to Original).
+        // Pass 1: resolve + (re)allocate every owned FBO, tracking the running
+        // input size down the chain (§2: a `source` scale on pass n is relative to
+        // FBO n-1, not to Original). A final pass with an explicit scale also owns
+        // an FBO here (#22); it is later stretched into the offscreen target.
         let mut input_size = source_size;
         for res in &mut self.passes {
-            if res.intermediate {
+            if res.owns_fbo {
                 let scale = Self::intermediate_scale(res.scale);
                 let size = scale.resolve(input_size, viewport);
                 // An FBO read downstream with `mipmap_input` carries a full mip
@@ -858,7 +892,7 @@ impl Renderer {
                 }
                 input_size = size;
             } else {
-                // Final pass: output is the viewport.
+                // Final pass with no FBO: output is the viewport.
                 input_size = viewport;
             }
         }
@@ -919,10 +953,13 @@ impl Renderer {
         let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
 
         for res in &self.passes {
-            // After `rebuild_chain`, an intermediate pass always has its FBO.
-            let output_size = match (res.intermediate, &res.fbo) {
-                (true, Some(fbo)) => fbo.size,
-                _ => viewport,
+            // A pass that owns an FBO (any intermediate, or a final pass with an
+            // explicit scale — #22) sees its FBO size as OutputSize; a final pass
+            // with no FBO sees the viewport. After `rebuild_chain`, an owning pass
+            // always has its FBO.
+            let output_size = match &res.fbo {
+                Some(fbo) => fbo.size,
+                None => viewport,
             };
 
             // No builtin block declared -> nothing to pack (the fallback vec4 UBO
@@ -1003,6 +1040,14 @@ impl Renderer {
             self.ensure_mip_gen(&mip_formats);
         }
 
+        // A final pass with an explicit scale renders into its own FBO and is then
+        // stretched into the offscreen target (#22): build the blit resources up
+        // front so the per-pass loop can borrow them immutably alongside `passes`.
+        let final_owns_fbo = self.passes.last().is_some_and(|p| p.final_owns_fbo);
+        if final_owns_fbo {
+            self.ensure_blit();
+        }
+
         let offscreen_view = self
             .offscreen
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1068,6 +1113,18 @@ impl Renderer {
                         .as_ref()
                         .expect("mip_gen built when any pass produces mips");
                     generate_mips(&self.device, &mut encoder, mip_gen, fbo);
+                }
+            }
+            // #22: a final pass with an explicit scale drew into its own scaled
+            // FBO; stretch it into the viewport-sized offscreen target with a
+            // linear sampler so the read-back is the resampled result.
+            if res.final_owns_fbo {
+                if let Some(fbo) = &res.fbo {
+                    let blit = self
+                        .blit
+                        .as_ref()
+                        .expect("blit built when a final pass owns an FBO");
+                    blit_to_offscreen(&self.device, &mut encoder, blit, fbo, &offscreen_view);
                 }
             }
         }
@@ -1167,6 +1224,93 @@ impl Renderer {
                     })
             });
         }
+    }
+
+    /// Lazily create the final-pass stretch-blit resources (#22): a passthrough
+    /// pipeline (reusing [`MIP_WGSL`]) targeting [`OFFSCREEN_FORMAT`] plus a linear
+    /// sampler, so a final pass's scaled FBO can be stretched into the offscreen
+    /// target. A no-op after the first call.
+    fn ensure_blit(&mut self) {
+        if self.blit.is_some() {
+            return;
+        }
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blit shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(MIP_WGSL)),
+            });
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("blit pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: OFFSCREEN_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        self.blit = Some(Blit {
+            layout,
+            sampler,
+            pipeline,
+        });
     }
 
     /// Frames rendered so far (the next `render` writes this as `FrameCount`).
@@ -1371,6 +1515,52 @@ fn generate_mips(
         rp.set_bind_group(0, &bind_group, &[]);
         rp.draw(0..3, 0..1);
     }
+}
+
+/// Stretch a final pass's scaled FBO into the viewport-sized offscreen target
+/// (#22): a fullscreen-quad passthrough samples `fbo` (its full `view`, mip 0)
+/// with a **linear** sampler and writes the offscreen target, so a final pass
+/// declaring an explicit `scaleN` is resampled to the viewport before read-back.
+fn blit_to_offscreen(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    blit: &Blit,
+    fbo: &Fbo,
+    offscreen_view: &wgpu::TextureView,
+) {
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit bind group"),
+        layout: &blit.layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&fbo.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&blit.sampler),
+            },
+        ],
+    });
+    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("final stretch blit"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: offscreen_view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    rp.set_pipeline(&blit.pipeline);
+    rp.set_bind_group(0, &bind_group, &[]);
+    rp.draw(0..3, 0..1);
 }
 
 fn create_offscreen(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
