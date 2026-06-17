@@ -403,16 +403,24 @@ pub struct RoundTrip {
     /// surfaced for the corpus harness to report as a documented exclusion rather
     /// than a silent byte loss.
     pub non_utf8_passes: Vec<usize>,
+    /// FINDING A2 — fields the **source** `.slangp` carried that import could drop
+    /// *before* either side of [`compare_projects`] sees them (so a first-import vs
+    /// re-import diff would be falsely empty). One readable line per source field
+    /// (a `parameter_overrides` value, the `feedback_pass`, or a `luts` name) that
+    /// is NOT reflected after the round trip. Empty when the source survived.
+    pub source_loss: Vec<String>,
 }
 
 impl RoundTrip {
-    /// Whether the round trip preserved both structure (the diff) AND the
-    /// per-pass `.slang` bytes — the full lossless verdict. A non-UTF-8 original
-    /// (which the `String` model cannot hold) makes this `false`; check
-    /// [`Self::non_utf8_passes`] to distinguish that intrinsic limitation from a
-    /// genuine byte-loss bug.
+    /// Whether the round trip preserved structure (the diff), the per-pass `.slang`
+    /// bytes, AND every salient field the SOURCE preset carried (FINDING A2) — the
+    /// full lossless verdict. A non-UTF-8 original (which the `String` model cannot
+    /// hold) makes this `false`; check [`Self::non_utf8_passes`] to distinguish
+    /// that intrinsic limitation from a genuine byte-loss bug.
     pub fn is_lossless(&self) -> bool {
-        self.diff.is_lossless() && self.pass_bytes_identical.iter().all(|&b| b)
+        self.diff.is_lossless()
+            && self.pass_bytes_identical.iter().all(|&b| b)
+            && self.source_loss.is_empty()
     }
 
     /// Whether every byte mismatch is attributable to a non-UTF-8 original (so the
@@ -421,6 +429,7 @@ impl RoundTrip {
     /// documented exclusion rather than a failure.
     pub fn only_non_utf8_loss(&self) -> bool {
         self.diff.is_lossless()
+            && self.source_loss.is_empty()
             && self
                 .pass_bytes_identical
                 .iter()
@@ -450,6 +459,18 @@ impl RoundTrip {
                  cannot round-trip those bytes)\n",
                 self.non_utf8_passes
             ));
+        }
+        if !self.source_loss.is_empty() {
+            out.push_str(&format!(
+                "{} source field(s) were dropped on IMPORT (absent in both \
+                 first & re-import, so the structural diff is blind to them):\n",
+                self.source_loss.len()
+            ));
+            for m in &self.source_loss {
+                out.push_str("  - ");
+                out.push_str(m);
+                out.push('\n');
+            }
         }
         out
     }
@@ -492,13 +513,7 @@ pub fn round_trip(slangp: &Path, work_dir: &Path) -> Result<RoundTrip, RoundTrip
                 non_utf8_passes.push(i);
             }
         }
-        pass_bytes_identical.push(match (original, exported) {
-            (Some(o), Some(e)) => o == e,
-            // A missing original (unreadable shader) can't be byte-compared; the
-            // import already surfaced a warning + empty source, so treat the
-            // empty-export round trip as identical rather than a false failure.
-            _ => true,
-        });
+        pass_bytes_identical.push(pass_bytes_match(original.as_deref(), exported.as_deref()));
     }
 
     // 4. Re-import the exported bundle.
@@ -507,13 +522,107 @@ pub fn round_trip(slangp: &Path, work_dir: &Path) -> Result<RoundTrip, RoundTrip
 
     let diff = compare_projects(&first, &second);
 
+    // 5. FINDING A2: also compare against the SOURCE preset. `compare_projects`
+    //    only sees first-import vs re-import, so any field IMPORT drops is absent
+    //    on BOTH sides and the diff is falsely empty. The exported preset text is
+    //    read so a value re-emitted as a bare `id = value` (rather than landing in
+    //    `second.parameters`) still counts as reflected.
+    let exported_text = std::fs::read_to_string(work_dir.join(PRESET_FILENAME)).unwrap_or_default();
+    let source_loss = compare_against_source(&preset, &second, &exported_text);
+
     Ok(RoundTrip {
         first,
         second,
         diff,
         pass_bytes_identical,
         non_utf8_passes,
+        source_loss,
     })
+}
+
+/// FINDING A2 — verify that every salient field the **source** `.slangp` carried
+/// is reflected after the round trip, catching loss that happens at IMPORT (before
+/// either side of [`compare_projects`] sees it). Checks:
+///
+/// * every float-valued `parameter_overrides` id is reflected — either as the
+///   overridden value in `second.parameters`, or re-emitted as a bare
+///   `id = value` line in the exported preset text;
+/// * `feedback_pass` (a non-negative source value) survives in `second`;
+/// * every `luts` name survives in `second`.
+///
+/// Returns one readable line per dropped source field; empty when all survived.
+fn compare_against_source(
+    source: &preset_io::Preset,
+    second: &Project,
+    exported_text: &str,
+) -> Vec<String> {
+    let mut loss = Vec::new();
+
+    // Parameter overrides: the tuned value must be reflected after the round trip.
+    let by_id: BTreeMap<&str, &Parameter> = second
+        .parameters
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+    for (id, &value) in &source.parameter_overrides {
+        let in_params = by_id
+            .get(id.as_str())
+            .is_some_and(|p| p.default.to_bits() == value.to_bits());
+        // Re-emitted verbatim as a bare `id = value` line (the export's inline
+        // override path) also counts as reflected.
+        let in_text = exported_text.lines().any(|line| {
+            line.split_once('=')
+                .map(|(k, v)| k.trim() == id && v.trim().parse::<f32>().ok() == Some(value))
+                .unwrap_or(false)
+        });
+        if !in_params && !in_text {
+            loss.push(format!(
+                "parameter override `{id} = {value}` was dropped on import \
+                 (not in re-imported parameters nor the exported preset text)"
+            ));
+        }
+    }
+
+    // feedback_pass: a non-negative source value must survive.
+    if let Some(fp) = source.feedback_pass {
+        if fp >= 0 && second.feedback_pass != Some(fp as u32) {
+            loss.push(format!(
+                "feedback_pass {fp} was not reflected after round trip (got {:?})",
+                second.feedback_pass
+            ));
+        }
+    }
+
+    // Every source LUT name must survive into the re-imported project.
+    let reimported_luts: std::collections::BTreeSet<&str> =
+        second.luts.iter().map(|l| l.name.as_str()).collect();
+    for lut in &source.luts {
+        if !reimported_luts.contains(lut.name.as_str()) {
+            loss.push(format!(
+                "LUT `{}` (in source preset) is missing after round trip",
+                lut.name
+            ));
+        }
+    }
+
+    loss
+}
+
+/// Whether a pass's exported `.slang` bytes match its original (#34/#36). FINDING
+/// A3: the arms must be split so a present original with a MISSING export is a
+/// failure, not silently treated as identical:
+///
+/// * `(None, _)` — a missing/unreadable **original** can't be byte-compared; the
+///   import already surfaced a warning + empty source, so this is *not* a failure.
+/// * `(Some(_), None)` — a present original but a missing/unreadable **export** is
+///   a real failure (the writer dropped or could not write the file).
+/// * `(Some(o), Some(e))` — both present: compare bytes.
+fn pass_bytes_match(original: Option<&[u8]>, exported: Option<&[u8]>) -> bool {
+    match (original, exported) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(o), Some(e)) => o == e,
+    }
 }
 
 #[cfg(test)]
@@ -733,5 +842,141 @@ mod tests {
             "{}",
             diff.report()
         );
+    }
+
+    // ---- FINDING A3: byte-identity arm split --------------------------------
+
+    #[test]
+    fn pass_bytes_match_splits_missing_export_from_missing_original() {
+        // A missing/unreadable ORIGINAL is tolerated (import warned + empty source).
+        assert!(pass_bytes_match(None, None));
+        assert!(pass_bytes_match(None, Some(b"anything")));
+        // Equal bytes match; differing bytes don't.
+        assert!(pass_bytes_match(Some(b"abc"), Some(b"abc")));
+        assert!(!pass_bytes_match(Some(b"abc"), Some(b"abd")));
+        // A present original but a MISSING export is a FAILURE (the writer dropped
+        // the file) — it must NOT be swallowed as identical. This is the bug arm.
+        assert!(
+            !pass_bytes_match(Some(b"present"), None),
+            "a present original with a missing export must be a failure, not 'identical'"
+        );
+    }
+
+    // ---- FINDING A2: oracle sees import-side loss ---------------------------
+
+    fn parse_source(text: &str) -> preset_io::Preset {
+        preset_io::parse_slangp_str(text, Path::new("/p")).expect("source preset parses")
+    }
+
+    #[test]
+    fn source_compare_flags_a_dropped_override() {
+        // If an override id is reflected NEITHER in the re-imported parameters NOR
+        // in the exported preset text, compare_against_source must flag it — this
+        // is exactly the loss FINDING A1 had that the first-vs-re-import diff was
+        // blind to.
+        let source = parse_source("shaders = 1\nshader0 = a.slang\nHEADER_KNOB = 0.625\n");
+        // A `second` project that DROPPED the override (no such parameter) and an
+        // exported text that never re-emitted it.
+        let second = one_pass_project(); // has no HEADER_KNOB parameter
+        let loss = compare_against_source(&source, &second, "shaders = 1\nshader0 = a.slang\n");
+        assert!(
+            loss.iter()
+                .any(|m| m.contains("HEADER_KNOB") && m.contains("dropped on import")),
+            "dropped override must be flagged: {loss:?}"
+        );
+    }
+
+    #[test]
+    fn source_compare_accepts_override_reflected_in_params_or_text() {
+        let source = parse_source("shaders = 1\nshader0 = a.slang\nHEADER_KNOB = 0.625\n");
+        // (a) reflected as a re-imported parameter carrying the value.
+        let mut second = one_pass_project();
+        second.parameters.push(Parameter {
+            name: "HEADER_KNOB".to_owned(),
+            label: "HEADER_KNOB".to_owned(),
+            default: 0.625,
+            min: 0.625,
+            max: 0.625,
+            step: 0.0,
+        });
+        assert!(
+            compare_against_source(&source, &second, "shaders = 1\n").is_empty(),
+            "override reflected in re-imported parameters is not a loss"
+        );
+        // (b) reflected only as a bare `id = value` line in the exported text.
+        let plain = one_pass_project();
+        assert!(
+            compare_against_source(
+                &source,
+                &plain,
+                "shaders = 1\nshader0 = a.slang\nHEADER_KNOB = 0.625\n"
+            )
+            .is_empty(),
+            "override re-emitted in the exported text is not a loss"
+        );
+    }
+
+    #[test]
+    fn source_compare_flags_dropped_feedback_pass_and_lut() {
+        let source = parse_source(
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             feedback_pass = 0\n\
+             textures = PAL\n\
+             PAL = pal.png\n",
+        );
+        // `second` lost the feedback pass and the LUT.
+        let mut second = one_pass_project();
+        second.feedback_pass = None;
+        second.luts.clear();
+        let loss = compare_against_source(&source, &second, "shaders = 1\n");
+        assert!(
+            loss.iter().any(|m| m.contains("feedback_pass")),
+            "dropped feedback_pass flagged: {loss:?}"
+        );
+        assert!(
+            loss.iter().any(|m| m.contains("PAL")),
+            "dropped LUT flagged: {loss:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_override_round_trips_through_full_harness() {
+        // End-to-end A1+A2: a preset whose pass body declares NO pragma for the
+        // overridden id (it would live in an #include) round-trips losslessly now,
+        // and the strengthened oracle confirms the source value survived.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.slang"),
+            "#version 450\n#include \"knobs.inc\"\nvoid main(){}\n",
+        )
+        .unwrap();
+        let slangp = dir.path().join("orphan.slangp");
+        std::fs::write(
+            &slangp,
+            "shaders = 1\nshader0 = a.slang\nHEADER_KNOB = 0.625\n",
+        )
+        .unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let rt = round_trip(&slangp, work.path()).expect("round trip");
+        assert!(
+            rt.is_lossless(),
+            "orphan override must round-trip losslessly:\n{}",
+            rt.report()
+        );
+        assert!(
+            rt.source_loss.is_empty(),
+            "no source loss: {:?}",
+            rt.source_loss
+        );
+        // The value is reflected in the re-imported parameters.
+        let knob = rt
+            .second
+            .parameters
+            .iter()
+            .find(|p| p.name == "HEADER_KNOB")
+            .expect("orphan override preserved as a parameter after round trip");
+        assert_eq!(knob.default, 0.625);
     }
 }
