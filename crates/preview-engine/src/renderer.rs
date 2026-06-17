@@ -276,6 +276,15 @@ struct Fbo {
     mip_level_count: u32,
 }
 
+/// One stored past `Original` frame for the history ring (#25, §5): a GPU copy of
+/// a source frame, sampled as `OriginalHistoryK`. The `view` keeps its backing
+/// texture alive (wgpu views hold an internal reference), so the texture handle
+/// need not be stored separately.
+struct HistoryFrame {
+    view: wgpu::TextureView,
+    size: (u32, u32),
+}
+
 /// A headless N-pass renderer.
 pub struct Renderer {
     device: wgpu::Device,
@@ -335,6 +344,16 @@ pub struct Renderer {
     /// by `set_chain`; mutated by [`Renderer::set_parameter`] (no recompile — the
     /// next frame just re-packs + re-uploads the param UBOs).
     params: ParamStore,
+
+    /// Frame history ring (#25, §5): past `Original` frames, front = newest
+    /// (`OriginalHistory1`), back = oldest. Bounded by [`Renderer::history_depth`].
+    /// Advanced one frame by [`Renderer::advance_source`]; cleared by
+    /// [`Renderer::reset_history`] (which `set_source` and `set_chain` call).
+    history: std::collections::VecDeque<HistoryFrame>,
+    /// Required history depth: the deepest `OriginalHistoryK` index the chain
+    /// references (#25). `0` when no pass reads history; the ring keeps at most this
+    /// many past frames. Recomputed by `set_chain`.
+    history_depth: usize,
 }
 
 /// Resources for the per-frame mipmap-downsample blit (#23): the shader module,
@@ -459,6 +478,8 @@ impl Renderer {
             source_rgba: None,
             passes: Vec::new(),
             params: ParamStore::default(),
+            history: std::collections::VecDeque::new(),
+            history_depth: 0,
         })
     }
 
@@ -490,14 +511,100 @@ impl Renderer {
     /// reproduces the uploaded image byte-for-byte.
     const SOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-    /// Upload a source image. The raw RGBA is retained so the source texture can
-    /// later be reallocated with a mip chain when pass 0 declares `mipmap_input`
-    /// (#23/F). The texture starts single-level; [`Renderer::ensure_source_mips`]
-    /// upgrades it on the next render if pass 0 needs mips.
+    /// Load (or reload / seek to) a source image (§5 reload semantics): make
+    /// `frame` the current `Original` and **reset the history ring** — a freshly
+    /// loaded or seeked source has no past frames. Use [`Renderer::advance_source`]
+    /// to step to the next frame of a sequence while preserving history.
+    ///
+    /// The raw RGBA is retained so the source texture can later be reallocated with
+    /// a mip chain when pass 0 declares `mipmap_input` (#23/F). The texture starts
+    /// single-level; [`Renderer::ensure_source_mips`] upgrades it on the next
+    /// render if pass 0 needs mips.
     pub fn set_source(&mut self, frame: &Frame) {
+        self.reset_history();
+        self.set_current_source(frame);
+    }
+
+    /// Advance to the next source frame (#25, §5): push the CURRENT `Original` into
+    /// the front of the history ring (so it becomes `OriginalHistory1` next frame),
+    /// then make `frame` the new current `Original`. The source pump (#31) calls
+    /// this once per source frame; a sequence of calls builds the history ring.
+    /// The push is a no-op when there is no current source yet (the first frame) or
+    /// the chain references no history.
+    pub fn advance_source(&mut self, frame: &Frame) {
+        self.push_history();
+        self.set_current_source(frame);
+    }
+
+    /// Set the current `Original` (the shared body of [`Renderer::set_source`] /
+    /// [`Renderer::advance_source`]) without touching the history ring.
+    fn set_current_source(&mut self, frame: &Frame) {
         self.source_size = Some((frame.width, frame.height));
         self.source_rgba = Some(frame.rgba.clone());
         self.source = Some(self.build_source((frame.width, frame.height), &frame.rgba, 1));
+    }
+
+    /// Push the current `Original` to the front of the history ring (#25, §5),
+    /// dropping the oldest entries beyond [`Renderer::history_depth`]. A no-op when
+    /// no history is referenced or no source is set yet.
+    fn push_history(&mut self) {
+        if self.history_depth == 0 {
+            return;
+        }
+        let (Some(size), Some(rgba)) = (self.source_size, self.source_rgba.clone()) else {
+            return;
+        };
+        let frame = self.build_history_frame(size, &rgba);
+        self.history.push_front(frame);
+        while self.history.len() > self.history_depth {
+            self.history.pop_back();
+        }
+    }
+
+    /// Clear the history ring (#25, §5): called on a fresh source load / seek
+    /// ([`Renderer::set_source`]) and on a pipeline rebuild ([`Renderer::set_chain`]),
+    /// so the next frame's `OriginalHistoryK` reads cold black until the ring
+    /// refills.
+    pub fn reset_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Build a single history-ring frame (#25): a source-sized, single-level
+    /// `SOURCE_FORMAT` texture with `rgba` uploaded into it, sampled as
+    /// `OriginalHistoryK`.
+    fn build_history_frame(&self, size: (u32, u32), rgba: &[u8]) -> HistoryFrame {
+        let extent = wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("OriginalHistory frame"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::SOURCE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 4),
+                rows_per_image: Some(size.1),
+            },
+            extent,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        HistoryFrame { view, size }
     }
 
     /// Build the source texture as an [`Fbo`] of `size` with `mip_level_count`
@@ -647,6 +754,21 @@ impl Renderer {
                 });
             }
         }
+
+        // ---- History depth (#25, §5) ----
+        // The ring must hold as many past `Original` frames as the deepest
+        // `OriginalHistoryK` any pass references (`OriginalHistory0` ≡ `Original`,
+        // resolved live, so it doesn't count). A pipeline rebuild resets the ring.
+        let mut history_depth = 0usize;
+        for res in &self.passes {
+            for slot in &res.texture_slots {
+                if let TextureClass::OriginalHistory(k) = &slot.class {
+                    history_depth = history_depth.max(*k);
+                }
+            }
+        }
+        self.history_depth = history_depth;
+        self.reset_history();
 
         // Collect the chain's parameters (global by name, deduped — §8), seeded
         // to each `#pragma parameter` default. Aliases come from each pass's
@@ -1253,9 +1375,22 @@ impl Renderer {
                 .copied()
                 .and_then(|n| self.feedback_resource(n))
                 .unwrap_or_else(|| self.placeholder_resource()),
-            // Deferred resources (#25 history / #27 LUTs): the resolver hook
-            // returns a placeholder black view today. Sampled with the source
-            // sampler.
+            // History (#25, §5): `OriginalHistoryK` = the source frame K frames
+            // ago. `History1` = the ring's front (newest past frame), `HistoryK` =
+            // ring index `K-1`. Before K source frames have elapsed the slot is
+            // absent → cold black placeholder (§5 cold start). An `Original`
+            // (produced by "pass -1"), so sampled with the source sampler.
+            TextureClass::OriginalHistory(k) => self
+                .history
+                .get(k.saturating_sub(1))
+                .map(|h| {
+                    let r: (&wgpu::TextureView, &wgpu::Sampler) =
+                        (&h.view, self.sampler_after_source());
+                    r
+                })
+                .unwrap_or_else(|| self.placeholder_resource()),
+            // Deferred resources (#27 LUTs): the resolver hook returns a
+            // placeholder black view today. Sampled with the source sampler.
             other => {
                 let view = self
                     .resolver
@@ -1334,6 +1469,16 @@ impl Renderer {
             .iter()
             .filter_map(|(name, &idx)| all_output_sizes.get(idx).map(|v| (name.clone(), *v)))
             .collect();
+        // History sizes (#25, §5): slot `k-1` backs `OriginalHistoryKSize`. A cold
+        // (not-yet-filled) slot reports the current source size — RetroArch
+        // pre-allocates the ring to the input size, so `1/w`/`1/h` never divide by
+        // zero before the ring warms up.
+        let original_history_sizes: Vec<[f32; 4]> = (0..self.history_depth)
+            .map(|i| {
+                let (w, h) = self.history.get(i).map(|h| h.size).unwrap_or(original);
+                uniforms::size_vec(w, h)
+            })
+            .collect();
         // Earlier passes' output sizes, grown as we walk the chain so pass i sees
         // passes 0..i (causal — §7).
         let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
@@ -1381,6 +1526,7 @@ impl Renderer {
                     alias_sizes: alias_sizes.clone(),
                     pass_feedback_sizes: all_output_sizes.clone(),
                     alias_feedback_sizes: alias_feedback_sizes.clone(),
+                    original_history_sizes: original_history_sizes.clone(),
                 };
                 let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);

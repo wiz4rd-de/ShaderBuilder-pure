@@ -408,6 +408,11 @@ pub struct BuiltinValues {
     /// aliased `FOO`. Same dimensions as `alias_sizes["FOO"]`, but populated for
     /// all aliased feedback targets regardless of causal order.
     pub alias_feedback_sizes: std::collections::HashMap<String, [f32; 4]>,
+    /// History-frame sizes (#25, §5): `original_history_sizes[k-1]` backs
+    /// `OriginalHistoryKSize` (K≥1). A cold slot reports the current source size
+    /// (the ring is pre-allocated to the input size), so reciprocals are safe.
+    /// `OriginalHistory0Size` ≡ `OriginalSize` and is served from `original_size`.
+    pub original_history_sizes: Vec<[f32; 4]>,
 }
 
 impl Default for BuiltinValues {
@@ -425,6 +430,7 @@ impl Default for BuiltinValues {
             alias_sizes: std::collections::HashMap::new(),
             pass_feedback_sizes: Vec::new(),
             alias_feedback_sizes: std::collections::HashMap::new(),
+            original_history_sizes: Vec::new(),
         }
     }
 }
@@ -474,6 +480,15 @@ impl BuiltinValues {
                 if let Some(idx) = parse_pass_feedback_size_index(name) {
                     return self.pass_feedback_sizes.get(idx).and_then(vec4);
                 }
+                // `OriginalHistoryKSize` (#25, §5) — the size of the source frame K
+                // frames ago. `OriginalHistory0Size` ≡ `OriginalSize`; `K≥1` reads
+                // ring slot `K-1`.
+                if let Some(k) = parse_history_size_index(name) {
+                    return match k {
+                        0 => vec4(&self.original_size),
+                        _ => self.original_history_sizes.get(k - 1).and_then(vec4),
+                    };
+                }
                 // `PassOutputKSize` (and the `PassKSize` alias) — pass K's output
                 // size, K < this pass (causal). Anything else is unknown here.
                 let idx = parse_pass_size_index(name)?;
@@ -504,6 +519,17 @@ fn parse_pass_size_index(name: &str) -> Option<usize> {
 /// which deliberately rejects the `Feedback` spelling.
 fn parse_pass_feedback_size_index(name: &str) -> Option<usize> {
     let digits = name.strip_prefix("PassFeedback")?.strip_suffix("Size")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Parse an `OriginalHistoryKSize` semantic name into its depth `K` (#25, §5),
+/// accepting `K = 0` (which the caller maps to `OriginalSize`). Returns `None`
+/// for any other name.
+fn parse_history_size_index(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix("OriginalHistory")?.strip_suffix("Size")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -566,7 +592,8 @@ fn is_builtin_semantic(name: &str) -> bool {
             | "Rotation"
     ) || (name.ends_with("Size")
         && (parse_pass_size_index(name).is_some()
-            || parse_pass_feedback_size_index(name).is_some()))
+            || parse_pass_feedback_size_index(name).is_some()
+            || parse_history_size_index(name).is_some()))
 }
 
 /// Apply a pass's `frame_count_mod` to the raw frame counter, per §6:

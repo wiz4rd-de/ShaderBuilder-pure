@@ -39,8 +39,8 @@
 //! | `Original`          | renderer    | the source image (any pass) |
 //! | `PassOutputN`/`PassN` | renderer  | pass `N`'s output FBO (causal: `N < i`) |
 //! | `<alias>`           | renderer    | the output of the pass whose preset `aliasN == <alias>` |
-//! | `PassFeedbackN`/`<alias>Feedback` | resolver | **placeholder** (→ #24) |
-//! | `OriginalHistoryN`  | resolver    | **placeholder** (→ #25) |
+//! | `PassFeedbackN`/`<alias>Feedback` | renderer | the pass's feedback twin (#24) |
+//! | `OriginalHistoryN`  | renderer    | the history ring's `N`-frames-ago slot (#25) |
 //! | LUT `<NAME>`/`UserN`| resolver    | **placeholder** (→ #27) |
 //!
 //! Sampler attribution (§3/§7, libretro/RetroArch#14437): a texture produced by
@@ -133,17 +133,12 @@ impl TextureClass {
         TextureClass::Lut(name.to_string())
     }
 
-    /// Whether the renderer resolves this class itself from resources that exist
-    /// today (`Source`/`Original`/`PassOutputN`/`<alias>`). The complementary
-    /// classes (`false`) route to the [`TextureResolver`] hook.
+    /// Whether the renderer resolves this class itself from resources it owns
+    /// (`Source`/`Original`/`PassOutputN`/`<alias>`, plus feedback twins (#24) and
+    /// the history ring (#25)). Only LUTs (#27) still route to the
+    /// [`TextureResolver`] hook, so this is "everything but a LUT".
     pub fn is_resolved_by_renderer(&self) -> bool {
-        matches!(
-            self,
-            TextureClass::Source
-                | TextureClass::Original
-                | TextureClass::PassOutput(_)
-                | TextureClass::Alias(_)
-        )
+        !matches!(self, TextureClass::Lut(_))
     }
 }
 
@@ -418,9 +413,11 @@ mod tests {
         assert!(TextureClass::Original.is_resolved_by_renderer());
         assert!(TextureClass::PassOutput(0).is_resolved_by_renderer());
         assert!(TextureClass::Alias("X".into()).is_resolved_by_renderer());
-        // Deferred classes route to the resolver hook.
-        assert!(!TextureClass::PassFeedback(0).is_resolved_by_renderer());
-        assert!(!TextureClass::OriginalHistory(1).is_resolved_by_renderer());
+        // Feedback (#24) and history (#25) are now renderer-resolved too.
+        assert!(TextureClass::PassFeedback(0).is_resolved_by_renderer());
+        assert!(TextureClass::AliasFeedback("X".into()).is_resolved_by_renderer());
+        assert!(TextureClass::OriginalHistory(1).is_resolved_by_renderer());
+        // Only LUTs (#27) still route to the resolver hook.
         assert!(!TextureClass::Lut("BORDER".into()).is_resolved_by_renderer());
     }
 

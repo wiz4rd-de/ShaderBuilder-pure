@@ -2083,3 +2083,197 @@ mod feedback_size_tests {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod history_tests {
+    //! Frame history ring tests (#25, §5): `OriginalHistoryK` samples the source
+    //! frame K frames ago. A numbered sequence proves `History1/2/3` hold frames
+    //! N-1/N-2/N-3; warm-up reads cold black; reload / rebuild reset the ring.
+    use super::{Pass, Renderer};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    // A single pass sampling OriginalHistory1/2/3 into output R/G/B, so one
+    // read-back decodes which past frame each slot holds. One shared sampler.
+    const SHADER: &str = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {
+    mat4 MVP;
+    vec4 SourceSize;
+    vec4 OriginalSize;
+    vec4 OutputSize;
+    uint FrameCount;
+} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D OriginalHistory1;
+layout(set = 0, binding = 2) uniform sampler Smp;
+layout(set = 0, binding = 3) uniform texture2D OriginalHistory2;
+layout(set = 0, binding = 4) uniform texture2D OriginalHistory3;
+void main() {
+    FragColor = vec4(
+        texture(sampler2D(OriginalHistory1, Smp), vTexCoord).r,
+        texture(sampler2D(OriginalHistory2, Smp), vTexCoord).r,
+        texture(sampler2D(OriginalHistory3, Smp), vTexCoord).r,
+        1.0);
+}
+";
+
+    fn history_shader() -> CompiledShader {
+        compile_slang(SHADER, None).expect("compile history fixture")
+    }
+
+    fn solid(width: u32, height: u32, r: u8) -> Frame {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&[r, 0, 0, 255]);
+        }
+        Frame::new(width, height, data)
+    }
+
+    fn center(f: &Frame) -> [u8; 3] {
+        let i = (((f.height / 2) * f.width + f.width / 2) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2]]
+    }
+
+    fn close(got: [u8; 3], want: [u8; 3]) -> bool {
+        got.iter()
+            .zip(want)
+            .all(|(g, w)| (*g as i32 - w as i32).abs() <= 3)
+    }
+
+    #[test]
+    fn history_1_2_3_sample_frames_n_minus_1_2_3() {
+        // Frames f0..f3 with R = 200,150,100,50 (oldest..newest). After advancing
+        // through all four (current Original = f3), the ring holds f2,f1,f0, so
+        // History1=f2(100), History2=f1(150), History3=f0(200).
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&solid(4, 4, 200)); // f0
+        r.set_chain(&[Pass::new(history_shader())])
+            .expect("set chain");
+        r.advance_source(&solid(4, 4, 150)); // f1: ring {f0}
+        r.advance_source(&solid(4, 4, 100)); // f2: ring {f1,f0}
+        r.advance_source(&solid(4, 4, 50)); // f3: ring {f2,f1,f0}
+        r.render().expect("render");
+        let got = center(&r.read_back().expect("read back"));
+        assert!(
+            close(got, [100, 150, 200]),
+            "History1/2/3 must hold f2/f1/f0 (R 100/150/200), got {got:?}"
+        );
+    }
+
+    #[test]
+    fn warmup_reads_cold_black_until_the_ring_fills() {
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&solid(4, 4, 200)); // f0
+        r.set_chain(&[Pass::new(history_shader())])
+            .expect("set chain");
+
+        // Frame 0: ring empty → all three history slots cold black.
+        r.render().expect("render");
+        assert!(
+            close(center(&r.read_back().expect("read back")), [0, 0, 0]),
+            "cold start: History1/2/3 must all read black"
+        );
+
+        // After one advance: History1 = f0 (200), History2/3 still cold (0).
+        r.advance_source(&solid(4, 4, 150)); // f1: ring {f0}
+        r.render().expect("render");
+        let got = center(&r.read_back().expect("read back"));
+        assert!(
+            close(got, [200, 0, 0]),
+            "warm-up: only History1 (=f0, R200) populated, rest cold; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn reload_and_rebuild_reset_the_ring() {
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&solid(4, 4, 200));
+        r.set_chain(&[Pass::new(history_shader())])
+            .expect("set chain");
+        for v in [150u8, 100, 50] {
+            r.advance_source(&solid(4, 4, v));
+        }
+        r.render().expect("render");
+        assert!(
+            !close(center(&r.read_back().expect("read")), [0, 0, 0]),
+            "ring filled"
+        );
+
+        // Reload (set_source) resets history → cold black again.
+        r.set_source(&solid(4, 4, 200));
+        r.render().expect("render");
+        assert!(
+            close(center(&r.read_back().expect("read")), [0, 0, 0]),
+            "set_source (reload/seek) must reset the history ring"
+        );
+
+        // Refill, then a pipeline rebuild (set_chain) must also reset it.
+        for v in [150u8, 100, 50] {
+            r.advance_source(&solid(4, 4, v));
+        }
+        r.set_chain(&[Pass::new(history_shader())])
+            .expect("rebuild");
+        r.render().expect("render");
+        assert!(
+            close(center(&r.read_back().expect("read")), [0, 0, 0]),
+            "set_chain (pipeline rebuild) must reset the history ring"
+        );
+    }
+
+    #[test]
+    fn history_does_not_advance_on_repeated_render() {
+        // Rendering the same source many times must NOT advance history (it is per
+        // SOURCE frame, not per render): History1 stays cold until advance_source.
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&solid(4, 4, 200));
+        r.set_chain(&[Pass::new(history_shader())])
+            .expect("set chain");
+        for _ in 0..5 {
+            r.render().expect("render");
+        }
+        assert!(
+            close(center(&r.read_back().expect("read")), [0, 0, 0]),
+            "repeated render must not fill history (advance is per source frame)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_size_tests {
+    //! `OriginalHistoryKSize` builtin semantics (#25, §5).
+    use crate::uniforms::{size_vec, BuiltinValues};
+
+    fn bytes(w: u32, h: u32) -> Vec<u8> {
+        size_vec(w, h)
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn history_size_resolves_per_slot_and_zero_is_original() {
+        let v = BuiltinValues {
+            original_size: size_vec(320, 240),
+            original_history_sizes: vec![size_vec(64, 48), size_vec(32, 24)],
+            ..Default::default()
+        };
+        // History0Size ≡ OriginalSize.
+        assert_eq!(
+            v.member_bytes("OriginalHistory0Size"),
+            Some(bytes(320, 240))
+        );
+        // History1/2 → ring slots 0/1.
+        assert_eq!(v.member_bytes("OriginalHistory1Size"), Some(bytes(64, 48)));
+        assert_eq!(v.member_bytes("OriginalHistory2Size"), Some(bytes(32, 24)));
+        // Past the populated depth → None (member stays zero).
+        assert_eq!(v.member_bytes("OriginalHistory5Size"), None);
+    }
+}
