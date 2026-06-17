@@ -46,6 +46,7 @@ pub fn run() {
             preview::load_shader,
             preview::load_preset,
             preview::set_viewport,
+            preview::set_parameter,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");

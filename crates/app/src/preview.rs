@@ -182,7 +182,29 @@ pub fn load_shader(
 pub fn load_preset(state: State<'_, PreviewState>, preset_path: String) -> Result<(), String> {
     let preset = preset_io::parse_slangp(&preset_path).map_err(|e| e.to_string())?;
     let passes = compile_preset_chain(&preset)?;
-    state.send(RenderCommand::SetChain(passes))
+    state.send(RenderCommand::SetChain(passes))?;
+    // Apply the preset's `parameter_overrides` (§8) AFTER the chain so they land
+    // on the freshly-collected `#pragma parameter` defaults (#29). Skipped when
+    // the preset declares none.
+    if !preset.parameter_overrides.is_empty() {
+        state.send(RenderCommand::ApplyParameterOverrides(
+            preset.parameter_overrides,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Set a `#pragma parameter`'s current value live (#29), driving the slider UI.
+/// Clamped to the parameter's `[min, max]` by the engine; an unknown name is a
+/// no-op. No shader recompile or pipeline rebuild — the next frame re-packs the
+/// value into the param UBO.
+#[tauri::command]
+pub fn set_parameter(
+    state: State<'_, PreviewState>,
+    name: String,
+    value: f32,
+) -> Result<(), String> {
+    state.send(RenderCommand::SetParameter { name, value })
 }
 
 /// Compile every pass of a parsed preset into an engine [`preview_engine::Pass`],
