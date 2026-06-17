@@ -134,11 +134,13 @@ pub fn pack_parameters(params: &[Parameter]) -> Vec<u8> {
 /// alias) in declaration order, and a `name -> current value` map the renderer
 /// re-packs into each pass's reflected offsets every frame.
 ///
-/// Values are clamped to `[min, max]` on set (the reference's §8 open question —
-/// we apply the clamp for v1; documented). Construction seeds each `current` to
-/// the `#pragma` default; [`ParamStore::apply_overrides`] then layers a preset's
-/// `parameter_overrides` on top (the §8 `id = value` semantics: overrides the
-/// `current` value, not the pragma `initial`).
+/// Values are stored **raw** in `current` (no clamp on set) and clamped to
+/// `[min, max]` only at **use** time, when [`pack_params`] writes a value into a
+/// UBO (the reference's §11 item 7: RetroArch stores the raw float into
+/// `current`; the clamp is applied where the value is consumed). Construction
+/// seeds each `current` to the `#pragma` default; [`ParamStore::apply_overrides`]
+/// then layers a preset's `parameter_overrides` on top (the §8 `id = value`
+/// semantics: overrides the `current` value, not the pragma `initial`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParamStore {
     /// Deduped parameter metadata in first-seen declaration order. The slider UI
@@ -233,18 +235,21 @@ impl ParamStore {
     }
 
     /// Apply a preset's `parameter_overrides` (§8 bare `id = value`): set each
-    /// named parameter's current value (clamped to its range). Names that match no
-    /// collected parameter are ignored. An override may target the canonical name
-    /// or an alias.
+    /// named parameter's current value (stored raw; §11 item 7). Names that match
+    /// no collected parameter are ignored. An override may target the canonical
+    /// name or an alias.
     pub fn apply_overrides(&mut self, overrides: &std::collections::BTreeMap<String, f32>) {
         for (name, value) in overrides {
             self.set(name, *value);
         }
     }
 
-    /// Set a parameter's current value by canonical name or alias, clamped to
-    /// `[min, max]` (§8 clamp, applied for v1). A name matching no parameter is a
-    /// no-op (returns `false`); a successful set returns `true`.
+    /// Set a parameter's current value by canonical name or alias. The **raw**
+    /// value is stored (§11 item 7: RetroArch stores the raw float into `current`;
+    /// the `[min, max]` clamp is applied at use time, in [`pack_params`], so the
+    /// rendered pixel stays clamped while the surfaced value is the raw input). A
+    /// name matching no parameter is a no-op (returns `false`); a successful set
+    /// returns `true`.
     pub fn set(&mut self, name: &str, value: f32) -> bool {
         // Resolve the name (or alias) to the canonical parameter.
         let Some(def) = self
@@ -254,22 +259,39 @@ impl ParamStore {
         else {
             return false;
         };
-        let clamped = value.clamp(def.min, def.max);
-        // Write under the canonical name and the alias so a member declared under
-        // either spelling reads the same value.
-        self.current.insert(def.name.clone(), clamped);
-        if let Some(a) = &def.alias {
-            self.current.insert(a.clone(), clamped);
+        let (canonical, alias) = (def.name.clone(), def.alias.clone());
+        // Store the RAW value under the canonical name and the alias so a member
+        // declared under either spelling reads the same value.
+        self.current.insert(canonical, value);
+        if let Some(a) = alias {
+            self.current.insert(a, value);
         }
         true
     }
 
-    /// The current value for a member `name` (canonical or alias), or `None` if
-    /// no parameter is named that. The packing path calls this per uniform-block
-    /// member: a member matching a parameter gets its current value; everything
-    /// else (builtins, unknowns) is left to the builtin packing / zero.
+    /// The current **raw** value for a member `name` (canonical or alias), or
+    /// `None` if no parameter is named that. This is the unclamped value the user
+    /// set (§11 item 7); the clamp to `[min, max]` is applied at packing time by
+    /// [`ParamStore::clamped_value`] / [`pack_params`].
     pub fn value(&self, name: &str) -> Option<f32> {
         self.current.get(name).copied()
+    }
+
+    /// The current value for a member `name` (canonical or alias) **clamped** to
+    /// its `[min, max]` range — what [`pack_params`] writes into a UBO so the
+    /// rendered pixel stays in range (§11 item 7). `None` if no parameter is named
+    /// that. The clamp uses the member's own [`ParamDef`] (looked up by name or
+    /// alias); a value with no matching def is returned unclamped.
+    pub fn clamped_value(&self, name: &str) -> Option<f32> {
+        let raw = self.current.get(name).copied()?;
+        let def = self
+            .params
+            .iter()
+            .find(|d| d.name == name || d.alias.as_deref() == Some(name));
+        Some(match def {
+            Some(d) => raw.clamp(d.min, d.max),
+            None => raw,
+        })
     }
 
     /// Whether the store holds no parameters at all.
@@ -302,14 +324,24 @@ impl ParamStore {
 /// shaders declare). Mutates `bytes` in place; a no-op when the store is empty.
 ///
 /// This is the same offset-by-name mechanism #28 uses for builtins, layered for
-/// parameters: a member is a builtin XOR a parameter, so the two passes never
-/// fight over the same offset.
+/// parameters: a member is a builtin XOR a parameter. A member whose name is a
+/// builtin semantic is **skipped** here even if a `#pragma parameter` happens to
+/// collide with it — the builtin wins, matching RetroArch (#28/#29). The value
+/// written is **clamped** to the parameter's `[min, max]` range (§11 item 7: the
+/// store keeps the raw value; the clamp is applied at this point of use so the
+/// rendered pixel stays in range).
 pub fn pack_params(bytes: &mut [u8], block: &UniformBlock, store: &ParamStore) {
     if store.is_empty() {
         return;
     }
     for m in &block.members {
-        let Some(value) = store.value(&m.name) else {
+        // A name collision between a `#pragma parameter` and a builtin semantic
+        // resolves in the builtin's favor (it was already packed by
+        // `pack_builtins`); never let the parameter overwrite it (#28/#29).
+        if is_builtin_semantic(&m.name) {
+            continue;
+        }
+        let Some(value) = store.clamped_value(&m.name) else {
             continue;
         };
         let src = value.to_le_bytes();
@@ -765,20 +797,46 @@ mod tests {
     }
 
     #[test]
-    fn param_store_set_clamps_to_range() {
+    fn param_store_stores_raw_and_clamps_at_use() {
+        // §11 item 7: `set` stores the RAW value in `current`; the clamp to
+        // `[min, max]` happens only at use (in `clamped_value`/`pack_params`).
         let p = vec![full_param("LEVEL", 0.5, 0.0, 1.0)];
         let aliases = std::collections::HashMap::new();
         let mut store = ParamStore::collect([p.as_slice()], &aliases);
 
         assert!(store.set("LEVEL", 0.75));
         assert_eq!(store.value("LEVEL"), Some(0.75));
-        // Above max clamps to max; below min clamps to min.
+        assert_eq!(store.clamped_value("LEVEL"), Some(0.75));
+        // Above max: raw stays 5.0; the clamped (use-time) value is the max.
         assert!(store.set("LEVEL", 5.0));
-        assert_eq!(store.value("LEVEL"), Some(1.0));
+        assert_eq!(store.value("LEVEL"), Some(5.0), "raw value is unclamped");
+        assert_eq!(store.clamped_value("LEVEL"), Some(1.0), "clamped at use");
+        // Below min: raw stays -3.0; clamped to the min.
         assert!(store.set("LEVEL", -3.0));
-        assert_eq!(store.value("LEVEL"), Some(0.0));
+        assert_eq!(store.value("LEVEL"), Some(-3.0), "raw value is unclamped");
+        assert_eq!(store.clamped_value("LEVEL"), Some(0.0), "clamped at use");
         // An unknown name is a no-op.
         assert!(!store.set("NOPE", 0.5));
+    }
+
+    #[test]
+    fn pack_params_clamps_the_packed_value() {
+        // The raw stored value may be out of range, but the PACKED bytes must be
+        // clamped to `[min, max]` (§11 item 7) so the rendered pixel stays in range.
+        let blk = block(
+            16,
+            vec![member("LEVEL", 0, 4, MemberKind::Scalar(ScalarType::Float))],
+        );
+        let p = vec![full_param("LEVEL", 0.5, 0.0, 1.0)];
+        let aliases = std::collections::HashMap::new();
+        let mut store = ParamStore::collect([p.as_slice()], &aliases);
+        assert!(store.set("LEVEL", 5.0)); // raw 5.0, out of range
+        assert_eq!(store.value("LEVEL"), Some(5.0), "raw unclamped");
+
+        let mut bytes = vec![0u8; 16];
+        pack_params(&mut bytes, &blk, &store);
+        // Packed value is clamped to the max (1.0), NOT the raw 5.0.
+        assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes(), "packed value clamped");
     }
 
     #[test]
@@ -862,6 +920,29 @@ mod tests {
         pack_params(&mut bytes, &blk, &store);
         assert_eq!(f32x4(&bytes, 0), size_vec(100, 50), "builtin survives");
         assert_eq!(&bytes[16..20], &0.5f32.to_le_bytes(), "param packed");
+    }
+
+    #[test]
+    fn pack_params_skips_a_param_colliding_with_a_builtin_name() {
+        // A `#pragma parameter` named like a builtin (`OutputSize`) must NOT
+        // overwrite the builtin the renderer already packed: the builtin wins
+        // (#28/#29). pack_params skips members whose name is a builtin semantic.
+        let blk = block(16, vec![member("OutputSize", 0, 16, vec4_kind())]);
+        let mut bytes = pack_builtins(
+            &blk,
+            &BuiltinValues {
+                output_size: size_vec(640, 480),
+                ..Default::default()
+            },
+        );
+        // A param colliding with the builtin name; its value would clobber if not
+        // skipped (the param is a scalar but would still write its 4 bytes).
+        let params = vec![full_param("OutputSize", 0.0, 0.0, 1.0)];
+        let aliases = std::collections::HashMap::new();
+        let store = ParamStore::collect([params.as_slice()], &aliases);
+        pack_params(&mut bytes, &blk, &store);
+        // The builtin OutputSize survives untouched (param did NOT overwrite it).
+        assert_eq!(f32x4(&bytes, 0), size_vec(640, 480), "builtin wins over param");
     }
 
     #[test]

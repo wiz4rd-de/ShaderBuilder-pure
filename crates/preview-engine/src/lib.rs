@@ -1033,7 +1033,7 @@ layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
             "clamp to max"
         );
 
-        // Below min clamps to 0.0 -> ~0.
+        // Below min: the rendered pixel clamps to 0.0 -> ~0.
         assert!(r.set_parameter("X", -9.0));
         r.render().expect("render");
         assert!(
@@ -1041,9 +1041,37 @@ layout(std140, set = 0, binding = 3) uniform Params {{ float X; }} params;
             "clamp to min"
         );
 
-        // The view reflects the clamped value.
+        // The view surfaces the RAW value the user set (-9.0), NOT the clamped one
+        // — the clamp lives at packing time, not in the store (§11 item 7).
         let v = r.parameters().into_iter().find(|p| p.name == "X").unwrap();
-        assert_eq!(v.value, 0.0);
+        assert_eq!(v.value, -9.0, "raw value surfaced to the UI");
+    }
+
+    #[test]
+    fn builtin_wins_over_a_param_colliding_with_its_name() {
+        // A `#pragma parameter OutputSize` collides with the builtin OutputSize
+        // semantic. RetroArch resolves this in the builtin's favor: the shader
+        // must see the real OutputSize (the pane width), NOT the param default
+        // (#28/#29). The param's small default would read back near 0; the
+        // builtin's width (the pane) reads back near 200.
+        let src = format!(
+            "#version 450
+#pragma parameter OutputSize \"Bogus\" 0.0 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; vec4 OutputSize; }} global;
+{VS}void main() {{ FragColor = vec4(global.OutputSize.x / 255.0, 0.0, 0.0, 1.0); }}
+"
+        );
+        let shader = compile_slang(&src, None).expect("compile collide shader");
+        // Pane = 200 wide so the builtin OutputSize.x is 200 (~200 read back).
+        let mut r = Renderer::new(200, 64).expect("wgpu device");
+        r.set_source(&solid(8, 8, [0, 0, 0, 255]));
+        r.set_shader(&shader);
+        r.render().expect("render");
+        let got = center(&r.read_back().expect("read back"))[0];
+        assert!(
+            (got as i32 - 200).abs() <= 3,
+            "builtin OutputSize (200) must reach the shader, not the param default (0); got {got}"
+        );
     }
 
     #[test]
