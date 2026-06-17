@@ -34,10 +34,15 @@
 //!
 //! glslang's push-constant block is already laid out with explicit `Offset` member
 //! decorations and a `Block` decoration on the struct — the same decorations a UBO
-//! carries. For the scalar / `vec4` / `mat4` members RetroArch `Push`/`UBO` blocks
-//! use, the std430 push-constant offsets and the std140 UBO offsets coincide, so
-//! the byte layout is preserved verbatim. The transform therefore only changes the
-//! *storage class* and adds the descriptor decorations:
+//! carries. For the scalar / `vec` / `vec4[]` / `mat4` members RetroArch
+//! `Push`/`UBO` blocks use, the std430 push-constant strides are already multiples
+//! of 16, so they coincide with the std140 UBO rules and the byte layout is
+//! preserved verbatim. A push block whose std430 layout would be INVALID in a
+//! std140 UBO — an array or matrix with a sub-16 stride (`float[N]` → 4, `mat2` →
+//! 8) — is **rejected** with [`PushToUboError::UnsupportedLayout`] rather than
+//! mis-transformed into SPIR-V wgpu/naga reject at pipeline creation (a future
+//! ticket can re-lay-out those to std140). For the safe blocks the transform only
+//! changes the *storage class* and adds the descriptor decorations:
 //!
 //! 1. Rewrite **every** `OpTypePointer` whose storage class is `PushConstant` to
 //!    `Uniform` — both the block pointer and the per-member access-chain pointers
@@ -90,6 +95,15 @@ use rspirv::spirv::{Decoration, Op, StorageClass};
 pub enum PushToUboError {
     /// The input words were not parseable SPIR-V (truncated, wrong magic, …).
     Parse(String),
+    /// The push-constant block uses a `std430` layout that is INVALID for a UBO
+    /// (`std140`): an array or matrix whose stride is not a multiple of 16 (#32
+    /// review). glslang lays push blocks out std430 (e.g. `float[N]` stride 4,
+    /// `mat2` stride 8); a UBO requires those rounded up to 16. Merely changing the
+    /// storage class would emit SPIR-V wgpu/naga reject at pipeline creation, so we
+    /// reject it here with a clear error instead. (Scalar/`vec`/`mat4`/`vec4[]`
+    /// push blocks ARE layout-compatible and transform fine.) A future ticket can
+    /// re-lay-out the member offsets/strides to std140 to support these shaders.
+    UnsupportedLayout(String),
 }
 
 impl std::fmt::Display for PushToUboError {
@@ -97,6 +111,12 @@ impl std::fmt::Display for PushToUboError {
         match self {
             PushToUboError::Parse(e) => {
                 write!(f, "could not parse SPIR-V to rewrite push constants: {e}")
+            }
+            PushToUboError::UnsupportedLayout(why) => {
+                write!(
+                    f,
+                    "push-constant block has a std430 layout invalid for a UBO: {why}"
+                )
             }
         }
     }
@@ -143,6 +163,37 @@ pub fn push_constant_to_ubo(
         return Ok(words.to_vec());
     }
 
+    // 1b. Reject a std430 layout that would be invalid in a std140 UBO (#32 review
+    // finding A). glslang lays push blocks out std430, where an array's stride is
+    // its element size (e.g. `float[N]` → 4) and a `mat2`'s column stride is 8; a
+    // UBO requires arrays/matrices to have a stride that is a multiple of 16, so
+    // merely re-tagging the storage class would emit SPIR-V wgpu/naga reject at
+    // shader-module creation. A real already-UBO block is laid out std140 (strides
+    // ≥ 16), so a sub-16 `ArrayStride`/`MatrixStride` anywhere in the module can
+    // only come from the std430 push block we are about to transform — reject it
+    // with a clear error rather than producing invalid SPIR-V. (Scalar / `vec` /
+    // `mat4` / `vec4[]` push blocks have ≥16 strides and pass through fine.)
+    if let Some(bad) = module.annotations.iter().find_map(|inst| {
+        if inst.class.opcode != Op::Decorate && inst.class.opcode != Op::MemberDecorate {
+            return None;
+        }
+        // OpDecorate <t> ArrayStride <n>  → operands [IdRef, Decoration, Literal]
+        // OpMemberDecorate <s> <m> MatrixStride <n> → [IdRef, Literal(m), Decoration, Literal]
+        let (deco, stride) = match inst.class.opcode {
+            Op::Decorate => (inst.operands.get(1), inst.operands.get(2)),
+            _ => (inst.operands.get(2), inst.operands.get(3)),
+        };
+        match (deco, stride) {
+            (
+                Some(Operand::Decoration(d @ (Decoration::ArrayStride | Decoration::MatrixStride))),
+                Some(Operand::LiteralBit32(n)),
+            ) if n % 16 != 0 => Some(format!("{d:?} = {n} (not a multiple of 16)")),
+            _ => None,
+        }
+    }) {
+        return Err(PushToUboError::UnsupportedLayout(bad));
+    }
+
     // 2. The bindings already used in *this* stage's set 0 (for the rare
     // multi-push-block case, to step past them after `target_binding`).
     let used = used_set0_bindings(&module);
@@ -164,17 +215,20 @@ pub fn push_constant_to_ubo(
 
     // 4. Decorate each former push-constant variable with (set 0, binding),
     // starting at the caller-chosen `target_binding` (cross-stage consistent).
+    // `saturating_add` on the binding-skip steps (matching the hardened sibling
+    // `split_samplers` allocator) so a pathological `u32::MAX` binding can't
+    // overflow-panic in debug / wrap in release (#32 review finding D).
     let mut next_binding = target_binding;
     while used.contains(&next_binding) {
-        next_binding += 1;
+        next_binding = next_binding.saturating_add(1);
     }
     let mut new_decorations: Vec<Instruction> = Vec::with_capacity(push_vars.len() * 2);
     for var in push_vars {
         new_decorations.push(decorate(var, Decoration::DescriptorSet, 0));
         new_decorations.push(decorate(var, Decoration::Binding, next_binding));
-        next_binding += 1;
+        next_binding = next_binding.saturating_add(1);
         while used.contains(&next_binding) {
-            next_binding += 1;
+            next_binding = next_binding.saturating_add(1);
         }
     }
     module.annotations.extend(new_decorations);
@@ -250,7 +304,7 @@ fn used_set0_bindings(module: &dr::Module) -> HashSet<u32> {
 fn lowest_free(used: &HashSet<u32>) -> u32 {
     let mut b = 0;
     while used.contains(&b) {
-        b += 1;
+        b = b.saturating_add(1);
     }
     b
 }
@@ -427,5 +481,45 @@ void main() { FragColor = texture(Source, vec2(0.5)); }
         assert_eq!(lowest_free(&HashSet::new()), 0);
         let sparse: HashSet<u32> = [0u32, 2].into_iter().collect();
         assert_eq!(lowest_free(&sparse), 1);
+    }
+
+    /// #32 review finding A: a push block with a scalar ARRAY member is laid out
+    /// std430 (`float[N]` → ArrayStride 4), which is invalid in a std140 UBO. The
+    /// transform must REJECT it (UnsupportedLayout) rather than emit SPIR-V that
+    /// wgpu/naga reject at shader-module creation.
+    #[test]
+    fn array_push_block_rejected_as_unsupported_layout() {
+        const ARRAY_PUSH: &str = "\
+#version 450
+layout(push_constant) uniform Push { float weights[4]; } registers;
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) out vec4 FragColor;
+void main() { FragColor = vec4(registers.weights[0], registers.weights[1], registers.weights[2], registers.weights[3]); }
+";
+        let frag = raw_spirv(Stage::Fragment, ARRAY_PUSH);
+        let err = push_constant_to_ubo(&frag, 1)
+            .expect_err("a std430 array push block must be rejected, not mis-transformed");
+        assert!(
+            matches!(err, PushToUboError::UnsupportedLayout(_)),
+            "expected UnsupportedLayout, got {err:?}"
+        );
+    }
+
+    /// The scalar/vec4/mat4 push block (the common RetroArch layout) is layout-safe
+    /// and must STILL transform cleanly (the array check must not over-reject).
+    #[test]
+    fn scalar_push_block_still_transforms() {
+        let frag = raw_spirv(Stage::Fragment, PUSH_SHADER);
+        let out = push_constant_to_ubo(&frag, 1).expect("scalar push block transforms");
+        let module = dr::load_words(&out).expect("parse");
+        assert_eq!(
+            count_vars(&module, StorageClass::PushConstant),
+            0,
+            "no push-constant variable should remain"
+        );
     }
 }

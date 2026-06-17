@@ -198,12 +198,12 @@ struct PassResources {
     /// dedicated params block. `None` when the pass has no such block (the param
     /// UBO is then a zero-filled vec4). #29 packs current param values here.
     param_block: Option<UniformBlock>,
-    /// The set-0 binding the **builtin** UBO buffer attaches at (#26): the builtin
-    /// block's reflected binding (legacy `0` when absent).
-    builtin_binding: u32,
-    /// The set-0 binding the **param** UBO buffer attaches at (#26): the param
-    /// block's reflected binding (legacy `3` when absent).
-    param_binding: u32,
+    /// The set-0 binding the **param** UBO buffer (`param_buffer`) attaches at: the
+    /// param block's reflected binding, or `None` when the pass has no param block.
+    /// A binding in `block_bindings` is routed to `param_buffer` iff it equals this
+    /// (else to `ubo`) — so a sole param-only block at binding 0 binds correctly
+    /// instead of being shadowed by an absent builtin block's default (#32 review).
+    param_binding: Option<u32>,
     /// `frame_count_modN` (#28): the `FrameCount` this pass sees is pre-wrapped
     /// by this modulus (`0` = no wrap).
     frame_count_mod: u32,
@@ -1195,13 +1195,25 @@ impl Renderer {
                 cache: None,
             });
 
-        // The binding number each UBO buffer attaches at (#26): the builtin block's
-        // and the param block's reflected `binding` within set 0. Default to the
-        // legacy 0 / 3 if a block is absent (the buffer is then a zero-filled vec4
-        // bound at a binding the layout may not list — harmless, but normally the
-        // layout carries it because the shader declares the block).
-        let builtin_binding = block_binding(builtin_block.as_ref()).unwrap_or(0);
-        let param_binding = block_binding(param_block.as_ref()).unwrap_or(3);
+        // The binding the param UBO buffer attaches at: the param block's reflected
+        // set-0 binding, or `None` when there is no param block. The builtin block
+        // (when present) attaches `ubo` at its own binding via the routing below; we
+        // do NOT need a builtin_binding default — routing is "param_buffer iff this
+        // binding is the param block's, else ubo" (#32 review fix for a sole
+        // param-only block at binding 0).
+        let param_binding = block_binding(param_block.as_ref());
+        // The renderer models exactly TWO set-0 UBOs (ubo + param_buffer). A pass
+        // declaring 3+ set-0 uniform blocks (very unusual — the standard RetroArch
+        // layout is one UBO + the push block) would mis-bind the third; warn rather
+        // than silently mis-render (#32 review limitation C).
+        if block_bindings.len() > 2 {
+            eprintln!(
+                "preview-engine: pass declares {} set-0 uniform blocks; only the \
+                 builtin + one param block are modeled — extra blocks bind the \
+                 builtin buffer (uniforms may be wrong)",
+                block_bindings.len()
+            );
+        }
 
         PassResources {
             pipeline,
@@ -1213,7 +1225,6 @@ impl Renderer {
             ubo,
             builtin_block,
             param_block,
-            builtin_binding,
             param_binding,
             frame_count_mod: pass.frame_count_mod,
             sampler,
@@ -1476,7 +1487,11 @@ impl Renderer {
             // param UBO. (A block the shader doesn't declare isn't in the layout,
             // so we only attach buffers for bindings the layout lists.)
             for &binding in &res.block_bindings {
-                let buffer = if binding == res.param_binding && binding != res.builtin_binding {
+                // Route to `param_buffer` iff this is the param block's binding
+                // (it is distinct from the builtin block by construction); every
+                // other set-0 UBO binding — including the builtin block, and a sole
+                // param-only block is itself the param block — takes `ubo`.
+                let buffer = if Some(binding) == res.param_binding {
                     &res.param_buffer
                 } else {
                     &res.ubo
