@@ -77,6 +77,9 @@ pub enum RenderCommand {
     /// the current value (clamped). Sent after a `SetChain` so the override lands
     /// on the freshly-collected defaults.
     ApplyParameterOverrides(std::collections::BTreeMap<String, f32>),
+    /// Replace the registered LUTs (#27): the preset's `textures` family, decoded
+    /// by the app and bound by name as `<NAME>`. An empty list clears stale LUTs.
+    SetLuts(Vec<crate::LutSpec>),
 }
 
 /// A [`FrameSource`] that renders a source image through a compiled slang shader
@@ -137,6 +140,9 @@ impl RenderSource {
                     let mut store = self.renderer.collected_params().clone();
                     store.apply_overrides(&overrides);
                     self.renderer.set_params(store);
+                }
+                RenderCommand::SetLuts(luts) => {
+                    self.renderer.set_luts(luts);
                 }
             }
         }

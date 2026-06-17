@@ -285,6 +285,34 @@ struct HistoryFrame {
     size: (u32, u32),
 }
 
+/// A preset LUT to register with the engine (#27, §7): a decoded RGBA8 image plus
+/// its per-LUT sampler settings. The app builds these from the preset's `textures`
+/// family ([`preset_io::LutEntry`] + the decoded PNG) and hands them to
+/// [`Renderer::set_luts`]. Bound by name from any pass as `<NAME>`, with its
+/// dimensions exposed as the `<NAME>Size` builtin.
+#[derive(Debug, Clone)]
+pub struct LutSpec {
+    /// The LUT name (the `textures` list entry) — how passes reference it.
+    pub name: String,
+    /// The decoded LUT image (RGBA8).
+    pub image: Frame,
+    /// `<NAME>_linear` — `true`=linear, `false`=nearest (LUTs default nearest).
+    pub filter_linear: bool,
+    /// `<NAME>_wrap_mode` — the LUT's sampler wrap mode.
+    pub wrap_mode: WrapMode,
+    /// `<NAME>_mipmap` — generate and sample a mip chain for the LUT.
+    pub mipmap: bool,
+}
+
+/// A registered LUT's GPU resources (#27): its texture (as an [`Fbo`] so it can
+/// carry a mip chain), its own sampler (per-LUT filter/wrap/mipmap, independent of
+/// pass samplers), and pixel size (for `<NAME>Size`).
+struct Lut {
+    fbo: Fbo,
+    sampler: wgpu::Sampler,
+    size: (u32, u32),
+}
+
 /// A headless N-pass renderer.
 pub struct Renderer {
     device: wgpu::Device,
@@ -354,6 +382,11 @@ pub struct Renderer {
     /// references (#25). `0` when no pass reads history; the ring keeps at most this
     /// many past frames. Recomputed by `set_chain`.
     history_depth: usize,
+
+    /// Registered preset LUTs by name (#27, §7): each carries its own texture +
+    /// sampler + size, bound when a pass samples `<NAME>`. Replaced wholesale by
+    /// [`Renderer::set_luts`]; independent of the pass chain (a preset sends both).
+    luts: std::collections::HashMap<String, Lut>,
 }
 
 /// Resources for the per-frame mipmap-downsample blit (#23): the shader module,
@@ -480,6 +513,7 @@ impl Renderer {
             params: ParamStore::default(),
             history: std::collections::VecDeque::new(),
             history_depth: 0,
+            luts: std::collections::HashMap::new(),
         })
     }
 
@@ -605,6 +639,54 @@ impl Renderer {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         HistoryFrame { view, size }
+    }
+
+    /// Register the preset's LUTs (#27, §7), replacing any previously set. Each LUT
+    /// is uploaded to its own `SOURCE_FORMAT` texture (with a mip chain when its
+    /// `mipmap` flag is set, generated immediately), gets its own sampler honoring
+    /// its `filter_linear`/`wrap_mode`/`mipmap` (independent of pass samplers), and
+    /// is bound by name when a pass samples `<NAME>` — its size exposed as
+    /// `<NAME>Size`. The app decodes the LUT PNGs and passes them here; a preset
+    /// with no LUTs should send an empty list to clear stale ones.
+    pub fn set_luts(&mut self, specs: Vec<LutSpec>) {
+        self.luts.clear();
+        if specs.is_empty() {
+            return;
+        }
+        // A mip-gen pipeline for the LUT format, if any LUT generates mips.
+        if specs.iter().any(|s| s.mipmap) {
+            self.ensure_mip_gen(&[Self::SOURCE_FORMAT]);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("LUT upload + mipgen"),
+            });
+        let mut built: Vec<(String, Lut)> = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let size = (spec.image.width, spec.image.height);
+            let mip_level_count = if spec.mipmap {
+                mip_level_count_for(size)
+            } else {
+                1
+            };
+            // `build_source` uploads the base RGBA8 and adds RENDER_ATTACHMENT when
+            // mipped — exactly what a LUT texture needs (same format as the source).
+            let fbo = self.build_source(size, &spec.image.rgba, mip_level_count);
+            if spec.mipmap {
+                let mip_gen = self
+                    .mip_gen
+                    .as_ref()
+                    .expect("mip_gen ensured when a LUT requests mips");
+                generate_mips(&self.device, &mut encoder, mip_gen, &fbo);
+            }
+            let sampler = self.make_sampler(spec.filter_linear, spec.wrap_mode, spec.mipmap);
+            built.push((spec.name.clone(), Lut { fbo, sampler, size }));
+        }
+        self.queue.submit(Some(encoder.finish()));
+        for (name, lut) in built {
+            self.luts.insert(name, lut);
+        }
     }
 
     /// Build the source texture as an [`Fbo`] of `size` with `mip_level_count`
@@ -1060,17 +1142,26 @@ impl Renderer {
     /// set so coarse mips can be sampled; otherwise lod is clamped to the base
     /// level so only mip 0 is read.
     fn build_sampler(&self, pass: &Pass) -> wgpu::Sampler {
-        let filter = if pass.filter_linear {
+        self.make_sampler(pass.filter_linear, pass.wrap_mode, pass.mipmap_input)
+    }
+
+    /// Build a sampler from explicit `filter_linear` / `wrap` / `mipmap` settings
+    /// (#23/#27). Shared by per-pass input samplers ([`Renderer::build_sampler`])
+    /// and per-LUT samplers ([`Renderer::set_luts`]). The mipmap filter tracks
+    /// `filter_linear` (librashader `mip_filter: filter`); `lod_max_clamp` opens to
+    /// the full chain only when `mipmap` is set, else pins to the base level.
+    fn make_sampler(&self, filter_linear: bool, wrap: WrapMode, mipmap: bool) -> wgpu::Sampler {
+        let filter = if filter_linear {
             wgpu::FilterMode::Linear
         } else {
             wgpu::FilterMode::Nearest
         };
-        let address = self.address_mode(pass.wrap_mode);
-        let (mipmap_filter, lod_max_clamp) = if pass.mipmap_input {
+        let address = self.address_mode(wrap);
+        let (mipmap_filter, lod_max_clamp) = if mipmap {
             // Mips consumed: allow the full chain. The mip filter tracks
             // `filter_linear` (librashader `mip_filter: filter`), so a nearest
-            // pass also samples mips with nearest.
-            let mip_filter = if pass.filter_linear {
+            // consumer also samples mips with nearest.
+            let mip_filter = if filter_linear {
                 wgpu::MipmapFilterMode::Linear
             } else {
                 wgpu::MipmapFilterMode::Nearest
@@ -1081,7 +1172,7 @@ impl Renderer {
             (wgpu::MipmapFilterMode::Nearest, 0.0)
         };
         self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pass input sampler"),
+            label: Some("input/LUT sampler"),
             address_mode_u: address,
             address_mode_v: address,
             address_mode_w: address,
@@ -1389,15 +1480,20 @@ impl Renderer {
                     r
                 })
                 .unwrap_or_else(|| self.placeholder_resource()),
-            // Deferred resources (#27 LUTs): the resolver hook returns a
-            // placeholder black view today. Sampled with the source sampler.
-            other => {
-                let view = self
-                    .resolver
-                    .resolve(other, pass_index)
-                    .unwrap_or_else(|| self.resolver.black());
-                (view, self.sampler_after_source())
-            }
+            // LUT (#27, §7): a `textures=` entry bound by name with its OWN
+            // sampler (per-LUT filter/wrap/mipmap). An unregistered name (a LUT the
+            // preset didn't supply, or a `UserN` we don't model) falls back to the
+            // resolver's 1×1 black placeholder so the bind never fails.
+            TextureClass::Lut(name) => match self.luts.get(name) {
+                Some(lut) => (&lut.fbo.view, &lut.sampler),
+                None => {
+                    let view = self
+                        .resolver
+                        .resolve(class, pass_index)
+                        .unwrap_or_else(|| self.resolver.black());
+                    (view, self.sampler_after_source())
+                }
+            },
         }
     }
 
@@ -1479,6 +1575,12 @@ impl Renderer {
                 uniforms::size_vec(w, h)
             })
             .collect();
+        // LUT sizes by name (#27, §7): `<NAME>Size` = the LUT's pixel dimensions.
+        let lut_sizes: std::collections::HashMap<String, [f32; 4]> = self
+            .luts
+            .iter()
+            .map(|(name, lut)| (name.clone(), uniforms::size_vec(lut.size.0, lut.size.1)))
+            .collect();
         // Earlier passes' output sizes, grown as we walk the chain so pass i sees
         // passes 0..i (causal — §7).
         let mut pass_output_sizes: Vec<[f32; 4]> = Vec::with_capacity(self.passes.len());
@@ -1527,6 +1629,7 @@ impl Renderer {
                     pass_feedback_sizes: all_output_sizes.clone(),
                     alias_feedback_sizes: alias_feedback_sizes.clone(),
                     original_history_sizes: original_history_sizes.clone(),
+                    lut_sizes: lut_sizes.clone(),
                 };
                 let mut bytes = uniforms::pack_builtins(block, &values);
                 uniforms::pack_params(&mut bytes, block, &self.params);

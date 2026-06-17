@@ -413,6 +413,9 @@ pub struct BuiltinValues {
     /// (the ring is pre-allocated to the input size), so reciprocals are safe.
     /// `OriginalHistory0Size` ≡ `OriginalSize` and is served from `original_size`.
     pub original_history_sizes: Vec<[f32; 4]>,
+    /// LUT sizes by name (#27, §7): `lut_sizes["NAME"]` backs the `<NAME>Size`
+    /// builtin — the LUT's pixel dimensions. Absent for an unregistered name.
+    pub lut_sizes: std::collections::HashMap<String, [f32; 4]>,
 }
 
 impl Default for BuiltinValues {
@@ -431,6 +434,7 @@ impl Default for BuiltinValues {
             pass_feedback_sizes: Vec::new(),
             alias_feedback_sizes: std::collections::HashMap::new(),
             original_history_sizes: Vec::new(),
+            lut_sizes: std::collections::HashMap::new(),
         }
     }
 }
@@ -472,6 +476,10 @@ impl BuiltinValues {
                         }
                     }
                     if let Some(v) = self.alias_sizes.get(base) {
+                        return vec4(v);
+                    }
+                    // `<NAME>Size` for a registered LUT (#27, §7).
+                    if let Some(v) = self.lut_sizes.get(base) {
                         return vec4(v);
                     }
                 }

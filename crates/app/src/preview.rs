@@ -182,6 +182,11 @@ pub fn load_shader(
 pub fn load_preset(state: State<'_, PreviewState>, preset_path: String) -> Result<(), String> {
     let preset = preset_io::parse_slangp(&preset_path).map_err(|e| e.to_string())?;
     let passes = compile_preset_chain(&preset)?;
+    // Decode the preset's LUTs (#27) and replace the engine's set (always sent, so
+    // switching to a preset with fewer/no LUTs clears stale ones). Decoded here so
+    // file IO stays off the render loop.
+    let luts = compile_preset_luts(&preset)?;
+    state.send(RenderCommand::SetLuts(luts))?;
     state.send(RenderCommand::SetChain(passes))?;
     // Apply the preset's `parameter_overrides` (§8) AFTER the chain so they land
     // on the freshly-collected `#pragma parameter` defaults (#29). Skipped when
@@ -192,6 +197,26 @@ pub fn load_preset(state: State<'_, PreviewState>, preset_path: String) -> Resul
         ))?;
     }
     Ok(())
+}
+
+/// Decode a parsed preset's LUTs (#27, §7) into engine [`preview_engine::LutSpec`]s:
+/// load each PNG (paths already resolved relative to the preset dir by the parser)
+/// and carry its per-LUT sampler settings, defaulting an absent key to the §7 LUT
+/// defaults (nearest filter, `clamp_to_border` wrap, no mipmap).
+fn compile_preset_luts(preset: &preset_io::Preset) -> Result<Vec<preview_engine::LutSpec>, String> {
+    let mut luts = Vec::with_capacity(preset.luts.len());
+    for entry in &preset.luts {
+        let image = source::load_image(&entry.path)
+            .map_err(|e| format!("LUT {:?} ({}): {e}", entry.name, entry.path.display()))?;
+        luts.push(preview_engine::LutSpec {
+            name: entry.name.clone(),
+            image,
+            filter_linear: entry.linear.unwrap_or(false),
+            wrap_mode: entry.wrap_mode.map(map_wrap_mode).unwrap_or_default(),
+            mipmap: entry.mipmap.unwrap_or(false),
+        });
+    }
+    Ok(luts)
 }
 
 /// Set a `#pragma parameter`'s current value live (#29), driving the slider UI.

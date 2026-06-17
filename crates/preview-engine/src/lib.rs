@@ -21,7 +21,7 @@ pub use bindtable::{PlaceholderResolver, TextureClass, TextureResolver};
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
 pub use render_source::{RenderCommand, RenderSource, DEFAULT_SHADER};
-pub use renderer::{Renderer, RendererError, OFFSCREEN_FORMAT};
+pub use renderer::{LutSpec, Renderer, RendererError, OFFSCREEN_FORMAT};
 pub use uniforms::{BuiltinUniforms, BuiltinValues, ParamDef, ParamStore, ParamView};
 
 /// Crate identity marker. See `core_model::NAME`.
@@ -2275,5 +2275,177 @@ mod history_size_tests {
         assert_eq!(v.member_bytes("OriginalHistory2Size"), Some(bytes(32, 24)));
         // Past the populated depth → None (member stays zero).
         assert_eq!(v.member_bytes("OriginalHistory5Size"), None);
+    }
+}
+
+#[cfg(test)]
+mod lut_tests {
+    //! LUT texture tests (#27, §7): a `textures=` entry binds by name (`<NAME>`)
+    //! with its OWN sampler (per-LUT filter/wrap), independent of pass samplers.
+    use super::{LutSpec, Pass, Renderer, WrapMode};
+    use slang_compile::{compile_slang, CompiledShader};
+    use source::Frame;
+
+    // A pass that samples LUT "PAL" — a texture named neither Source/Original/Pass*
+    // /History*, so it classifies as a LUT (#27) and binds the registered LUT.
+    fn lut_at(coord: &str) -> CompiledShader {
+        compile_slang(
+            &format!(
+                "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO {{ mat4 MVP; }} global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() {{ gl_Position = global.MVP * Position; vTexCoord = TexCoord; }}
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D PAL;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() {{ FragColor = texture(sampler2D(PAL, Smp), {coord}); }}
+"
+            ),
+            None,
+        )
+        .expect("compile LUT fixture")
+    }
+
+    /// A 2×1 LUT: left texel red, right texel green.
+    fn red_green_lut() -> Frame {
+        Frame::new(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255])
+    }
+
+    fn black_source() -> Frame {
+        Frame::new(4, 4, vec![0; 4 * 4 * 4])
+    }
+
+    fn spec(name: &str, image: Frame, filter_linear: bool) -> LutSpec {
+        LutSpec {
+            name: name.to_string(),
+            image,
+            filter_linear,
+            wrap_mode: WrapMode::ClampToEdge,
+            mipmap: false,
+        }
+    }
+
+    fn px(f: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * f.width + x) * 4) as usize;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2], f.rgba[i + 3]]
+    }
+
+    #[test]
+    fn lut_binds_by_name_and_samples_its_content() {
+        // Sample PAL across the output's uv.x with NEAREST: left half = red texel,
+        // right half = green texel. Proves the LUT binds by name with real content.
+        let mut r = Renderer::new(8, 8).expect("wgpu device");
+        r.set_source(&black_source());
+        r.set_luts(vec![spec("PAL", red_green_lut(), false)]);
+        r.set_chain(&[Pass::new(lut_at("vTexCoord"))])
+            .expect("chain");
+        r.render().expect("render");
+        let out = r.read_back().expect("read back");
+        let left = px(&out, 1, 4);
+        let right = px(&out, 6, 4);
+        assert!(
+            left[0] > 200 && left[1] < 40,
+            "left should sample the red LUT texel, got {left:?}"
+        );
+        assert!(
+            right[1] > 200 && right[0] < 40,
+            "right should sample the green LUT texel, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn per_lut_filter_nearest_vs_linear_differ_at_the_texel_boundary() {
+        // Sample at the exact 2×1 boundary uv=(0.5,0.5). NEAREST picks one texel
+        // (one channel ~0); LINEAR blends both (~128,128). Proves the LUT's OWN
+        // filter setting is applied.
+        let render = |linear: bool| {
+            let mut r = Renderer::new(4, 4).expect("wgpu device");
+            r.set_source(&black_source());
+            r.set_luts(vec![spec("PAL", red_green_lut(), linear)]);
+            r.set_chain(&[Pass::new(lut_at("vec2(0.5, 0.5)"))])
+                .expect("chain");
+            r.render().expect("render");
+            px(&r.read_back().expect("read"), 2, 2)
+        };
+        let nearest = render(false);
+        let linear = render(true);
+        assert!(
+            (nearest[0] < 40 && nearest[1] > 200) || (nearest[0] > 200 && nearest[1] < 40),
+            "nearest must pick a single texel (one channel ~0), got {nearest:?}"
+        );
+        assert!(
+            (linear[0] as i32 - 128).abs() <= 50 && (linear[1] as i32 - 128).abs() <= 50,
+            "linear must blend the two texels (~128,128), got {linear:?}"
+        );
+    }
+
+    #[test]
+    fn unregistered_lut_falls_back_to_black() {
+        // No LUT registered → the name binds the 1×1 black placeholder, not garbage.
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&black_source());
+        r.set_luts(vec![]); // none registered
+        r.set_chain(&[Pass::new(lut_at("vTexCoord"))])
+            .expect("chain");
+        r.render().expect("render");
+        let p = px(&r.read_back().expect("read"), 2, 2);
+        assert_eq!(
+            [p[0], p[1], p[2]],
+            [0, 0, 0],
+            "unregistered LUT → black, got {p:?}"
+        );
+    }
+
+    #[test]
+    fn set_luts_replaces_the_previous_set() {
+        // Re-registering replaces the LUT: a second set_luts wins.
+        let mut r = Renderer::new(4, 4).expect("wgpu device");
+        r.set_source(&black_source());
+        r.set_luts(vec![spec("PAL", red_green_lut(), false)]);
+        r.set_chain(&[Pass::new(lut_at("vec2(0.25,0.5)"))])
+            .expect("chain"); // left=red
+        r.render().expect("render");
+        assert!(
+            px(&r.read_back().expect("read"), 2, 2)[0] > 200,
+            "first LUT red"
+        );
+
+        // Replace PAL with a solid-blue 1×1 LUT.
+        r.set_luts(vec![spec(
+            "PAL",
+            Frame::new(1, 1, vec![0, 0, 255, 255]),
+            false,
+        )]);
+        r.render().expect("render");
+        let p = px(&r.read_back().expect("read"), 2, 2);
+        assert!(
+            p[2] > 200 && p[0] < 40,
+            "replaced LUT should be blue, got {p:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lut_size_tests {
+    //! `<NAME>Size` builtin for a registered LUT (#27, §7).
+    use crate::uniforms::{size_vec, BuiltinValues};
+
+    #[test]
+    fn lut_name_size_resolves() {
+        let mut v = BuiltinValues::default();
+        v.lut_sizes.insert("PAL".to_string(), size_vec(16, 16));
+        let want: Vec<u8> = size_vec(16, 16)
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(v.member_bytes("PALSize"), Some(want));
+        // An unregistered LUT size is unknown (member stays zero).
+        assert_eq!(v.member_bytes("OtherSize"), None);
     }
 }
