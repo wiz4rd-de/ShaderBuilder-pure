@@ -229,11 +229,24 @@ pub fn import_parsed_preset(
         &mut param_conflicts,
     );
     for w in &param_conflicts {
-        if let ParamWarning::Conflict { id, detail } = w {
-            diagnostics.push(ImportDiagnostic::warning(format!(
-                "parameter `{id}` is declared with conflicting definitions across passes \
-                 ({detail}); keeping the first declaration"
-            )));
+        match w {
+            ParamWarning::Conflict { id, detail } => {
+                diagnostics.push(ImportDiagnostic::warning(format!(
+                    "parameter `{id}` is declared with conflicting definitions across passes \
+                     ({detail}); keeping the first declaration"
+                )));
+            }
+            // An orphan override (id with no scanned pragma — often the pragma is
+            // in an #included header): preserved as a synthesized parameter so the
+            // tuned value round-trips, and surfaced so it is not invisible.
+            ParamWarning::OrphanOverride { id, value } => {
+                diagnostics.push(ImportDiagnostic::info(format!(
+                    "parameter override `{id} = {value}` has no `#pragma parameter` \
+                     declaration in any pass body (it may live in an `#include`d header); \
+                     preserving the value as a synthesized parameter"
+                )));
+            }
+            ParamWarning::Malformed { .. } => {}
         }
     }
 
@@ -903,6 +916,62 @@ mystery_setting = banana
 
         // The raw declarations also live on the pass.
         assert_eq!(project.passes[0].parameters.len(), 2);
+    }
+
+    #[test]
+    fn orphan_override_is_preserved_as_parameter_with_info_diagnostic() {
+        // FINDING A1: a bare `id = value` whose `#pragma parameter` lives in an
+        // #included header (which import does NOT resolve) was silently dropped on
+        // import -> export — the tuned value vanished (gate #1 violation). It must
+        // now be preserved (as a synthesized parameter carrying the value) AND
+        // surfaced as an info diagnostic.
+        let dir = tempfile::tempdir().unwrap();
+        // The pass body declares NO pragma for HEADER_KNOB; it "lives in an
+        // #include" we don't resolve, so the scan sees nothing.
+        std::fs::write(
+            dir.path().join("a.slang"),
+            "#version 450\n#include \"params.inc\"\nvoid main(){}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p.slangp"),
+            "shaders = 1\n\
+             shader0 = a.slang\n\
+             HEADER_KNOB = 0.625\n",
+        )
+        .unwrap();
+
+        let (project, diags) = import_preset(dir.path().join("p.slangp")).expect("imports");
+
+        // The orphan override is preserved as a project parameter carrying its value.
+        let knob = project
+            .parameters
+            .iter()
+            .find(|p| p.name == "HEADER_KNOB")
+            .expect("orphan override preserved as a parameter");
+        assert_eq!(knob.default, 0.625, "tuned value survives import");
+
+        // …and the importer surfaces it as an INFO diagnostic (not silently lost).
+        assert!(
+            diags
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Info
+                    && d.message.contains("HEADER_KNOB")
+                    && d.message.contains("no `#pragma parameter`")),
+            "orphan override surfaced as info diagnostic: {:?}",
+            diags.diagnostics
+        );
+        // It is an Info, not a Warning (the import still produced a usable model).
+        assert!(
+            !diags.has_warnings()
+                || !diags
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.severity == Severity::Warning && d.message.contains("HEADER_KNOB")),
+            "orphan override is informational, not a warning: {:?}",
+            diags.diagnostics
+        );
     }
 
     #[test]

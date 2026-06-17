@@ -29,7 +29,7 @@
 //! softened to a diagnostic here so a real-world preset with a benign mismatch
 //! still imports).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use core_model::Parameter;
 
@@ -46,6 +46,20 @@ pub enum ParamWarning {
         id: String,
         /// Human-readable description of the field(s) that differ.
         detail: String,
+    },
+    /// A `.slangp` bare `id = value` override whose id matched **no**
+    /// `#pragma parameter` declaration scanned from any pass body (commonly because
+    /// the pragma lives in an `#include`d header, which the importer does not
+    /// resolve — see [`scan_parameters`]). Rather than silently drop the user's
+    /// tuned value (a gate #1 losslessness violation), reconciliation **synthesizes
+    /// a project [`Parameter`]** carrying the override as its default so it
+    /// round-trips, and records the orphaned id here so the importer can surface an
+    /// info diagnostic.
+    OrphanOverride {
+        /// The override id with no matching pragma declaration.
+        id: String,
+        /// The overridden value, preserved as the synthesized parameter's default.
+        value: f32,
     },
 }
 
@@ -124,8 +138,12 @@ fn parse_parameter(arg: &str) -> Option<Parameter> {
 /// pragma default). See the module docs for the duplicate-id reconciliation rule.
 ///
 /// Returns the reconciled parameters in **first-seen declaration order** (stable:
-/// pass order, then within-pass order) plus any [`ParamWarning::Conflict`]s for
-/// ids that diverged across passes.
+/// pass order, then within-pass order), followed by a synthesized [`Parameter`]
+/// for each **orphan** override — a `.slangp` `id = value` whose id matched no
+/// scanned pragma (these are appended in id-sorted order, which is deterministic
+/// and stable across a round trip). Emits a [`ParamWarning::Conflict`] for each id
+/// that diverged across passes and a [`ParamWarning::OrphanOverride`] for each
+/// synthesized orphan so the importer can surface both as diagnostics.
 pub fn reconcile_parameters(
     per_pass: &[Vec<Parameter>],
     overrides: &BTreeMap<String, f32>,
@@ -165,7 +183,47 @@ pub fn reconcile_parameters(
             p.default = value;
         }
     }
+
+    // Orphan overrides: a bare `id = value` whose pragma was never scanned (e.g.
+    // it lives in an `#include`d header). Synthesizing a project parameter that
+    // carries the value as its default makes it visible AND round-trip losslessly
+    // (the export re-emits a parameter with no pragma initial as `id = value`),
+    // instead of silently dropping the user's tuned value. `overrides` is a
+    // `BTreeMap`, so this appends in id-sorted (deterministic, round-trip-stable)
+    // order.
+    let declared: BTreeSet<&str> = reconciled.iter().map(|p| p.name.as_str()).collect();
+    let orphans: Vec<(&String, &f32)> = overrides
+        .iter()
+        .filter(|(id, _)| !declared.contains(id.as_str()))
+        .collect();
+    for (id, &value) in orphans {
+        warnings.push(ParamWarning::OrphanOverride {
+            id: id.clone(),
+            value,
+        });
+        reconciled.push(synthesize_orphan_parameter(id, value));
+    }
+
     reconciled
+}
+
+/// Synthesize a minimal project [`Parameter`] for an orphan override (a bare
+/// `.slangp` `id = value` with no scanned pragma). The value becomes the
+/// parameter's `default`; min/max bracket it and `step` is `0.0`. The synthesis is
+/// a **deterministic function of the value** so re-importing the re-emitted
+/// `id = value` yields an identical parameter — the round trip is stable.
+fn synthesize_orphan_parameter(id: &str, value: f32) -> Parameter {
+    // A degenerate [value, value] range: the importer has no pragma min/max for an
+    // orphan, and any deterministic bound keeps the round trip stable. The label
+    // mirrors the id (RetroArch shows the id when no label is known).
+    Parameter {
+        name: id.to_string(),
+        label: id.to_string(),
+        default: value,
+        min: value,
+        max: value,
+        step: 0.0,
+    }
 }
 
 /// Describe how two same-id parameter declarations differ, or `None` if they
@@ -391,8 +449,12 @@ mod tests {
     }
 
     #[test]
-    fn override_for_unknown_id_is_ignored() {
-        // A bare `id = value` with no matching pragma has nothing to apply to.
+    fn orphan_override_is_preserved_and_diagnosed() {
+        // A bare `id = value` with no matching pragma (its pragma lives in an
+        // #included header the importer doesn't resolve) must NOT be silently
+        // dropped — the user's tuned value would vanish on import -> export, a
+        // gate #1 losslessness violation. Instead reconciliation synthesizes a
+        // project parameter carrying the value and reports the orphan.
         let pass0 = vec![Parameter {
             name: "KNOWN".into(),
             label: "K".into(),
@@ -401,11 +463,46 @@ mod tests {
             max: 2.0,
             step: 0.1,
         }];
-        let overrides = BTreeMap::from([("UNKNOWN".to_owned(), 9.0_f32)]);
+        let overrides = BTreeMap::from([("ORPHAN".to_owned(), 9.0_f32)]);
         let mut warns = Vec::new();
         let out = reconcile_parameters(&[pass0], &overrides, &mut warns);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "KNOWN");
-        assert_eq!(out[0].default, 1.0);
+
+        // The known pragma parameter is unchanged…
+        let known = out.iter().find(|p| p.name == "KNOWN").expect("KNOWN kept");
+        assert_eq!(known.default, 1.0);
+
+        // …and the orphan override now appears as a synthesized parameter carrying
+        // its value (so it round-trips losslessly), bracketed by a deterministic
+        // [value, value] range.
+        let orphan = out
+            .iter()
+            .find(|p| p.name == "ORPHAN")
+            .expect("orphan override synthesized into a parameter");
+        assert_eq!(orphan.default, 9.0, "orphan value preserved as default");
+        assert_eq!(orphan.min, 9.0);
+        assert_eq!(orphan.max, 9.0);
+        assert_eq!(orphan.label, "ORPHAN");
+
+        // The orphan is surfaced as a warning the importer turns into a diagnostic.
+        assert!(
+            matches!(
+                warns.as_slice(),
+                [ParamWarning::OrphanOverride { id, value }]
+                    if id == "ORPHAN" && *value == 9.0
+            ),
+            "orphan override reported: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn orphan_override_synthesis_is_deterministic_for_round_trip() {
+        // Re-importing the re-emitted `id = value` must yield an identical
+        // parameter so the round trip is stable (no drift across iterations).
+        let overrides = BTreeMap::from([("ORPHAN".to_owned(), 0.375_f32)]);
+        let mut w1 = Vec::new();
+        let first = reconcile_parameters(&[], &overrides, &mut w1);
+        let mut w2 = Vec::new();
+        let second = reconcile_parameters(&[], &overrides, &mut w2);
+        assert_eq!(first, second, "orphan synthesis is deterministic");
     }
 }
