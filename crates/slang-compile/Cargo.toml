@@ -11,3 +11,4 @@ publish.workspace = true
 core-model = { workspace = true }
 tempfile = { workspace = true }
 naga = { workspace = true }
+rspirv = "0.13.0"

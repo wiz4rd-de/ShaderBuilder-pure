@@ -128,10 +128,12 @@ pub struct SpirvReflection {
     /// Uniform + push-constant blocks declared by either stage, merged by
     /// `(set, binding)` (a block shared by both stages appears once).
     pub blocks: Vec<UniformBlock>,
-    /// Sampled-texture globals. A combined GLSL `sampler2D` is **not** yet split
-    /// into a separate texture + sampler (tracked as a separate task); current
-    /// fixtures use the separate Vulkan `texture2D` + `sampler` form, so these are
-    /// pure `texture2D`s.
+    /// Sampled-texture globals. These are always the *separate* Vulkan
+    /// `texture2D` form by the time reflection runs: a shader's combined GLSL
+    /// `sampler2D` is split into a separate image + sampler by
+    /// [`crate::split_samplers`] inside the compile path, before reflection sees the
+    /// SPIR-V, so reflection never encounters a combined `OpTypeSampledImage`
+    /// variable.
     pub textures: Vec<ResourceBinding>,
     /// Sampler globals.
     pub samplers: Vec<ResourceBinding>,
@@ -443,6 +445,95 @@ void main() {
         let smp = &r.samplers[0];
         assert_eq!(smp.name, "Smp");
         assert_eq!((smp.set, smp.binding), (0, 2));
+    }
+
+    /// The exact shader that previously failed reflection with naga's
+    /// `invalid id %14`: a RetroArch-faithful passthrough declaring its input as a
+    /// *combined* `uniform sampler2D Source` and sampling with `texture(Source,…)`.
+    /// After the [`crate::split_samplers`] transform runs inside `compile_slang`,
+    /// reflection must succeed and report exactly ONE texture + ONE sampler.
+    const COMBINED_PASSTHROUGH: &str = "\
+#version 450
+layout(set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform sampler2D Source;
+void main() { FragColor = texture(Source, vTexCoord); }
+";
+
+    #[test]
+    fn combined_sampler2d_reflects_into_separate_texture_and_sampler() {
+        // The `invalid id %14` regression: this used to fail to reflect at all.
+        let shader = compile_slang(COMBINED_PASSTHROUGH, None).expect("compile combined sampler2D");
+        let r = reflect(&shader).expect("reflect transformed combined sampler");
+
+        // Exactly one texture, at the ORIGINAL binding (the transform keeps it).
+        assert_eq!(r.textures.len(), 1, "one texture: {:?}", r.textures);
+        let tex = &r.textures[0];
+        assert_eq!(tex.name, "Source");
+        assert_eq!(
+            (tex.set, tex.binding),
+            (0, 1),
+            "image keeps the source binding"
+        );
+
+        // Exactly one sampler, split out into the same set at the deterministic
+        // collision-free binding: the set uses {0 (UBO), 1 (Source)}, so the
+        // sampler is allocated at max+1 = 2.
+        assert_eq!(r.samplers.len(), 1, "one sampler: {:?}", r.samplers);
+        let smp = &r.samplers[0];
+        assert_eq!(smp.set, 0, "sampler shares the image's set");
+        assert_eq!(smp.binding, 2, "sampler binding = max existing (1) + 1");
+    }
+
+    #[test]
+    fn combined_texel_fetch_reflects_into_separate_texture_and_sampler() {
+        // Exercises the OpImage / OpImageFetch / OpImageQuerySizeLod path:
+        // `texelFetch` + `textureSize` lower the combined sampler to an image first.
+        let src = "\
+#version 450
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; vec4 SourceSize; } global;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+void main() { gl_Position = global.MVP * Position; vTexCoord = TexCoord; }
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform sampler2D Source;
+void main() {
+    ivec2 c = ivec2(vTexCoord * global.SourceSize.xy);
+    FragColor = texelFetch(Source, c, 0) + vec4(textureSize(Source, 0), 0.0, 0.0);
+}
+";
+        let shader = compile_slang(src, None).expect("compile texelFetch combined sampler2D");
+        let r = reflect(&shader).expect("reflect transformed texelFetch combined sampler");
+        assert_eq!(r.textures.len(), 1, "one texture: {:?}", r.textures);
+        assert_eq!((r.textures[0].set, r.textures[0].binding), (0, 1));
+        assert_eq!(r.samplers.len(), 1, "one sampler: {:?}", r.samplers);
+        // Set uses {0 (UBO), 1 (Source)}; the split sampler lands at max+1 = 2.
+        assert_eq!((r.samplers[0].set, r.samplers[0].binding), (0, 2));
+    }
+
+    #[test]
+    fn separate_sampler_fixture_is_untouched_by_the_split() {
+        // The no-op guarantee: a shader that already uses `texture2D`+`sampler`
+        // reflects exactly as before, with no extra/split sampler appearing.
+        let r = reflect_fixture();
+        assert_eq!(r.textures.len(), 1);
+        assert_eq!((r.textures[0].set, r.textures[0].binding), (0, 1));
+        assert_eq!(r.samplers.len(), 1);
+        // The hand-written `Smp` stays at its declared binding 2 — NOT relocated to
+        // 1001, proving the transform did not fire on the already-separate form.
+        assert_eq!(r.samplers[0].name, "Smp");
+        assert_eq!((r.samplers[0].set, r.samplers[0].binding), (0, 2));
     }
 
     #[test]

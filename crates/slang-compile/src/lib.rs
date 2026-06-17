@@ -11,6 +11,7 @@ pub mod cache;
 mod glslang;
 pub mod preprocess;
 pub mod reflect;
+pub mod split_samplers;
 
 use std::path::Path;
 
@@ -21,6 +22,7 @@ pub use reflect::{
     reflect, BlockBinding, MemberKind, ReflectError, ResourceBinding, ScalarType, SpirvReflection,
     UniformBlock, UniformMember,
 };
+pub use split_samplers::SplitError;
 
 /// Crate identity marker (kept from the Phase 0 scaffold so dependent crates'
 /// smoke tests keep the dependency edge live).
@@ -44,6 +46,15 @@ pub enum CompileError {
     Preprocess(PreprocessError),
     /// glslang rejected a stage or could not be run.
     Glslang(GlslangError),
+    /// The combined-image-sampler → separate-sampler SPIR-V transform failed
+    /// (unparseable SPIR-V, or a combined-sampler shape the transform refuses to
+    /// rewrite — see [`SplitError`]). Carries which stage hit it.
+    SplitSamplers {
+        /// Which stage's SPIR-V failed to transform.
+        stage: Stage,
+        /// The underlying split error.
+        source: SplitError,
+    },
 }
 
 impl From<PreprocessError> for CompileError {
@@ -63,6 +74,9 @@ impl std::fmt::Display for CompileError {
         match self {
             CompileError::Preprocess(e) => write!(f, "{e}"),
             CompileError::Glslang(e) => write!(f, "{e}"),
+            CompileError::SplitSamplers { stage, source } => {
+                write!(f, "{stage:?} stage sampler split failed: {source}")
+            }
         }
     }
 }
@@ -84,13 +98,26 @@ pub fn compile_slang(
 /// Compile already-preprocessed per-stage GLSL. Shared by [`compile_slang`] and
 /// the cache (which preprocesses once to form its key).
 pub(crate) fn compile_preprocessed(pre: &Preprocessed) -> Result<CompiledShader, CompileError> {
-    let vertex_spirv = glslang::compile_stage(Stage::Vertex, &pre.vertex)?;
-    let fragment_spirv = glslang::compile_stage(Stage::Fragment, &pre.fragment)?;
+    // glslang emits Vulkan-GLSL `sampler2D` as a *combined* `OpTypeSampledImage`,
+    // which neither our naga-based reflection nor wgpu's naga ingestion can parse.
+    // Normalize each stage's SPIR-V into the *separate* image + sampler form the
+    // engine speaks (a no-op for shaders that already use `texture2D`+`sampler`)
+    // before anything downstream sees it. See [`split_samplers`].
+    let vertex_spirv = split_stage(Stage::Vertex, &pre.vertex)?;
+    let fragment_spirv = split_stage(Stage::Fragment, &pre.fragment)?;
     Ok(CompiledShader {
         vertex_spirv,
         fragment_spirv,
         reflection: pre.reflection.clone(),
     })
+}
+
+/// Compile one stage to SPIR-V, then split its combined image-samplers into the
+/// separate form. Tagging the [`SplitError`] with the failing stage.
+fn split_stage(stage: Stage, source: &str) -> Result<Vec<u32>, CompileError> {
+    let spirv = glslang::compile_stage(stage, source)?;
+    split_samplers::split_combined_samplers(&spirv)
+        .map_err(|source| CompileError::SplitSamplers { stage, source })
 }
 
 #[cfg(test)]
