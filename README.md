@@ -71,6 +71,36 @@ npm run build
 cargo tauri dev
 ```
 
+### Manual preview run (curvature shader over the test image)
+
+The Phase 1 exit slice — a curvature/warp shader rendered over a test image —
+is proven headlessly by the `e2e_curvature` integration test:
+
+```bash
+# Real, deterministic GPU run of the full slice (no webview). Writes the live
+# rendered snapshot to target/e2e-artifacts/curvature_output.png.
+cargo test -p preview-engine --test e2e_curvature
+```
+
+The bundled fixtures it uses live under
+[`crates/preview-engine/tests/fixtures/`](crates/preview-engine/tests/fixtures/):
+
+- `curvature.slang` — one-pass barrel-distortion warp shader,
+- `passthrough.slang` — the control shader,
+- `test_source.png` — the 128×128 four-quadrant/grid/diagonal source image,
+- `curvature_reference.png` — a committed reference snapshot (documentation /
+  Phase-2 golden-suite seed only; **not** byte-compared in CI, since the CI
+  software-Vulkan/lavapipe output won't match a hardware GPU).
+
+To see the same warp on the app's `<canvas>`, launch the app and load the
+bundled `test_source.png` + `curvature.slang`. On a headless box (or one whose
+GDK/WebKit GPU path misbehaves) launch with the software-render env:
+
+```bash
+GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1 \
+  cargo tauri dev
+```
+
 CI runs all of the above on Linux for every push and PR — see
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) and the
 [Development section of CONTRIBUTING.md](./CONTRIBUTING.md#development).

@@ -13,3 +13,8 @@ source = { workspace = true }
 wgpu = { version = "29", features = ["spirv"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
+
+# The end-to-end exit test (`tests/e2e_curvature.rs`) loads a committed PNG
+# source fixture and writes the rendered curvature snapshot back out as PNG.
+[dev-dependencies]
+image = { workspace = true }

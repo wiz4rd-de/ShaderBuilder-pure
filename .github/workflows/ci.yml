@@ -69,7 +69,10 @@ jobs:
           path: web/dist
 
       # Tauri v2 Linux system dependencies (WebKitGTK 4.1 + friends) so the
-      # `app` crate links.
+      # `app` crate links, plus the toolchain the GPU/compile tests need:
+      #   * glslang-tools — provides `glslangValidator`, the slang-compile backend;
+      #   * mesa-vulkan-drivers — the lavapipe software Vulkan ICD wgpu renders on;
+      #   * vulkan-tools — `vulkaninfo` for debugging adapter selection in logs.
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
@@ -79,7 +82,10 @@ jobs:
             librsvg2-dev \
             libayatana-appindicator3-dev \
             libsoup-3.0-dev \
-            build-essential
+            build-essential \
+            glslang-tools \
+            mesa-vulkan-drivers \
+            vulkan-tools
 
       # Explicitly install the pinned toolchain *with* rustfmt + clippy. `rustup
       # show` alone is unreliable on the runner: auto-install uses the minimal
@@ -96,8 +102,27 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Force wgpu onto the lavapipe software-Vulkan adapter so the headless
+      # GPU tests (incl. the `e2e_curvature` Phase-1 exit test) run on the
+      # GPU-less runner. `Renderer::new` builds the instance via
+      # `new_without_display_handle_from_env`, so these env vars are honored.
       - name: Test
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          WGPU_BACKEND: vulkan
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: cargo test --workspace --locked
+
+      # Capture the rendered curvature snapshot (and passthrough control) the
+      # e2e test writes, so a render regression is inspectable from the run.
+      - name: Upload e2e render artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-render-artifacts
+          path: target/e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
 
       # `cargo test` above regenerated the committed TypeScript bindings (the
       # ts-rs #[ts(export)] tests). If they differ from what's checked in, the
