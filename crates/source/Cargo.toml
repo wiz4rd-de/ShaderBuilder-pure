@@ -9,3 +9,7 @@ publish.workspace = true
 
 [dependencies]
 core-model = { workspace = true }
+image = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
