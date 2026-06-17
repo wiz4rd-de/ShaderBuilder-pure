@@ -855,6 +855,84 @@ impl std::fmt::Display for ProjectLoadError {
 
 impl std::error::Error for ProjectLoadError {}
 
+/// What the `export_preset` command wrote, returned to the webview (#36, Fix C1):
+/// where the bundle landed and what files it contains, plus any non-fatal notes.
+///
+/// This is the success payload of the `export_preset` IPC command. It lives in
+/// `core-model` — not in the `app` crate — so a TypeScript binding is generated
+/// from the single shared schema (module doc §A) rather than escaping it as an
+/// untyped, binding-less JSON shape. The richer [`preset_io::ExportReport`] is the
+/// crate-internal writer report; this is its flattened, IPC-friendly projection
+/// (absolute `presetPath` as a string, no `PathBuf`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportResult {
+    /// Absolute path of the written `preset.slangp`.
+    pub preset_path: String,
+    /// Per-pass `.slang` file names written, relative to the bundle root.
+    pub pass_files: Vec<String>,
+    /// LUT file names written under `textures/`, relative to the bundle root.
+    pub texture_files: Vec<String>,
+    /// Non-fatal notes (e.g. a LUT source image that could not be copied in).
+    pub warnings: Vec<String>,
+}
+
+/// A typed error from exporting a RetroArch `.slangp` bundle (the `export_preset`
+/// command, #36, Fix C1). The webview-facing mirror of `preset_io::ExportError`:
+/// it lives in `core-model` so a TypeScript binding is generated (module doc §A),
+/// and — like [`ProjectSaveError`] / [`ProjectLoadError`] — it keeps the
+/// semantically distinct failure modes as **branchable** variants instead of
+/// collapsing them into one opaque string.
+///
+/// `std::io::Error` is not `Clone`/`Eq`/`Serialize`, so the [`Io`] variant carries
+/// only a message string rather than leaking the OS error directly, keeping the
+/// whole enum a clean, serializable IPC payload the Phase-7 export UX can match on.
+///
+/// [`Io`]: ExportError::Io
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ExportError {
+    /// The bundle could not be written (directory creation or file write failed).
+    /// Carries a human-readable message (the flattened `std::io::Error`).
+    Io {
+        /// The underlying I/O error message.
+        message: String,
+    },
+    /// A pass is authored as a node [`Graph`]; slang codegen for graph passes is a
+    /// later phase, so it cannot be exported yet. This is an expected, user-facing
+    /// limitation (distinct from an [`Io`] failure) — the frontend can surface it
+    /// specifically. Carries the offending pass id.
+    ///
+    /// [`Io`]: ExportError::Io
+    GraphPassUnsupported {
+        /// The id of the graph pass that cannot be exported yet.
+        pass_id: String,
+    },
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::Io { message } => {
+                write!(f, "could not write export bundle: {message}")
+            }
+            ExportError::GraphPassUnsupported { pass_id } => write!(
+                f,
+                "pass `{pass_id}` is a node graph; exporting graph passes to slang is not yet \
+                 supported (whole-pass / imported passes only)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,6 +1365,54 @@ mod tests {
             let back: ProjectSaveError = serde_json::from_value(value).expect("round-trips");
             assert_eq!(err, back);
         }
+    }
+
+    #[test]
+    fn export_error_serializes_as_branchable_ipc_payload() {
+        // The webview-facing export error must round-trip through serde and keep
+        // its variants distinguishable by the "kind" tag (Fix C1) — so the
+        // frontend can branch on GraphPassUnsupported specifically.
+        for err in [
+            ExportError::Io {
+                message: "disk full".to_owned(),
+            },
+            ExportError::GraphPassUnsupported {
+                pass_id: "pass-0".to_owned(),
+            },
+        ] {
+            let value = serde_json::to_value(&err).expect("serializes");
+            assert!(
+                value.get("kind").and_then(|k| k.as_str()).is_some(),
+                "export error carries a `kind` discriminator: {value}"
+            );
+            let back: ExportError = serde_json::from_value(value).expect("round-trips");
+            assert_eq!(err, back);
+        }
+        // The GraphPassUnsupported case is branchable on its typed field.
+        let graph = ExportError::GraphPassUnsupported {
+            pass_id: "p1".to_owned(),
+        };
+        match graph {
+            ExportError::GraphPassUnsupported { pass_id } => assert_eq!(pass_id, "p1"),
+            other => panic!("expected GraphPassUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_result_round_trips_camel_case() {
+        let result = ExportResult {
+            preset_path: "/tmp/out/preset.slangp".to_owned(),
+            pass_files: vec!["a.slang".to_owned()],
+            texture_files: vec!["border.png".to_owned()],
+            warnings: vec!["note".to_owned()],
+        };
+        let value = serde_json::to_value(&result).expect("serializes");
+        assert!(
+            value.get("presetPath").is_some(),
+            "fields are camelCase: {value}"
+        );
+        let back: ExportResult = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(result, back);
     }
 
     #[test]

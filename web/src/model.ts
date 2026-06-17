@@ -29,6 +29,11 @@ export type { LibraryRef } from "./bindings/LibraryRef";
 // (#38) — re-exported so the Phase-7 save/load UX can match on the variants.
 export type { ProjectLoadError } from "./bindings/ProjectLoadError";
 export type { ProjectSaveError } from "./bindings/ProjectSaveError";
+// Typed result + diagnostics returned by the export_preset command (#36, Fix C1)
+// — re-exported so the Phase-7 export UX can match on the variants (notably the
+// expected GraphPassUnsupported limitation vs a real Io write failure).
+export type { ExportResult } from "./bindings/ExportResult";
+export type { ExportError } from "./bindings/ExportError";
 
 /** Schema version the frontend was built against (mirrors PROJECT_SCHEMA_VERSION). */
 export const PROJECT_SCHEMA_VERSION = 1;
