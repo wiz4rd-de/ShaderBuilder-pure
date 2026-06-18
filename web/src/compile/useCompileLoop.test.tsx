@@ -106,9 +106,83 @@ describe("useCompileLoop", () => {
       await vi.advanceTimersByTimeAsync(2);
     });
     expect(store().pipelineValid).toBe(true);
-    expect(invokeIpc).toHaveBeenCalledWith("load_shader_source", { source: "// generated" });
+    // The single graph pass is pushed through the settings-aware chain command
+    // (carrying its PassSettings), not the settings-blind load_shader_source.
+    const call = invokeIpc.mock.calls.find((c) => c[0] === "load_chain_sources");
+    expect(call).toBeDefined();
+    const passes = (call![1] as { passes: Array<{ source: string }> }).passes;
+    expect(passes).toHaveLength(1);
+    expect(passes[0]!.source).toBe("// generated");
     expect(store().diagnosticsByNode).toEqual({});
     expect(store().problems).toEqual([]);
+  });
+
+  it("drops a stale out-of-order compile result (slow A, then fast B)", async () => {
+    // Edit A is dispatched first but resolves LAST; edit B is dispatched second and
+    // resolves FIRST. The loop tags each dispatch with an edit seq and DROPS a
+    // resolved result whose seq is no longer the latest. So when A (the older,
+    // slower compile) finally resolves, its stale diagnostics/source must NOT
+    // overwrite B's — the store must end with B's result, and the last preview
+    // dispatch must carry B's source.
+    const deferred = <T,>() => {
+      let resolve!: (v: T) => void;
+      const promise = new Promise<T>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    };
+    const dA = deferred<CompileGraphResult>();
+    const dB = deferred<CompileGraphResult>();
+
+    let call = 0;
+    const compile = vi.fn<InvokeCompile>(() => {
+      call += 1;
+      return call === 1 ? dA.promise : dB.promise;
+    });
+    const invokeIpc = vi.fn<Invoke>(async () => undefined);
+    render(<Host compile={compile} invokeIpc={invokeIpc} />);
+
+    // Dispatch A (the mount compile) by flushing the debounce.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2);
+    });
+    // A new edit dispatches B (a second, newer compile) while A is still in flight.
+    act(() => {
+      store().addNode("source", { x: 0, y: 0 });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2);
+    });
+    expect(compile).toHaveBeenCalledTimes(2);
+
+    // B (the newer edit) resolves FIRST with a clean source.
+    await act(async () => {
+      dB.resolve(cleanResult("// from B"));
+      await Promise.resolve();
+    });
+    // THEN A (the older, slower edit) resolves with a STALE error result.
+    await act(async () => {
+      dA.resolve({
+        source: null,
+        diagnostics: {
+          items: [
+            { severity: "error", code: "cycle", message: "stale A", node: "a1", port: null },
+          ],
+        },
+      });
+      await Promise.resolve();
+    });
+
+    // The store reflects B (clean), NOT A's stale error — A was dropped.
+    expect(store().pipelineValid).toBe(true);
+    expect(store().diagnosticsByNode).toEqual({});
+    expect(store().problems).toEqual([]);
+    // The last preview dispatch carried B's source (A never dispatched a preview).
+    const chainCalls = invokeIpc.mock.calls.filter((c) => c[0] === "load_chain_sources");
+    expect(chainCalls.length).toBeGreaterThan(0);
+    const last = chainCalls[chainCalls.length - 1]!;
+    const passes = (last[1] as { passes: Array<{ source: string }> }).passes;
+    expect(passes[0]!.source).toBe("// from B");
   });
 
   it("clears stale diagnostics on the next clean compile", async () => {
