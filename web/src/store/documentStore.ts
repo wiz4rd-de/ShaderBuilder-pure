@@ -28,6 +28,7 @@ import { create } from "zustand";
 
 import type { Diagnostic } from "../bindings/Diagnostic";
 import type { Graph } from "../bindings/Graph";
+import type { LibraryPayload } from "../bindings/LibraryPayload";
 import type { Node } from "../bindings/Node";
 import type { PassSettings } from "../bindings/PassSettings";
 import type { Project } from "../bindings/Project";
@@ -54,6 +55,7 @@ import {
   PLACEHOLDER_KIND,
 } from "./factories";
 import { collapseSelection, expandSubgraph } from "./collapse";
+import { SUBGRAPH_KIND } from "../nodes/subgraph";
 import { cloneSnapshot, deepClone, type DocSnapshot } from "./snapshot";
 import { resolveGraph, replaceGraph, subgraphAt } from "./subgraphNav";
 import { nextId } from "./ids";
@@ -304,6 +306,19 @@ export interface DocumentState {
   showPipeline: () => void;
   /** Drill into a pass's graph (remembering the pipeline viewport + selection). */
   openPass: (passId: string) => void;
+
+  /**
+   * Insert a library item's already-instantiated payload (#59) into the active
+   * graph at `position`. The payload MUST already carry fresh interior ids
+   * (mint them with `instantiateLibraryItem`); this action only mints the ONE
+   * wrapping node id and drops the node in. A `subgraph` payload drops in as a
+   * collapsed, drill-in-editable `kind=="subgraph"` node whose `data` is the
+   * Subgraph body; a `node` payload drops in as that node (its id is replaced
+   * with a fresh one so the action is self-contained). One undo entry; selects
+   * the inserted node. Returns the inserted node's id. Going through the store
+   * makes history + the debounced compile loop fire automatically.
+   */
+  insertLibraryPayload: (payload: LibraryPayload, position: Vec2) => string;
 
   // ---- subgraph collapse / expand / drill-in (#57) ----
   /**
@@ -954,6 +969,26 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         selections: { ...s.selections, pipeline: passId },
         selection: remembered,
       }));
+    },
+
+    insertLibraryPayload: (payload, position) => {
+      // Mint the ONE wrapping/placed-node id (the payload's interior ids are
+      // already fresh from instantiateLibraryItem). For a subgraph payload the
+      // node's `data` IS the Subgraph body; for a node payload we re-id the node
+      // so the action is self-contained regardless of how the payload was built.
+      const nodeId = nextId("node");
+      const node: Node =
+        payload.kind === "subgraph"
+          ? {
+              id: nodeId,
+              kind: SUBGRAPH_KIND,
+              position,
+              data: payload.subgraph as unknown as Record<string, unknown>,
+            }
+          : { ...payload.node, id: nodeId, position };
+      mutateGraph((g) => ({ ...g, nodes: [...g.nodes, node] }));
+      set({ selection: { nodeIds: [nodeId], edgeIds: [] } });
+      return nodeId;
     },
 
     collapseSelection: (name) => {
