@@ -107,6 +107,29 @@ describe("save / saveAs", () => {
     expect(deps.saveProject).not.toHaveBeenCalled();
   });
 
+  it("preserves an edit made DURING the in-flight save (F10)", async () => {
+    // The save serializes a pre-await snapshot, but a node added while the write is
+    // in flight must NOT be clobbered by that stale snapshot when the store commits.
+    let editId = "";
+    const deps = fakeDeps({
+      pickSavePath: vi.fn(async () => "/tmp/a.json"),
+      saveProject: vi.fn(async () => {
+        // Simulate the user editing mid-write (between snapshot and commit).
+        editId = store().addNode("placeholder", { x: 10, y: 10 });
+      }),
+    });
+
+    const ok = await save(deps);
+
+    expect(ok).toBe(true);
+    // The mid-save edit survives in the committed document.
+    expect(store().activeGraph().nodes.some((n) => n.id === editId)).toBe(true);
+    // The save path was still recorded.
+    expect(store().currentProjectPath).toBe("/tmp/a.json");
+    // The committed project carries the stamped metadata.
+    expect(store().project.metadata.modifiedAt).toBe("2026-06-18T00:00:00.000Z");
+  });
+
   it("a save IO failure returns false and keeps the document dirty", async () => {
     const deps = fakeDeps({
       pickSavePath: vi.fn(async () => "/tmp/a.json"),

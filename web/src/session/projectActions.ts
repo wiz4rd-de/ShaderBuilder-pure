@@ -173,8 +173,24 @@ async function writeTo(path: string, deps: SessionDeps): Promise<boolean> {
     useToastStore.getState().push("error", `Could not save ${basename(path)}: ${describe(err)}`);
     return false;
   }
-  // Commit the stamped metadata + the saved path into the store and clear dirty.
-  useDocumentStore.setState({ project, dirty: false, currentProjectPath: path });
+  // Commit the stamped metadata + saved path into the store. The `project` snapshot
+  // above was captured BEFORE the async write, so re-reading the CURRENT store
+  // project here preserves any edits made during the save round-trip (#63 / F10)
+  // rather than clobbering them with the stale pre-await copy. We restamp only the
+  // createdAt/modifiedAt metadata onto whatever the live document is now, then let
+  // `markSaved` clear dirty + record the path.
+  const live = useDocumentStore.getState().project;
+  useDocumentStore.setState({
+    project: {
+      ...live,
+      metadata: {
+        ...live.metadata,
+        createdAt: live.metadata.createdAt ?? now,
+        modifiedAt: now,
+      },
+    },
+  });
+  useDocumentStore.getState().markSaved(path);
   await recordRecent(path, project.name, deps);
   await deps.clearRecovery().catch(() => undefined);
   return true;
