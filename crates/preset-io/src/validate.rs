@@ -214,7 +214,10 @@ mod tests {
         //    inline param default.
         let preset_path = out.path().join(crate::PRESET_FILENAME);
         assert!(preset_path.is_file(), "preset.slangp written");
-        assert!(out.path().join(&report.pass_files[0]).is_file(), ".slang written");
+        assert!(
+            out.path().join(&report.pass_files[0]).is_file(),
+            ".slang written"
+        );
         assert_eq!(report.texture_files.len(), 1);
         assert!(out
             .path()
@@ -226,8 +229,14 @@ mod tests {
             let value = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
             assert!(!value.starts_with('/'), "relative paths only: {line:?}");
         }
-        assert!(text.contains("BRIGHT = 1.5"), "tuned default inline:\n{text}");
-        assert!(text.contains("textures/"), "LUT referenced relatively:\n{text}");
+        assert!(
+            text.contains("BRIGHT = 1.5"),
+            "tuned default inline:\n{text}"
+        );
+        assert!(
+            text.contains("textures/"),
+            "LUT referenced relatively:\n{text}"
+        );
 
         // 4. Re-import the exported bundle (the Phase-3 round trip) — it parses and
         //    preserves the passes, the tuned parameter, and the LUT.
