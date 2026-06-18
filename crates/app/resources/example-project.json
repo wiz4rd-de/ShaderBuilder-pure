@@ -1,0 +1,171 @@
+{
+  "schemaVersion": 1,
+  "name": "CRT Scanlines + Curvature",
+  "passes": [
+    {
+      "id": "pass-0",
+      "name": "Pass 0",
+      "source": {
+        "kind": "wholePassCode",
+        "source": "#version 450\n\n// Example preset — pass 0: CRT screen CURVATURE (barrel distortion).\n//\n// Warps the source UVs outward from the centre so the image bulges like an old\n// curved CRT tube, then samples the source through the warped coordinate. UVs\n// that fall off the (now curved) screen are darkened to a black border.\n//\n// This is the first pass of the bundled \"CRT Scanlines + Curvature\" example\n// project shipped with ShaderBuilder (docs/example-project.md). It is authored\n// as plain whole-pass slang so it compiles, previews, and exports unchanged.\n\nlayout(push_constant) uniform Push\n{\n\tvec4 SourceSize;\n\tvec4 OriginalSize;\n\tvec4 OutputSize;\n\tuint FrameCount;\n\tfloat CURVATURE;\n\tfloat CORNER_SMOOTH;\n} params;\n\n#pragma parameter CURVATURE \"Screen Curvature\" 0.10 0.0 0.40 0.01\n#pragma parameter CORNER_SMOOTH \"Corner Vignette\" 0.03 0.0 0.20 0.01\n\nlayout(std140, set = 0, binding = 0) uniform UBO\n{\n\tmat4 MVP;\n} global;\n\n#pragma stage vertex\nlayout(location = 0) in vec4 Position;\nlayout(location = 1) in vec2 TexCoord;\nlayout(location = 0) out vec2 vTexCoord;\n\nvoid main()\n{\n\tgl_Position = global.MVP * Position;\n\tvTexCoord = TexCoord;\n}\n\n#pragma stage fragment\nlayout(location = 0) in vec2 vTexCoord;\nlayout(location = 0) out vec4 FragColor;\nlayout(set = 0, binding = 2) uniform sampler2D Source;\n\n// Barrel-distort a centred UV by `amount`.\nvec2 curve(vec2 uv, float amount)\n{\n\tuv = uv * 2.0 - 1.0;\n\tvec2 offset = abs(uv.yx) / vec2(6.0, 5.0);\n\tuv = uv + uv * offset * offset * amount * 10.0;\n\treturn uv * 0.5 + 0.5;\n}\n\nvoid main()\n{\n\tvec2 uv = curve(vTexCoord, params.CURVATURE);\n\n\t// Darken the corners and anything that warped off-screen.\n\tvec2 edge = smoothstep(vec2(0.0), vec2(params.CORNER_SMOOTH + 0.001), uv)\n\t          * smoothstep(vec2(0.0), vec2(params.CORNER_SMOOTH + 0.001), vec2(1.0) - uv);\n\tfloat vignette = clamp(edge.x * edge.y, 0.0, 1.0);\n\n\tvec3 color = texture(Source, clamp(uv, 0.0, 1.0)).rgb;\n\tcolor *= vignette;\n\n\tFragColor = vec4(color, 1.0);\n}\n",
+        "filename": "curvature.slang",
+        "opaque": true
+      },
+      "parameters": [
+        {
+          "name": "CURVATURE",
+          "label": "Screen Curvature",
+          "default": 0.1,
+          "min": 0.0,
+          "max": 0.4,
+          "step": 0.01
+        },
+        {
+          "name": "CORNER_SMOOTH",
+          "label": "Corner Vignette",
+          "default": 0.03,
+          "min": 0.0,
+          "max": 0.2,
+          "step": 0.01
+        }
+      ],
+      "settings": {
+        "scaleX": {
+          "scaleType": "source",
+          "scale": 1.0
+        },
+        "scaleY": {
+          "scaleType": "source",
+          "scale": 1.0
+        },
+        "filterLinear": true,
+        "wrapMode": null,
+        "mipmapInput": null,
+        "floatFramebuffer": null,
+        "srgbFramebuffer": null,
+        "alias": null,
+        "frameCountMod": null
+      },
+      "references": [
+        {
+          "name": "Source",
+          "kind": "source"
+        }
+      ]
+    },
+    {
+      "id": "pass-1",
+      "name": "Pass 1",
+      "source": {
+        "kind": "wholePassCode",
+        "source": "#version 450\n\n// Example preset — pass 1: CRT SCANLINES.\n//\n// Modulates the (already curvature-warped) image from pass 0 with a vertical\n// sine pattern locked to the source's vertical resolution, so each scan row gets\n// a soft dark gap like a CRT's raster lines. A weight knob fades the effect.\n//\n// Second pass of the bundled \"CRT Scanlines + Curvature\" example project\n// (docs/example-project.md). Plain whole-pass slang: compiles, previews, exports.\n\nlayout(push_constant) uniform Push\n{\n\tvec4 SourceSize;\n\tvec4 OriginalSize;\n\tvec4 OutputSize;\n\tuint FrameCount;\n\tfloat SCANLINE_WEIGHT;\n\tfloat BRIGHTNESS;\n} params;\n\n#pragma parameter SCANLINE_WEIGHT \"Scanline Strength\" 0.40 0.0 1.0 0.05\n#pragma parameter BRIGHTNESS \"Brightness Boost\" 1.15 0.5 2.0 0.05\n\nlayout(std140, set = 0, binding = 0) uniform UBO\n{\n\tmat4 MVP;\n} global;\n\n#define PI 3.141592654\n\n#pragma stage vertex\nlayout(location = 0) in vec4 Position;\nlayout(location = 1) in vec2 TexCoord;\nlayout(location = 0) out vec2 vTexCoord;\n\nvoid main()\n{\n\tgl_Position = global.MVP * Position;\n\tvTexCoord = TexCoord;\n}\n\n#pragma stage fragment\nlayout(location = 0) in vec2 vTexCoord;\nlayout(location = 0) out vec4 FragColor;\nlayout(set = 0, binding = 2) uniform sampler2D Source;\n\nvoid main()\n{\n\tvec3 color = texture(Source, vTexCoord).rgb * params.BRIGHTNESS;\n\n\t// One dark band per source row.\n\tfloat lines = sin(vTexCoord.y * params.SourceSize.y * PI);\n\tfloat scan = 1.0 - params.SCANLINE_WEIGHT * (lines * lines);\n\n\tFragColor = vec4(color * scan, 1.0);\n}\n",
+        "filename": "scanlines.slang",
+        "opaque": true
+      },
+      "parameters": [
+        {
+          "name": "SCANLINE_WEIGHT",
+          "label": "Scanline Strength",
+          "default": 0.4,
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.05
+        },
+        {
+          "name": "BRIGHTNESS",
+          "label": "Brightness Boost",
+          "default": 1.15,
+          "min": 0.5,
+          "max": 2.0,
+          "step": 0.05
+        }
+      ],
+      "settings": {
+        "scaleX": {
+          "scaleType": "viewport",
+          "scale": null
+        },
+        "scaleY": {
+          "scaleType": "viewport",
+          "scale": null
+        },
+        "filterLinear": true,
+        "wrapMode": null,
+        "mipmapInput": null,
+        "floatFramebuffer": null,
+        "srgbFramebuffer": null,
+        "alias": null,
+        "frameCountMod": null
+      },
+      "references": [
+        {
+          "name": "Source",
+          "kind": "source"
+        }
+      ]
+    }
+  ],
+  "feedbackPass": null,
+  "pipeline": {
+    "aliases": [],
+    "availability": [
+      {
+        "passIndex": 0,
+        "available": [
+          "Original",
+          "Source"
+        ]
+      },
+      {
+        "passIndex": 1,
+        "available": [
+          "Original",
+          "Source",
+          "PassOutput0"
+        ]
+      }
+    ]
+  },
+  "parameters": [
+    {
+      "name": "CURVATURE",
+      "label": "Screen Curvature",
+      "default": 0.1,
+      "min": 0.0,
+      "max": 0.4,
+      "step": 0.01
+    },
+    {
+      "name": "CORNER_SMOOTH",
+      "label": "Corner Vignette",
+      "default": 0.03,
+      "min": 0.0,
+      "max": 0.2,
+      "step": 0.01
+    },
+    {
+      "name": "SCANLINE_WEIGHT",
+      "label": "Scanline Strength",
+      "default": 0.4,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    },
+    {
+      "name": "BRIGHTNESS",
+      "label": "Brightness Boost",
+      "default": 1.15,
+      "min": 0.5,
+      "max": 2.0,
+      "step": 0.05
+    }
+  ],
+  "luts": [],
+  "metadata": {
+    "description": "A two-pass CRT example: screen curvature then scanlines. Open it from the start screen to see a live preview, then tweak the parameters or export it as a .slangp bundle.",
+    "author": "ShaderBuilder",
+    "createdAt": null,
+    "modifiedAt": null
+  },
+  "libraryRefs": []
+}

@@ -4188,6 +4188,7 @@ dependencies = [
  "ir",
  "preset-io",
  "preview-engine",
+ "serde_json",
  "slang-compile",
  "source",
  "tempfile",
