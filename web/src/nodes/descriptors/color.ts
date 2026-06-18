@@ -48,7 +48,7 @@ export const YIQ_TO_RGB_ROWS: readonly [number, number, number][] = [
 ];
 
 /** Build the column-major `mat3(...)` literal for a row-form 3x3 matrix. */
-function mat3FromRows(rows: readonly [number, number, number][]): string {
+export function mat3FromRows(rows: readonly [number, number, number][]): string {
   // GLSL mat3 args are columns, so emit column j = (rows[0][j], rows[1][j], rows[2][j]).
   const cols: string[] = [];
   for (let j = 0; j < 3; j++) {

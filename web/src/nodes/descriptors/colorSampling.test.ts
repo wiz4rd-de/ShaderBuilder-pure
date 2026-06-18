@@ -19,6 +19,7 @@ import {
   RGB_TO_YIQ_ROWS,
   YIQ_TO_RGB_ROWS,
   colorDescriptors,
+  mat3FromRows,
 } from "./color";
 import { gaussianWeights, samplingDescriptors } from "./sampling";
 
@@ -91,6 +92,21 @@ describe("RGB ↔ YIQ", () => {
         expect(Math.abs(back[k] - v[k])).toBeLessThan(1e-5);
       }
     }
+  });
+
+  it("mat3FromRows transposes rows → GLSL column-major args (column-by-column)", () => {
+    // GLSL `mat3(a,b,c, d,e,f, g,h,i)` reads its 9 scalars as COLUMNS, so a
+    // row-form matrix must be emitted column-by-column. For the row matrix
+    // [[1,2,3],[4,5,6],[7,8,9]] the columns are (1,4,7),(2,5,8),(3,6,9). A
+    // missing transpose (emitting rows verbatim) would silently apply Mᵀ — pinning
+    // this exact string guards the YIQ matrix orientation at the GLSL level.
+    expect(
+      mat3FromRows([
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+      ]),
+    ).toBe("mat3(1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0)");
   });
 
   it("emits the forward/inverse matrices as a mat3 * color expression", () => {

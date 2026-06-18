@@ -1010,6 +1010,112 @@ fn sampling_crt_mask_snippet_compiles_and_tracks_output_size() {
     });
 }
 
+/// #51 Color acceptance (YIQ): the `RGB → YIQ → RGB` colour nodes — two vec3-port
+/// CustomSnippets emitting column-major NTSC matrices — compile end-to-end. Mirrors
+/// the IrGraph the TS bridge emits for `Source → swizzle(.rgb) → rgbToYiq → yiqToRgb
+/// → construct(vec4) → Output`. The snippet bodies are the VERBATIM strings
+/// `web/src/nodes/descriptors/color.ts` generates (the column-major `mat3(...)`
+/// literals from `mat3FromRows`), so this pins that the transposed matrix args
+/// compile through the real slang path (a malformed `mat3(...)` would fail here).
+#[test]
+fn color_rgb_yiq_roundtrip_snippet_compiles() {
+    // Column-major (mat3 args are COLUMNS): the row matrix is transposed, exactly as
+    // mat3FromRows emits. See web/src/nodes/descriptors/color.ts.
+    let fwd_body =
+        "result = mat3(0.299, 0.595716, 0.211456, 0.587, -0.274453, -0.522591, 0.114, -0.321263, 0.311135) * color;";
+    let inv_body =
+        "result = mat3(1.0, 1.0, 1.0, 0.956296, -0.272122, -1.106989, 0.621024, -0.647381, 1.704615) * color;";
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "rgb",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "rgb".to_owned(),
+                    },
+                    operands: vec!["in".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "fwd",
+                NodeOp::CustomSnippet {
+                    body: fwd_body.to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec3)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            IrNode::new(
+                "inv",
+                NodeOp::CustomSnippet {
+                    body: inv_body.to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec3)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            IrNode::new(
+                "one",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 1.0 },
+                },
+            ),
+            IrNode::new(
+                "rgba",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: PortType::Vec4 },
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "rgb", "in"),
+            IrEdge::new("rgb", "out", "fwd", "color"),
+            IrEdge::new("fwd", "result", "inv", "color"),
+            IrEdge::new("inv", "result", "rgba", "a"),
+            IrEdge::new("one", "out", "rgba", "b"),
+            IrEdge::new("rgba", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "rgb↔yiq colour graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("rgb↔yiq colour graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("color_yiq".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    // The column-major matrix args reached the emitted source verbatim.
+    assert!(
+        slang.contains("mat3(0.299, 0.595716, 0.211456,"),
+        "forward YIQ matrix emitted column-major:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("rgb↔yiq colour graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
 /// The frontend custom-snippet node (#52, web/src/nodes/descriptors/custom.ts)
 /// lowers to a `CustomSnippet` whose author-typed body reads its declared input
 /// ports and assigns its declared output ports. This pins the node's DEFAULT body
