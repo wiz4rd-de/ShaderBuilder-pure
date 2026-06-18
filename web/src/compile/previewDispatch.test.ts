@@ -31,12 +31,17 @@ function result(
 }
 
 describe("dispatchPreview", () => {
-  it("sends a single renderable pass via load_shader_source", async () => {
+  it("sends a single renderable pass via the settings-aware load_chain_sources", async () => {
+    // A single pass MUST still carry its PassSettings (scale/filter/wrap/format) —
+    // it goes through load_chain_sources like any chain, NOT the settings-blind
+    // load_shader_source which dropped them (#4-review).
     const invoke = vi.fn(async () => undefined);
     const dispatched = await dispatchPreview(result([{ passId: "a", source: "// s" }], true), invoke);
     expect(dispatched).toBe(true);
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke).toHaveBeenCalledWith("load_shader_source", { source: "// s" });
+    expect(invoke).toHaveBeenCalledWith("load_chain_sources", {
+      passes: [{ source: "// s", settings: settings() }],
+    });
   });
 
   it("sends a multi-pass chain via load_chain_sources in pipeline order", async () => {
