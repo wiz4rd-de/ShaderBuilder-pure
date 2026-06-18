@@ -484,6 +484,23 @@
   align-self: flex-start;
 }
 
+/* ---- Code editor (custom-snippet body / whole-pass source) ---- */
+.inspector__field--code {
+  margin-bottom: 10px;
+}
+
+.inspector__code {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .inspector__vec {
   display: flex;
   gap: 4px;

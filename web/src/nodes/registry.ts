@@ -5,6 +5,7 @@
 // #52 custom snippet) — never by special-casing a kind elsewhere.
 import { colorDescriptors } from "./descriptors/color";
 import { coordinateDescriptors } from "./descriptors/coordinates";
+import { customDescriptors } from "./descriptors/custom";
 import { mathDescriptors } from "./descriptors/math";
 import { outputDescriptor } from "./descriptors/output";
 import { samplerDescriptors } from "./descriptors/samplers";
@@ -26,6 +27,7 @@ export const ALL_DESCRIPTORS: ReadonlyArray<NodeDescriptor> = [
   ...mathDescriptors,
   ...vectorDescriptors,
   ...colorDescriptors,
+  ...customDescriptors,
   outputDescriptor,
 ];
 

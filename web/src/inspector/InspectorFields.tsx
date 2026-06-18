@@ -22,8 +22,11 @@ interface FieldProps {
 
 /** Render the right widget for a field's kind. */
 export function InspectorFieldRow({ field, data, editor }: FieldProps): React.JSX.Element {
+  // Code fields are multi-line: stack the label above a full-width editor.
+  const className =
+    "inspector__field" + (field.kind === "code" ? " inspector__field--code" : "");
   return (
-    <label className="inspector__field">
+    <label className={className}>
       <span className="inspector__field-label">{field.label}</span>
       <FieldWidget field={field} data={data} editor={editor} />
     </label>
@@ -34,6 +37,8 @@ function FieldWidget({ field, data, editor }: FieldProps): React.JSX.Element {
   switch (field.kind) {
     case "text":
       return <TextField field={field} data={data} editor={editor} />;
+    case "code":
+      return <CodeField field={field} data={data} editor={editor} />;
     case "number":
     case "integer":
       return <NumberField field={field} data={data} editor={editor} />;
@@ -59,6 +64,27 @@ function TextField({ field, data, editor }: FieldProps): React.JSX.Element {
     <input
       type="text"
       className="inspector__input"
+      value={value}
+      onChange={(e) => {
+        setValue(e.target.value);
+        editor.live({ [field.key]: e.target.value });
+      }}
+      onBlur={() => editor.flush()}
+    />
+  );
+}
+
+// ---- code (multi-line GLSL/slang body) ------------------------------------
+
+function CodeField({ field, data, editor }: FieldProps): React.JSX.Element {
+  const stored = typeof data[field.key] === "string" ? (data[field.key] as string) : "";
+  const [value, setValue] = useState(stored);
+  useEffect(() => setValue(stored), [stored]);
+  return (
+    <textarea
+      className="inspector__input inspector__code"
+      spellCheck={false}
+      rows={8}
       value={value}
       onChange={(e) => {
         setValue(e.target.value);

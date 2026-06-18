@@ -41,6 +41,7 @@ export type InspectorFieldKind =
   | "number"
   | "integer"
   | "text"
+  | "code"
   | "boolean"
   | "select"
   | "vec2"
