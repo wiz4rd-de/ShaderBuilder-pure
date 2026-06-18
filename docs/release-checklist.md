@@ -108,7 +108,7 @@ prove the artifact is self-contained.
 
 1. **Launch** — download the artifact from the (draft) Release:
    - AppImage: `chmod +x ShaderBuilder_1.0.0_amd64.AppImage && ./ShaderBuilder_1.0.0_amd64.AppImage`
-   - .deb: `sudo apt install ./ShaderBuilder_1.0.0_amd64.deb && shaderbuilder`
+   - .deb: `sudo apt install ./ShaderBuilder_1.0.0_amd64.deb && ShaderBuilder`
    - On a headless/odd-GPU box, fall back to software GL:
      `LIBGL_ALWAYS_SOFTWARE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 ./ShaderBuilder_*.AppImage`
    - PASS: the window opens to the start screen.

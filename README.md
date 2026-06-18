@@ -43,7 +43,7 @@ chmod +x ShaderBuilder_1.0.0_amd64.AppImage
 
 ```bash
 sudo apt install ./ShaderBuilder_1.0.0_amd64.deb
-shaderbuilder            # or launch "ShaderBuilder" from your app menu
+ShaderBuilder            # or launch "ShaderBuilder" from your app menu
 ```
 
 Runtime dependencies (WebKitGTK 4.1, GTK 3) are declared by the `.deb` and are
