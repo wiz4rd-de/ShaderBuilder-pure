@@ -219,6 +219,109 @@ const fn port_type_eq(a: PortType, b: PortType) -> bool {
     a as u8 == b as u8
 }
 
+/// A concrete RetroArch texture a [`NodeOp::Sample`] reads from (Spec §7 binding
+/// table). This is the **typed, resolved** reference (it carries its index/name),
+/// distinct from the import-scan's coarse [`TextureRefKind`](crate::TextureRefKind)
+/// classification: the emitter (#42) maps each variant to a concrete RetroArch
+/// sampler identifier (`Source`, `Original`, `OriginalHistory2`, `PassOutput0`,
+/// `PassFeedback1`, or a LUT name) and assigns its `layout(set=0, binding=N)`.
+///
+/// History/PassOutput/PassFeedback carry a `u32` index; a LUT carries its name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum TextureSource {
+    /// `Source` — the previous pass's output (`Original` for pass 0).
+    Source,
+    /// `Original` — the whole-chain input frame (≡ `OriginalHistory0`).
+    Original,
+    /// `OriginalHistoryN` — `Original` from `index` frames ago (§5). Index `0`
+    /// is `Original` itself.
+    OriginalHistory {
+        /// How many frames back (`OriginalHistory{index}`).
+        index: u32,
+    },
+    /// `PassOutputN` — pass `index`'s output **this frame** (causal, §7).
+    PassOutput {
+        /// The producing pass index (`PassOutput{index}`).
+        index: u32,
+    },
+    /// `PassFeedbackN` — pass `index`'s output from the **previous** frame (§4).
+    PassFeedback {
+        /// The producing pass index (`PassFeedback{index}`).
+        index: u32,
+    },
+    /// A LUT texture bound by its `textures` name (`<NAME>`, §7).
+    Lut {
+        /// The LUT name as declared in the project's `luts`.
+        name: String,
+    },
+}
+
+/// A reserved RetroArch builtin-semantic uniform a [`NodeOp::Builtin`] reads
+/// (Spec §8.1; the worked-example header). These names are **reserved** — the
+/// emitter spells each exactly as the RetroArch slang identifier (e.g.
+/// `SourceSize`, `FrameCount`, `MVP`), reading them from the push-constant /
+/// global UBO. Each variant's documented [`PortType`] is its value type, which
+/// the type checker uses for the builtin node's output port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BuiltinSemantic {
+    /// `SourceSize` — `vec4(w, h, 1/w, 1/h)` of this pass's input. [`PortType::Vec4`].
+    SourceSize,
+    /// `OriginalSize` — `vec4` of the whole-chain input frame. [`PortType::Vec4`].
+    OriginalSize,
+    /// `OutputSize` — `vec4` of this pass's render target. [`PortType::Vec4`].
+    OutputSize,
+    /// `FinalViewportSize` — `vec4` of the simulated final viewport. [`PortType::Vec4`].
+    FinalViewportSize,
+    /// `FrameCount` — the running frame counter (`uint`). [`PortType::Int`].
+    FrameCount,
+    /// `FrameDirection` — `+1` playing forward, `-1` rewinding (`int`). [`PortType::Int`].
+    FrameDirection,
+    /// `MVP` — the model-view-projection matrix used by the standard vertex
+    /// stage. Has no scalar/vector [`PortType`] (it is a `mat4`); a graph node
+    /// never consumes it directly — the vertex stage is the fixed `MVP*Position`
+    /// passthrough — but the semantic is enumerated for completeness/round-trip.
+    Mvp,
+}
+
+impl BuiltinSemantic {
+    /// The [`PortType`] of this builtin's value, or `None` for [`BuiltinSemantic::Mvp`]
+    /// (a `mat4`, which has no scalar/vector port type). The type checker (#40)
+    /// uses this to type a [`NodeOp::Builtin`] node's output port.
+    pub const fn port_type(self) -> Option<PortType> {
+        match self {
+            BuiltinSemantic::SourceSize
+            | BuiltinSemantic::OriginalSize
+            | BuiltinSemantic::OutputSize
+            | BuiltinSemantic::FinalViewportSize => Some(PortType::Vec4),
+            BuiltinSemantic::FrameCount | BuiltinSemantic::FrameDirection => Some(PortType::Int),
+            BuiltinSemantic::Mvp => None,
+        }
+    }
+
+    /// The exact RetroArch slang identifier this semantic emits as (e.g.
+    /// `"SourceSize"`, `"FrameCount"`, `"MVP"`). Reserved names — the emitter
+    /// (#42) writes these verbatim into the generated shader.
+    pub const fn slang_name(self) -> &'static str {
+        match self {
+            BuiltinSemantic::SourceSize => "SourceSize",
+            BuiltinSemantic::OriginalSize => "OriginalSize",
+            BuiltinSemantic::OutputSize => "OutputSize",
+            BuiltinSemantic::FinalViewportSize => "FinalViewportSize",
+            BuiltinSemantic::FrameCount => "FrameCount",
+            BuiltinSemantic::FrameDirection => "FrameDirection",
+            BuiltinSemantic::Mvp => "MVP",
+        }
+    }
+}
+
 #[cfg(test)]
 mod port_type_tests {
     use super::*;
@@ -360,5 +463,105 @@ mod port_type_tests {
             serde_json::to_value(PortType::Sampler2D).unwrap(),
             serde_json::json!("sampler2D")
         );
+    }
+}
+
+#[cfg(test)]
+mod texture_and_builtin_tests {
+    use super::*;
+
+    #[test]
+    fn texture_source_round_trips_and_tags() {
+        for ts in [
+            TextureSource::Source,
+            TextureSource::Original,
+            TextureSource::OriginalHistory { index: 2 },
+            TextureSource::PassOutput { index: 0 },
+            TextureSource::PassFeedback { index: 1 },
+            TextureSource::Lut {
+                name: "BORDER".to_owned(),
+            },
+        ] {
+            let v = serde_json::to_value(&ts).expect("serializes");
+            assert!(
+                v.get("kind").and_then(|k| k.as_str()).is_some(),
+                "carries a `kind` discriminator: {v}"
+            );
+            let back: TextureSource = serde_json::from_value(v).expect("round-trips");
+            assert_eq!(ts, back);
+        }
+    }
+
+    #[test]
+    fn texture_source_tags_are_camel_case() {
+        assert_eq!(
+            serde_json::to_value(TextureSource::OriginalHistory { index: 3 }).unwrap(),
+            serde_json::json!({ "kind": "originalHistory", "index": 3 })
+        );
+        assert_eq!(
+            serde_json::to_value(TextureSource::PassFeedback { index: 1 }).unwrap(),
+            serde_json::json!({ "kind": "passFeedback", "index": 1 })
+        );
+        assert_eq!(
+            serde_json::to_value(TextureSource::Lut {
+                name: "OVERLAY".to_owned()
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "lut", "name": "OVERLAY" })
+        );
+    }
+
+    #[test]
+    fn builtin_semantic_port_types() {
+        assert_eq!(
+            BuiltinSemantic::SourceSize.port_type(),
+            Some(PortType::Vec4)
+        );
+        assert_eq!(
+            BuiltinSemantic::OutputSize.port_type(),
+            Some(PortType::Vec4)
+        );
+        assert_eq!(
+            BuiltinSemantic::FinalViewportSize.port_type(),
+            Some(PortType::Vec4)
+        );
+        assert_eq!(BuiltinSemantic::FrameCount.port_type(), Some(PortType::Int));
+        assert_eq!(
+            BuiltinSemantic::FrameDirection.port_type(),
+            Some(PortType::Int)
+        );
+        assert_eq!(BuiltinSemantic::Mvp.port_type(), None);
+    }
+
+    #[test]
+    fn builtin_semantic_slang_names_are_reserved_spellings() {
+        assert_eq!(BuiltinSemantic::SourceSize.slang_name(), "SourceSize");
+        assert_eq!(BuiltinSemantic::OriginalSize.slang_name(), "OriginalSize");
+        assert_eq!(BuiltinSemantic::OutputSize.slang_name(), "OutputSize");
+        assert_eq!(
+            BuiltinSemantic::FinalViewportSize.slang_name(),
+            "FinalViewportSize"
+        );
+        assert_eq!(BuiltinSemantic::FrameCount.slang_name(), "FrameCount");
+        assert_eq!(
+            BuiltinSemantic::FrameDirection.slang_name(),
+            "FrameDirection"
+        );
+        assert_eq!(BuiltinSemantic::Mvp.slang_name(), "MVP");
+    }
+
+    #[test]
+    fn builtin_semantic_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_value(BuiltinSemantic::SourceSize).unwrap(),
+            serde_json::json!("sourceSize")
+        );
+        assert_eq!(
+            serde_json::to_value(BuiltinSemantic::Mvp).unwrap(),
+            serde_json::json!("mvp")
+        );
+        let back: BuiltinSemantic =
+            serde_json::from_value(serde_json::json!("frameDirection")).unwrap();
+        assert_eq!(back, BuiltinSemantic::FrameDirection);
     }
 }
