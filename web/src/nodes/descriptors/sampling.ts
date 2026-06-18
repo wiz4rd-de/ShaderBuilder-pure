@@ -95,7 +95,7 @@ export const gaussianBlurDescriptor: NodeDescriptor = {
     }
     return ports;
   },
-  outputs: () => [{ name: "out", type: "vec4", label: "color" }],
+  outputs: () => [{ name: "result", type: "vec4", label: "color" }],
   defaultData: () => ({ taps: 5, sigma: 1.5 }),
   inspector: (): InspectorField[] => [
     { key: "taps", label: "Tap count (odd, 3–15)", kind: "integer", min: 3, max: 15, step: 2 },
@@ -112,9 +112,9 @@ export const gaussianBlurDescriptor: NodeDescriptor = {
     }
     return {
       kind: "customSnippet",
-      body: `out = ${terms.join(" + ")};`,
+      body: `result = ${terms.join(" + ")};`,
       inputs: inputs.map((p) => ({ name: p.name, type: p.type })),
-      outputs: [{ name: "out", type: "vec4" }],
+      outputs: [{ name: "result", type: "vec4" }],
     };
   },
 };
@@ -137,7 +137,7 @@ export const sharpBilinearDescriptor: NodeDescriptor = {
     { name: "uv", type: "vec2", label: "UV" },
     { name: "sourceSize", type: "vec4", label: "SourceSize" },
   ],
-  outputs: () => [{ name: "out", type: "vec2", label: "UV" }],
+  outputs: () => [{ name: "result", type: "vec2", label: "UV" }],
   defaultData: () => ({ sharpness: 1 }),
   inspector: (): InspectorField[] => [
     { key: "sharpness", label: "Sharpness (0–1)", kind: "number", min: 0, max: 1, step: 0.01 },
@@ -153,7 +153,7 @@ export const sharpBilinearDescriptor: NodeDescriptor = {
       "vec2 center = floor(texel) + vec2(0.5);",
       "vec2 frac = texel - center;",
       `vec2 snapped = center + clamp(frac * ${glslFloat(sh === 1 ? 1e6 : 1 / (1 - sh))}, vec2(-0.5), vec2(0.5));`,
-      "out = snapped * sourceSize.zw;",
+      "result = snapped * sourceSize.zw;",
     ].join("\n");
     return {
       kind: "customSnippet",
@@ -162,7 +162,7 @@ export const sharpBilinearDescriptor: NodeDescriptor = {
         { name: "uv", type: "vec2" },
         { name: "sourceSize", type: "vec4" },
       ],
-      outputs: [{ name: "out", type: "vec2" }],
+      outputs: [{ name: "result", type: "vec2" }],
     };
   },
 };
@@ -209,7 +209,7 @@ function maskBody(type: string, strength: number): string {
         "vec3 m = vec3(step(col, 1.0), step(1.0, col) * step(col, 2.0), step(2.0, col));",
         "float slot = step(0.5, mod(floor(px.y / 2.0) + floor(px.x / 3.0), 2.0));",
         "m *= mix(1.0, slot, 0.5);",
-        `out = mix(vec3(1.0), m * 3.0, ${s});`,
+        `result = mix(vec3(1.0), m * 3.0, ${s});`,
       ].join("\n");
     }
     case "shadowMask": {
@@ -219,7 +219,7 @@ function maskBody(type: string, strength: number): string {
         "float phase = mod(px.x, 3.0);",
         "vec3 m = vec3(step(phase, 1.0), step(1.0, phase) * step(phase, 2.0), step(2.0, phase));",
         "float rowDim = mix(1.0, 0.7, mod(floor(px.y), 2.0));",
-        `out = mix(vec3(1.0), m * 3.0 * rowDim, ${s});`,
+        `result = mix(vec3(1.0), m * 3.0 * rowDim, ${s});`,
       ].join("\n");
     }
     case "apertureGrille":
@@ -229,7 +229,7 @@ function maskBody(type: string, strength: number): string {
         head,
         "float phase = mod(px.x, 3.0);",
         "vec3 m = vec3(step(phase, 1.0), step(1.0, phase) * step(phase, 2.0), step(2.0, phase));",
-        `out = mix(vec3(1.0), m * 3.0, ${s});`,
+        `result = mix(vec3(1.0), m * 3.0, ${s});`,
       ].join("\n");
     }
   }
@@ -250,7 +250,7 @@ export const crtMaskDescriptor: NodeDescriptor = {
     { name: "uv", type: "vec2", label: "UV" },
     { name: "outputSize", type: "vec4", label: "OutputSize" },
   ],
-  outputs: () => [{ name: "out", type: "vec3", label: "mask" }],
+  outputs: () => [{ name: "result", type: "vec3", label: "mask" }],
   defaultData: () => ({ mask: "apertureGrille", strength: 0.5 }),
   inspector: (): InspectorField[] => [
     {
@@ -268,7 +268,7 @@ export const crtMaskDescriptor: NodeDescriptor = {
       { name: "uv", type: "vec2" },
       { name: "outputSize", type: "vec4" },
     ],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 

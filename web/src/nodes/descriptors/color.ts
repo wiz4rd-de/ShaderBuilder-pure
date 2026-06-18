@@ -23,7 +23,7 @@ function glslFloat(n: number): string {
 /** A vec3 colour input port (the upstream RGB a transform consumes). */
 const RGB_IN: PortSpec[] = [{ name: "color", type: "vec3", label: "RGB" }];
 /** A vec3 colour output port (what every colour transform yields). */
-const RGB_OUT: PortSpec[] = [{ name: "out", type: "vec3", label: "RGB" }];
+const RGB_OUT: PortSpec[] = [{ name: "result", type: "vec3", label: "RGB" }];
 
 // ---- RGB ↔ YIQ (standard NTSC matrices + true inverse) --------------------
 //
@@ -64,14 +64,14 @@ export const rgbToYiqDescriptor: NodeDescriptor = {
   label: "RGB → YIQ",
   description: "Convert RGB to NTSC YIQ (standard matrix).",
   inputs: () => RGB_IN,
-  outputs: () => [{ name: "out", type: "vec3", label: "YIQ" }],
+  outputs: () => [{ name: "result", type: "vec3", label: "YIQ" }],
   defaultData: () => ({}),
   inspector: () => [],
   toNodeOp: () => ({
     kind: "customSnippet",
-    body: `out = ${mat3FromRows(RGB_TO_YIQ_ROWS)} * color;`,
+    body: `result = ${mat3FromRows(RGB_TO_YIQ_ROWS)} * color;`,
     inputs: [{ name: "color", type: "vec3" }],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 
@@ -87,9 +87,9 @@ export const yiqToRgbDescriptor: NodeDescriptor = {
   inspector: () => [],
   toNodeOp: () => ({
     kind: "customSnippet",
-    body: `out = ${mat3FromRows(YIQ_TO_RGB_ROWS)} * color;`,
+    body: `result = ${mat3FromRows(YIQ_TO_RGB_ROWS)} * color;`,
     inputs: [{ name: "color", type: "vec3" }],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 
@@ -116,10 +116,10 @@ export const linearToSrgbDescriptor: NodeDescriptor = {
       "vec3 lo = color * 12.92;",
       "vec3 hi = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;",
       "vec3 cutoff = step(vec3(0.0031308), color);",
-      "out = mix(lo, hi, cutoff);",
+      "result = mix(lo, hi, cutoff);",
     ].join("\n"),
     inputs: [{ name: "color", type: "vec3" }],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 
@@ -139,10 +139,10 @@ export const srgbToLinearDescriptor: NodeDescriptor = {
       "vec3 lo = color / 12.92;",
       "vec3 hi = pow((max(color, vec3(0.0)) + 0.055) / 1.055, vec3(2.4));",
       "vec3 cutoff = step(vec3(0.04045), color);",
-      "out = mix(lo, hi, cutoff);",
+      "result = mix(lo, hi, cutoff);",
     ].join("\n"),
     inputs: [{ name: "color", type: "vec3" }],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 
@@ -167,7 +167,7 @@ export const lumaDescriptor: NodeDescriptor = {
   label: "Luma",
   description: "Weighted luminance of an RGB colour (Rec.601 / Rec.709).",
   inputs: () => RGB_IN,
-  outputs: () => [{ name: "out", type: "float", label: "luma" }],
+  outputs: () => [{ name: "result", type: "float", label: "luma" }],
   defaultData: () => ({ weights: "rec601" }),
   inspector: (): InspectorField[] => [
     {
@@ -181,9 +181,9 @@ export const lumaDescriptor: NodeDescriptor = {
     const [r, g, b] = lumaWeights(data);
     return {
       kind: "customSnippet",
-      body: `out = dot(color, vec3(${glslFloat(r)}, ${glslFloat(g)}, ${glslFloat(b)}));`,
+      body: `result = dot(color, vec3(${glslFloat(r)}, ${glslFloat(g)}, ${glslFloat(b)}));`,
       inputs: [{ name: "color", type: "vec3" }],
-      outputs: [{ name: "out", type: "float" }],
+      outputs: [{ name: "result", type: "float" }],
     };
   },
 };
@@ -206,9 +206,9 @@ export const contrastDescriptor: NodeDescriptor = {
     const amount = glslFloat(readNumber(data, "amount", 1));
     return {
       kind: "customSnippet",
-      body: `out = (color - vec3(0.5)) * ${amount} + vec3(0.5);`,
+      body: `result = (color - vec3(0.5)) * ${amount} + vec3(0.5);`,
       inputs: [{ name: "color", type: "vec3" }],
-      outputs: [{ name: "out", type: "vec3" }],
+      outputs: [{ name: "result", type: "vec3" }],
     };
   },
 };
@@ -229,9 +229,9 @@ export const gammaDescriptor: NodeDescriptor = {
     const gamma = glslFloat(readNumber(data, "gamma", 2.2));
     return {
       kind: "customSnippet",
-      body: `out = pow(max(color, vec3(0.0)), vec3(${gamma}));`,
+      body: `result = pow(max(color, vec3(0.0)), vec3(${gamma}));`,
       inputs: [{ name: "color", type: "vec3" }],
-      outputs: [{ name: "out", type: "vec3" }],
+      outputs: [{ name: "result", type: "vec3" }],
     };
   },
 };
@@ -277,12 +277,12 @@ export const blendDescriptor: NodeDescriptor = {
   ],
   toNodeOp: (data: NodeData) => ({
     kind: "customSnippet",
-    body: `out = ${blendMode(data).expr};`,
+    body: `result = ${blendMode(data).expr};`,
     inputs: [
       { name: "a", type: "vec3" },
       { name: "b", type: "vec3" },
     ],
-    outputs: [{ name: "out", type: "vec3" }],
+    outputs: [{ name: "result", type: "vec3" }],
   }),
 };
 

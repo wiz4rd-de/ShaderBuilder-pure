@@ -181,7 +181,7 @@ describe("gaussian blur (N-tap separable)", () => {
     expect(op.kind).toBe("customSnippet");
     if (op.kind === "customSnippet") {
       expect(op.inputs.map((p) => p.name)).toEqual(["tap0", "tap1", "tap2", "tap3", "tap4"]);
-      expect(op.outputs).toEqual([{ name: "out", type: "vec4" }]);
+      expect(op.outputs).toEqual([{ name: "result", type: "vec4" }]);
     }
   });
 
@@ -258,7 +258,7 @@ describe("graphToIr round-trips a colour + sampling graph", () => {
       edges: [
         edge(uv.id, "uv", src.id, "coord"),
         edge(src.id, "out", dec.id, "color"),
-        edge(dec.id, "out", out.id, "color"),
+        edge(dec.id, "result", out.id, "color"),
       ],
     };
     const { ir, issues } = graphToIr(graph);
