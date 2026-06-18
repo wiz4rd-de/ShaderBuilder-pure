@@ -322,6 +322,321 @@ impl BuiltinSemantic {
     }
 }
 
+/// A typed literal value produced by a [`NodeOp::Const`] (Spec §8.2). Each
+/// variant pins both the value and its [`PortType`] — the type checker (#40)
+/// reads [`const_type`](ConstValue::port_type) for the const node's output port,
+/// and the emitter (#42) writes the matching slang literal/constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ConstValue {
+    /// A `float` literal. [`PortType::Float`].
+    Float {
+        /// The scalar value.
+        value: f32,
+    },
+    /// A `vec2` literal. [`PortType::Vec2`].
+    Vec2 {
+        /// The two components `[x, y]`.
+        value: [f32; 2],
+    },
+    /// A `vec3` literal. [`PortType::Vec3`].
+    Vec3 {
+        /// The three components `[x, y, z]`.
+        value: [f32; 3],
+    },
+    /// A `vec4` literal. [`PortType::Vec4`].
+    Vec4 {
+        /// The four components `[x, y, z, w]`.
+        value: [f32; 4],
+    },
+    /// An `int` literal. [`PortType::Int`].
+    Int {
+        /// The integer value.
+        value: i32,
+    },
+    /// A `bool` literal. [`PortType::Bool`].
+    Bool {
+        /// The boolean value.
+        value: bool,
+    },
+}
+
+impl ConstValue {
+    /// The [`PortType`] of this literal's value.
+    pub const fn port_type(&self) -> PortType {
+        match self {
+            ConstValue::Float { .. } => PortType::Float,
+            ConstValue::Vec2 { .. } => PortType::Vec2,
+            ConstValue::Vec3 { .. } => PortType::Vec3,
+            ConstValue::Vec4 { .. } => PortType::Vec4,
+            ConstValue::Int { .. } => PortType::Int,
+            ConstValue::Bool { .. } => PortType::Bool,
+        }
+    }
+}
+
+/// The intrinsic operation an [`NodeOp::Expr`] performs over its operand ports
+/// (Spec §8.3 node taxonomy). The set is deliberately the intrinsics #44's
+/// fixtures exercise (color transform, contrast/gamma, UV warp, blur taps) plus
+/// the common GLSL math the node taxonomy needs — each maps 1:1 to a slang
+/// intrinsic or operator the emitter (#42) writes, and each is buildable by #44.
+///
+/// **Arity / typing** (used by the #40 type checker): the binary arithmetic ops
+/// are component-wise with scalar broadcast; `mix`/`clamp` are ternary; the unary
+/// math ops are one operand; `dot` is binary → `float`; `normalize`/`length` act
+/// on a vector; `swizzle` carries the selecting [`mask`](ExprOp::Swizzle::mask).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[ts(export)]
+pub enum ExprOp {
+    /// `a + b` (component-wise, scalar-broadcasting). Binary.
+    Add,
+    /// `a - b` (component-wise, scalar-broadcasting). Binary.
+    Sub,
+    /// `a * b` (component-wise, scalar-broadcasting). Binary.
+    Mul,
+    /// `a / b` (component-wise, scalar-broadcasting). Binary.
+    Div,
+    /// `mix(a, b, t)` — linear interpolation. Ternary.
+    Mix,
+    /// `clamp(x, lo, hi)`. Ternary.
+    Clamp,
+    /// `min(a, b)` (component-wise). Binary.
+    Min,
+    /// `max(a, b)` (component-wise). Binary.
+    Max,
+    /// `pow(a, b)` (component-wise). Binary.
+    Pow,
+    /// `sin(x)` (component-wise). Unary.
+    Sin,
+    /// `cos(x)` (component-wise). Unary.
+    Cos,
+    /// `abs(x)` (component-wise). Unary.
+    Abs,
+    /// `floor(x)` (component-wise). Unary.
+    Floor,
+    /// `fract(x)` (component-wise). Unary.
+    Fract,
+    /// `dot(a, b)` → `float`. Binary; operands must share a vector type.
+    Dot,
+    /// `normalize(v)` → same vector type. Unary.
+    Normalize,
+    /// `length(v)` → `float`. Unary.
+    Length,
+    /// A component **swizzle** `v.<mask>` (e.g. `.rgb`, `.xy`, `.x`). Unary; the
+    /// result type is [`PortType::swizzle_result`] of the operand and `mask`.
+    Swizzle {
+        /// The swizzle accessor mask (`xyzw` / `rgba` / `stpq`, length 1..=4).
+        mask: String,
+    },
+    /// Construct a `vecN` from its scalar/sub-vector operands (e.g. build a
+    /// `vec4` from a `vec3` + a `float`). The target type is [`ty`](ExprOp::Construct::ty);
+    /// this is the explicit widening the implicit rules forbid. Variadic.
+    Construct {
+        /// The vector type to construct.
+        ty: PortType,
+    },
+}
+
+/// A reference to one **port** on a node in an [`IrGraph`] — the endpoint an
+/// [`IrEdge`] connects (Architecture §C). Ports are named by string identifiers
+/// declared by the node's [`NodeOp`] (its input/output port names); an edge wires
+/// a `(source.node, source.port)` output to a `(target.node, target.port)` input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PortRef {
+    /// The [`IrNode::id`] this port belongs to.
+    pub node: String,
+    /// The port identifier on that node (e.g. `"out"`, `"coord"`, `"a"`).
+    pub port: String,
+}
+
+impl PortRef {
+    /// Construct a [`PortRef`] from a node id and a port name.
+    pub fn new(node: impl Into<String>, port: impl Into<String>) -> Self {
+        Self {
+            node: node.into(),
+            port: port.into(),
+        }
+    }
+}
+
+/// A typed input/output port declaration on a [`NodeOp::CustomSnippet`]
+/// (Architecture §C). The snippet's GLSL `body` reads its declared `inputs` and
+/// writes its declared `outputs` by name; the type checker validates the wired
+/// edges against these types and the emitter substitutes them into the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PortDecl {
+    /// The port identifier (the GLSL variable name the snippet body uses).
+    pub name: String,
+    /// The port's type.
+    #[serde(rename = "type")]
+    pub ty: PortType,
+}
+
+impl PortDecl {
+    /// Construct a [`PortDecl`] from a name and type.
+    pub fn new(name: impl Into<String>, ty: PortType) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+        }
+    }
+}
+
+/// The operation a single [`IrNode`] performs — the per-node op model
+/// (Architecture §C). A node's **inputs** are wired by [`IrEdge`]s targeting its
+/// input port names; its **output(s)** are referenced by edges sourcing its
+/// output port names. The op carries only its intrinsic configuration (which
+/// texture, which semantic, which literal, which intrinsic, the snippet body) —
+/// never the wiring, which lives on the edges.
+///
+/// ## Port-name conventions
+///
+/// Each variant has a fixed set of port names the lowering pass (#41) and type
+/// checker (#40) agree on:
+///
+/// - [`Sample`](NodeOp::Sample): input `"coord"` (a `vec2`); output `"out"` (a `vec4`).
+/// - [`Builtin`](NodeOp::Builtin): no inputs; output `"out"` (the semantic's type).
+/// - [`Param`](NodeOp::Param): no inputs; output `"out"` (`float`).
+/// - [`Const`](NodeOp::Const): no inputs; output `"out"` (the literal's type).
+/// - [`Expr`](NodeOp::Expr): inputs are the entries of `operands` (in order);
+///   output `"out"`.
+/// - [`Output`](NodeOp::Output): input `"color"` (a `vec4`); no output. Exactly
+///   one reachable [`Output`] per graph (the final color sink).
+/// - [`CustomSnippet`](NodeOp::CustomSnippet): inputs/outputs are the declared
+///   [`PortDecl`]s, addressed by their `name`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum NodeOp {
+    /// Sample a RetroArch texture at a coordinate. Reads its `"coord"` input port
+    /// (`vec2`) and produces a `vec4` on `"out"`.
+    Sample {
+        /// Which RetroArch texture to sample.
+        texture: TextureSource,
+    },
+    /// Read a builtin-semantic uniform; produces the semantic's type on `"out"`.
+    Builtin {
+        /// Which reserved RetroArch semantic to read.
+        semantic: BuiltinSemantic,
+    },
+    /// Read a declared `#pragma parameter` value; produces a `float` on `"out"`.
+    Param {
+        /// The parameter identifier (must match a declared [`Parameter`](crate::Parameter)).
+        name: String,
+    },
+    /// A typed literal constant; produces the literal's type on `"out"`.
+    Const {
+        /// The literal value (and its type).
+        value: ConstValue,
+    },
+    /// An intrinsic expression over the named `operands` input ports; produces
+    /// its result on `"out"`. The result type is determined by `op` and the
+    /// operand types (Spec §8.2 rules).
+    Expr {
+        /// The intrinsic to apply.
+        op: ExprOp,
+        /// The **ordered** input port names this expression consumes. Each name
+        /// is an input port of this node that an [`IrEdge`] wires a value into;
+        /// the order is the operand order of `op` (e.g. `["a", "b"]` for `add`,
+        /// `["x", "lo", "hi"]` for `clamp`).
+        operands: Vec<String>,
+    },
+    /// The final color sink — the one reachable per graph. Reads its `"color"`
+    /// input port (`vec4`) and writes it to `FragColor`. Produces no output port.
+    Output,
+    /// A verbatim GLSL snippet with typed in/out ports (the escape hatch inside a
+    /// graph). The `body` reads its declared `inputs` by name and assigns its
+    /// declared `outputs` by name; the emitter inlines it with those substitutions.
+    CustomSnippet {
+        /// The GLSL statements. References its input port names as in-scope
+        /// values and assigns its output port names.
+        body: String,
+        /// Typed input ports (the snippet's free variables).
+        inputs: Vec<PortDecl>,
+        /// Typed output ports (the values the snippet assigns).
+        outputs: Vec<PortDecl>,
+    },
+}
+
+/// A directed, port-to-port connection in an [`IrGraph`] (Architecture §C): the
+/// `source` node's **output** port feeds the `target` node's **input** port. The
+/// value's type must be [`assignable_to`](PortType::assignable_to) the target
+/// port's type (validated by the #40 type checker).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IrEdge {
+    /// The output port the value comes from.
+    pub source: PortRef,
+    /// The input port the value flows into.
+    pub target: PortRef,
+}
+
+impl IrEdge {
+    /// Wire `source_node.source_port` → `target_node.target_port`.
+    pub fn new(
+        source_node: impl Into<String>,
+        source_port: impl Into<String>,
+        target_node: impl Into<String>,
+        target_port: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: PortRef::new(source_node, source_port),
+            target: PortRef::new(target_node, target_port),
+        }
+    }
+}
+
+/// A single typed node in an [`IrGraph`]: a stable `id` plus its [`NodeOp`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IrNode {
+    /// Stable unique id, referenced by [`IrEdge`]/[`PortRef`] and diagnostics.
+    pub id: String,
+    /// The operation this node performs.
+    pub op: NodeOp,
+}
+
+impl IrNode {
+    /// Construct an [`IrNode`] from an id and an op.
+    pub fn new(id: impl Into<String>, op: NodeOp) -> Self {
+        Self { id: id.into(), op }
+    }
+}
+
+/// The per-pass **typed dataflow DAG** (Architecture §C) — the codegen-facing
+/// model the type checker (#40), lowering (#41), and emitter (#42) consume.
+///
+/// This is the typed counterpart to the skeletal editor [`Graph`](crate::Graph)
+/// (see the module docs): nodes are concrete [`NodeOp`]s with typed ports, edges
+/// wire output ports to input ports. A well-formed graph has exactly one
+/// reachable [`NodeOp::Output`] sink; the lowering pass topologically sorts from
+/// it. Hand-built in Rust for Phase-4 tests; the editor → IR bridge is Phase 5.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IrGraph {
+    /// The typed nodes.
+    pub nodes: Vec<IrNode>,
+    /// The directed, port-to-port connections between nodes.
+    pub edges: Vec<IrEdge>,
+}
+
 #[cfg(test)]
 mod port_type_tests {
     use super::*;
