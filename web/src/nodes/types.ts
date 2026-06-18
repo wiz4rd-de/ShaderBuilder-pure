@@ -81,6 +81,13 @@ export interface NodeDescriptor<D extends NodeData = NodeData> {
   /** A one-line palette/inspector description. */
   description?: string;
   /**
+   * An optional DATA-DERIVED node title shown on the canvas (and breadcrumb)
+   * INSTEAD of the static `label` — e.g. a subgraph node shows its `data.name`.
+   * Falls back to `label` when absent or when it returns an empty string. A
+   * user-set `data.label` still wins over this (see graphAdapter.deriveLabel).
+   */
+  title?: (data: D) => string;
+  /**
    * The node's input ports. May depend on `data` (e.g. an Expr's operand ports
    * are derived from its op). Static descriptors return a constant array.
    */
