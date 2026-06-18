@@ -185,18 +185,87 @@ export function connectionLegal(srcType: PortType, target: ConnectionTarget): bo
 
 /**
  * The OUTPUT type a source node's `port` produces, accounting for data-derived
- * port types (a Swizzle's output depends on its stored mask, a Combine's on its
- * target type, a CustomSnippet's on its editable ports). Reads the node's CURRENT
- * `data` via its descriptor — never a cached spec. Returns `null` when the node
- * kind / port is unresolvable (treated as "cannot judge" by callers).
+ * port types (a Swizzle's output depends on its stored mask AND its live input
+ * type, a Combine's on its target type, a CustomSnippet's on its editable ports).
+ * Reads the node's CURRENT `data` via its descriptor — never a cached spec.
+ *
+ * It is **graph-aware** so it can faithfully mirror the IR's
+ * [`PortType::swizzle_result`] typing: a node that lowers to an [`Expr` swizzle]
+ * (Swizzle / Split) produces `swizzleResult(inputType, mask)` of its live input,
+ * NOT a type fabricated from the mask length alone. When that input is
+ * unconnected / indeterminate, or the mask is illegal for it, the result is
+ * `null` — exactly the IR's `None`, which `check_edge_types` lets the downstream
+ * edge SKIP (no `typeMismatch`). Returning `null` makes {@link judgeConnection}
+ * DEFER to `compile_graph` rather than fabricate a verdict the checker would not
+ * make.
+ *
+ * Returns `null` when the node kind / port is unresolvable (treated as "cannot
+ * judge" by callers).
  */
-export function sourceOutputType(node: Node, port: string): PortType | null {
+export function sourceOutputType(
+  graph: Graph,
+  node: Node,
+  port: string,
+  visited: ReadonlySet<string> = new Set(),
+): PortType | null {
   const descriptor = getDescriptor(node.kind);
   if (!descriptor) {
     return null;
   }
+
+  // A node whose output type is INPUT-DERIVED (an `Expr` swizzle: Swizzle /
+  // Split) must be typed from its live input + mask via `swizzleResult`, mirroring
+  // `PortType::swizzle_result`. Deriving it from the mask length alone (the
+  // descriptor's canvas hint) diverges from the IR — which returns `None` (and so
+  // SKIPS the edge) when the mask is illegal for the input or the input is unfed.
+  if (port === "out") {
+    let op;
+    try {
+      op = descriptor.toNodeOp(node.data);
+    } catch {
+      op = undefined; // subgraph guard / malformed data — fall back to the descriptor.
+    }
+    if (op && op.kind === "expr" && op.op.op === "swizzle") {
+      const operand = op.operands[0];
+      if (operand === undefined) {
+        return null;
+      }
+      const inputType = inputSourceType(graph, node.id, operand, visited);
+      if (inputType === null) {
+        return null; // input unfed / indeterminate — defer (mirrors IR `None`).
+      }
+      return swizzleResult(inputType, op.op.mask);
+    }
+  }
+
   const spec = descriptor.outputs(node.data).find((p) => p.name === port);
   return spec ? spec.type : null;
+}
+
+/**
+ * The type flowing INTO `nodeId`'s input `port` — the output type of the source
+ * node feeding it (the editor-side mirror of `TypeInferer::input_type`). Returns
+ * `null` when the port is unfed, the source is missing, or a cycle is detected
+ * (`visited` guards re-entrancy on a malformed graph).
+ */
+function inputSourceType(
+  graph: Graph,
+  nodeId: string,
+  port: string,
+  visited: ReadonlySet<string>,
+): PortType | null {
+  if (visited.has(nodeId)) {
+    return null; // cycle — the checker reports it; don't loop here.
+  }
+  const edge = graph.edges.find((e) => e.target === nodeId && e.targetPort === port);
+  if (!edge) {
+    return null; // unfed input — indeterminate.
+  }
+  const srcNode = graph.nodes.find((n) => n.id === edge.source);
+  if (!srcNode) {
+    return null;
+  }
+  return sourceOutputType(graph, srcNode, edge.sourcePort, new Set([...visited, nodeId]));
 }
 
 /**
@@ -308,7 +377,7 @@ export function judgeConnection(
   if (!srcNode || !tgtNode) {
     return { legal: false, sourceType: null, coercion: "none" };
   }
-  const srcType = sourceOutputType(srcNode, sourcePort);
+  const srcType = sourceOutputType(graph, srcNode, sourcePort);
   const classified = classifyTarget(tgtNode, targetPort);
   // If either endpoint is unresolvable, don't block — defer to compile_graph.
   if (srcType === null || classified === null) {
@@ -335,7 +404,7 @@ export function edgeIsIllegal(graph: Graph, edge: Edge): boolean {
   if (!srcNode || !tgtNode) {
     return false;
   }
-  const srcType = sourceOutputType(srcNode, edge.sourcePort);
+  const srcType = sourceOutputType(graph, srcNode, edge.sourcePort);
   const classified = classifyTarget(tgtNode, edge.targetPort);
   if (srcType === null || classified === null) {
     return false; // cannot judge — defer to compile_graph

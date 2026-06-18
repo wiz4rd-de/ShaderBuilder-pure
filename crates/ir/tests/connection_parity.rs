@@ -283,3 +283,255 @@ fn predicate_agrees_with_full_checker() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Parity #3 (#65 F2/F3): DATA-DERIVED editor sources — Swizzle / Split / Combine.
+//
+// The two parity checks above only ever feed ABSTRACT PortType pairs into the
+// sink. They are blind to the editor's *source-output* typing: a Swizzle's output
+// type is `swizzle_result(input_type, mask)` of its LIVE input, not a type
+// fabricated from the mask length. The TS guard derived it from mask length alone
+// (vector.ts), so it FALSE-BLOCKED a wire the IR accepts (F2).
+//
+// This golden drives the EDITOR path end-to-end: it builds the LOWERED IrGraph the
+// editor's `graphToIr` would produce (a Const of `input_type` → Swizzle/Split/
+// Combine → a sink), runs the FULL checker, and records whether a `typeMismatch`
+// lands on the SINK edge. The frontend test rebuilds the equivalent editor Graph,
+// runs `judgeConnection`, and asserts its `legal` verdict reproduces this golden
+// row-for-row — so the editor's drag-time verdict for data-derived sources is
+// pinned to the IR. This row table would NOT all be `legal:true` before the F2 fix.
+// ---------------------------------------------------------------------------
+
+/// One data-derived scenario row: a `kind` of source (swizzle/split/combine) with
+/// its `mask`/`ty`, fed an `inputType`, dropped onto a classified `sink`.
+struct ScenarioRow {
+    source_kind: &'static str,
+    /// The swizzle/split mask (empty for combine).
+    mask: &'static str,
+    /// The combine target type (empty for swizzle/split).
+    ty: &'static str,
+    /// The PortType feeding the source's input operand(s).
+    input_type: &'static str,
+    sink_kind: &'static str,
+    /// For an `assignable` sink, the declared sink type (empty otherwise).
+    sink_type: &'static str,
+    legal: bool,
+}
+
+/// The sinks every scenario is dropped onto, as `(sink_kind, sink_type)`.
+const SCENARIO_SINKS: &[(&str, &str)] = &[
+    ("outputColor", ""),       // Output.color → Assignable(Vec4)
+    ("sampleCoord", ""),       // Sample.coord → SampleCoord (tightened vec2)
+    ("snippetFloat", "float"), // CustomSnippet input port → Assignable(<type>)
+    ("snippetVec2", "vec2"),
+    ("snippetVec3", "vec3"),
+    ("snippetVec4", "vec4"),
+];
+
+/// Build the sink node + the edge wiring `source.out → sink`, plus the
+/// `(node, port)` the typeMismatch (if any) lands on.
+fn sink_nodes_and_edge(sink_kind: &str, sink_type: &str) -> (Vec<IrNode>, IrEdge, &'static str) {
+    match sink_kind {
+        "outputColor" => (
+            vec![IrNode::new("sink", NodeOp::Output)],
+            IrEdge::new("source", "out", "sink", "color"),
+            "color",
+        ),
+        "sampleCoord" => (
+            vec![
+                IrNode::new(
+                    "sink",
+                    NodeOp::Sample {
+                        texture: TextureSource::Source,
+                    },
+                ),
+                // Give the Sample a downstream Output so the graph is well-formed.
+                IrNode::new("term", NodeOp::Output),
+            ],
+            IrEdge::new("source", "out", "sink", "coord"),
+            "coord",
+        ),
+        _ => {
+            // A CustomSnippet input port of the declared sink type.
+            let ty = parse_port_type(sink_type);
+            (
+                vec![IrNode::new(
+                    "sink",
+                    NodeOp::CustomSnippet {
+                        body: "result = vec4(0.0);".to_owned(),
+                        inputs: vec![PortDecl {
+                            name: "in".to_owned(),
+                            ty,
+                        }],
+                        outputs: vec![PortDecl {
+                            name: "result".to_owned(),
+                            ty: PortType::Vec4,
+                        }],
+                    },
+                )],
+                IrEdge::new("source", "out", "sink", "in"),
+                "in",
+            )
+        }
+    }
+}
+
+/// Parse a camelCase PortType spelling.
+fn parse_port_type(name: &str) -> PortType {
+    ALL_TYPES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(t, _)| *t)
+        .unwrap_or_else(|| panic!("unknown port type `{name}`"))
+}
+
+/// Build the lowered IrGraph for one scenario and return whether the FULL checker
+/// leaves the SINK edge free of a `typeMismatch` (the editor's "legal" verdict).
+fn scenario_is_legal(
+    source_kind: &str,
+    mask: &str,
+    ty: &str,
+    input_type: &str,
+    sink_kind: &str,
+    sink_type: &str,
+) -> bool {
+    let mut nodes: Vec<IrNode> = Vec::new();
+    let mut edges: Vec<IrEdge> = Vec::new();
+
+    // The source op + its input operands (mirroring the editor descriptors'
+    // `toNodeOp`): swizzle/split → Expr{Swizzle, operands:["in"]}; combine →
+    // Expr{Construct{ty}, operands:["x","y",...]} fed by float components.
+    let input_pt = parse_port_type(input_type);
+    match source_kind {
+        "swizzle" | "split" => {
+            // One Const of `input_type` feeding the single `in` operand.
+            if let Some(src_in) = const_of("in_node", input_pt) {
+                nodes.push(src_in);
+                edges.push(IrEdge::new("in_node", "out", "source", "in"));
+            }
+            nodes.push(IrNode::new(
+                "source",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: mask.to_owned(),
+                    },
+                    operands: vec!["in".to_owned()],
+                },
+            ));
+        }
+        "combine" => {
+            let target = parse_port_type(ty);
+            let n = target.component_count().unwrap_or(0) as usize;
+            let names = ["x", "y", "z", "w"];
+            let operands: Vec<String> = names[..n].iter().map(|s| (*s).to_owned()).collect();
+            for (i, name) in operands.iter().enumerate() {
+                let cid = format!("c{i}");
+                nodes.push(konst(&cid, ConstValue::Float { value: 1.0 }));
+                edges.push(IrEdge::new(&cid, "out", "source", name));
+            }
+            nodes.push(IrNode::new(
+                "source",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: target },
+                    operands,
+                },
+            ));
+        }
+        other => panic!("unknown source kind `{other}`"),
+    }
+
+    let (sink_nodes, sink_edge, sink_port) = sink_nodes_and_edge(sink_kind, sink_type);
+    nodes.extend(sink_nodes);
+    edges.push(sink_edge);
+
+    let graph = IrGraph { nodes, edges };
+    !has_type_mismatch_on(&graph, &CheckContext::new(), "sink", sink_port)
+}
+
+/// Build the data-derived scenario table from the FULL checker.
+fn build_scenarios() -> Vec<ScenarioRow> {
+    // The PortTypes a Const source can produce (Sampler2D has no literal).
+    const INPUT_TYPES: &[&str] = &["float", "vec2", "vec3", "vec4", "int", "bool"];
+    // Swizzle masks of each length 1..=4 (legal envelope varies by input width).
+    const MASKS: &[&str] = &["x", "xy", "xyz", "xyzw"];
+    const COMBINE_TYPES: &[&str] = &["vec2", "vec3", "vec4"];
+
+    let mut rows = Vec::new();
+    for &(sink_kind, sink_type) in SCENARIO_SINKS {
+        // Swizzle: each mask × each input type.
+        for &mask in MASKS {
+            for &input_type in INPUT_TYPES {
+                rows.push(ScenarioRow {
+                    source_kind: "swizzle",
+                    mask,
+                    ty: "",
+                    input_type,
+                    sink_kind,
+                    sink_type,
+                    legal: scenario_is_legal("swizzle", mask, "", input_type, sink_kind, sink_type),
+                });
+            }
+        }
+        // Split: a single-component swizzle (`x`) × each input type.
+        for &input_type in INPUT_TYPES {
+            rows.push(ScenarioRow {
+                source_kind: "split",
+                mask: "x",
+                ty: "",
+                input_type,
+                sink_kind,
+                sink_type,
+                legal: scenario_is_legal("split", "x", "", input_type, sink_kind, sink_type),
+            });
+        }
+        // Combine: each target type (inputs are floats — input-independent output).
+        for &ty in COMBINE_TYPES {
+            rows.push(ScenarioRow {
+                source_kind: "combine",
+                mask: "",
+                ty,
+                input_type: "float",
+                sink_kind,
+                sink_type,
+                legal: scenario_is_legal("combine", "", ty, "float", sink_kind, sink_type),
+            });
+        }
+    }
+    rows
+}
+
+/// Render the scenario table as deterministic, one-object-per-line JSON.
+fn render_scenarios_json(rows: &[ScenarioRow]) -> String {
+    let mut out = String::from("[\n");
+    for (i, r) in rows.iter().enumerate() {
+        let comma = if i + 1 < rows.len() { "," } else { "" };
+        out.push_str(&format!(
+            "  {{ \"sourceKind\": \"{}\", \"mask\": \"{}\", \"ty\": \"{}\", \"inputType\": \"{}\", \"sinkKind\": \"{}\", \"sinkType\": \"{}\", \"legal\": {} }}{}\n",
+            r.source_kind, r.mask, r.ty, r.input_type, r.sink_kind, r.sink_type, r.legal, comma
+        ));
+    }
+    out.push_str("]\n");
+    out
+}
+
+/// The committed scenario golden path.
+fn scenario_golden_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../web/src/nodes/__goldens__/connectionParityScenarios.json")
+}
+
+#[test]
+fn data_derived_scenario_golden_matches_checked_in_file() {
+    let expected = render_scenarios_json(&build_scenarios());
+    let path = scenario_golden_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("create golden dir");
+    }
+    std::fs::write(&path, &expected).expect("write data-derived scenario golden");
+    let on_disk = std::fs::read_to_string(&path).expect("read data-derived scenario golden");
+    assert_eq!(
+        on_disk, expected,
+        "data-derived scenario golden drifted — commit \
+         web/src/nodes/__goldens__/connectionParityScenarios.json"
+    );
+}
