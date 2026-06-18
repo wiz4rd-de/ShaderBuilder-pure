@@ -8,11 +8,13 @@ import { basename } from "./paths";
 import type { RecentProject } from "../bindings/RecentProject";
 import { newProject, openProject, openRecent, save, saveAs } from "./projectActions";
 import { loadRecents as fetchRecents } from "./api";
+import { useExportStore } from "../export/exportStore";
 
 export function FileMenu() {
   const [open, setOpen] = useState(false);
   const [recents, setRecents] = useState<RecentProject[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
+  const openExport = useExportStore((s) => s.openDialog);
 
   // Refresh the recents list whenever the menu opens.
   useEffect(() => {
@@ -96,6 +98,10 @@ export function FileMenu() {
           </button>
           <button type="button" role="menuitem" onClick={() => run(() => saveAs())}>
             Save As… <span className="filemenu__shortcut">Ctrl+Shift+S</span>
+          </button>
+          <hr className="filemenu__sep" />
+          <button type="button" role="menuitem" onClick={() => run(() => openExport())}>
+            Export Bundle…
           </button>
         </div>
       ) : null}

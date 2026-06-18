@@ -1,6 +1,7 @@
 import "./App.css";
 import { useCompileLoop } from "./compile/useCompileLoop";
 import { EditorCanvas } from "./editor/EditorCanvas";
+import { ExportDialog } from "./export/ExportDialog";
 import { ErrorBoundary } from "./feedback/ErrorBoundary";
 import { Toasts } from "./feedback/Toasts";
 import { useEngineEvents } from "./feedback/useEngineEvents";
@@ -82,6 +83,9 @@ export default function App() {
 
       {/* Blocking save/discard/cancel + recovery modal (#63). */}
       <ConfirmDialog />
+
+      {/* The export-bundle dialog (#64): destination + name + validation gate. */}
+      <ExportDialog />
     </div>
   );
 }

@@ -1943,3 +1943,118 @@
 .error-boundary__retry:hover {
   border-color: var(--accent);
 }
+
+/* Export-bundle dialog (#64). */
+.export-dialog {
+  min-width: 420px;
+  max-width: 560px;
+}
+.export-dialog__title {
+  margin: 0 0 16px;
+  font-size: 16px;
+}
+.export-dialog__field {
+  display: block;
+  margin-bottom: 14px;
+}
+.export-dialog__label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--muted, #9aa);
+}
+.export-dialog__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.export-dialog__dest {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.export-dialog__input {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+.export-dialog__summary {
+  display: flex;
+  gap: 24px;
+  margin: 4px 0 14px;
+}
+.export-dialog__summary div {
+  display: flex;
+  flex-direction: column;
+}
+.export-dialog__summary dt {
+  font-size: 11px;
+  color: var(--muted, #9aa);
+}
+.export-dialog__summary dd {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+.export-dialog__blockers {
+  margin-bottom: 14px;
+  padding: 10px;
+  background: rgb(220 60 60 / 10%);
+  border: 1px solid rgb(220 60 60 / 40%);
+  border-radius: 4px;
+}
+.export-dialog__blockers-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.export-dialog__blockers ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.export-dialog__blocker {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.export-dialog__jump {
+  margin-left: 8px;
+  font: inherit;
+  font-size: 12px;
+  padding: 1px 8px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.export-dialog__success {
+  margin: 0 0 12px;
+  font-size: 14px;
+  word-break: break-all;
+}
+.export-dialog__warnings {
+  margin: 0 0 12px;
+  padding-left: 18px;
+}
+.export-dialog__warning {
+  font-size: 12px;
+  color: var(--warn, #d89b2b);
+}
+.export-dialog__error {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--error, #e06666);
+}
