@@ -10,12 +10,25 @@ import type { EngineStatus } from "./EngineStatus";
  * (live ↔ last-good ↔ stopped); [`Error`](EngineEvent::Error) reports a structured
  * render/compile failure. Kept as ONE event type (tagged by `kind`) so the
  * frontend registers a single listener and the wire shape is fixed.
+ *
+ * Every event carries the `stream_id` of the preview stream that produced it (the
+ * id the frontend passed to `start_preview_stream`). The frontend IGNORES events
+ * from a superseded stream so a stopped/torn-down old render thread can neither
+ * raise a spurious toast nor clobber the new stream's live status (#12, #13).
  */
 export type EngineEvent = { "kind": "status", 
+/**
+ * The owning preview stream's id.
+ */
+streamId: string, 
 /**
  * The new engine status.
  */
 status: EngineStatus, } | { "kind": "error", 
+/**
+ * The owning preview stream's id.
+ */
+streamId: string, 
 /**
  * The error payload.
  */

@@ -59,14 +59,16 @@ fn map_status(status: RenderStatus) -> EngineStatus {
     }
 }
 
-/// Map an engine-local [`RenderEvent`] (#62) to the `core_model` wire event. A
-/// render-thread error carries no pass tag (the engine renders a chain it was
-/// given); pass/node tagging is added by the app for slang-compile failures.
-fn map_engine_event(event: RenderEvent) -> EngineEvent {
+/// Map an engine-local [`RenderEvent`] (#62) to the `core_model` wire event, tagged
+/// with the owning `stream_id` so the frontend can ignore a superseded stream's
+/// late events (#12, #13). A render-thread error carries no pass tag (the engine
+/// renders a chain it was given); pass/node tagging is added by the app for
+/// slang-compile failures.
+fn map_engine_event(stream_id: &str, event: RenderEvent) -> EngineEvent {
     match event {
-        RenderEvent::Status(status) => EngineEvent::status(map_status(status)),
+        RenderEvent::Status(status) => EngineEvent::status(stream_id, map_status(status)),
         RenderEvent::Error { code, message } => {
-            EngineEvent::error(EngineErrorEvent::error(code, message))
+            EngineEvent::error(stream_id, EngineErrorEvent::error(code, message))
         }
     }
 }
@@ -131,6 +133,13 @@ impl PreviewState {
         self.active.lock().unwrap().as_ref().map(|s| s.viewport)
     }
 
+    /// The active stream's id, if any (#12/#13): used to tag command-side engine
+    /// events (e.g. a `load_chain_sources` slang-compile failure) so the frontend
+    /// routes them to the live stream and ignores those from a superseded one.
+    fn active_id(&self) -> Option<String> {
+        self.active.lock().unwrap().as_ref().map(|s| s.id.clone())
+    }
+
     /// Record a new pane size on the active stream (so later `load_source`
     /// defaults track it).
     fn set_viewport_size(&self, width: u32, height: u32) {
@@ -169,7 +178,7 @@ pub fn start_preview_stream(
     let running = Arc::new(AtomicBool::new(true));
     let (commands, rx) = mpsc::channel();
     *state.active.lock().unwrap() = Some(ActiveStream {
-        id: stream_id,
+        id: stream_id.clone(),
         running: running.clone(),
         commands,
         viewport: (width, height),
@@ -206,9 +215,10 @@ pub fn start_preview_stream(
     // sender (stream stopped).
     let (event_tx, event_rx) = mpsc::channel::<RenderEvent>();
     let event_app = app.clone();
+    let event_stream_id = stream_id.clone();
     std::thread::spawn(move || {
         for event in event_rx {
-            emit_engine_event(&event_app, map_engine_event(event));
+            emit_engine_event(&event_app, map_engine_event(&event_stream_id, event));
         }
     });
 
@@ -222,16 +232,22 @@ pub fn start_preview_stream(
                 // silent blank pane (#62).
                 emit_engine_event(
                     &app,
-                    EngineEvent::error(EngineErrorEvent::error("noAdapter", err.to_string())),
+                    EngineEvent::error(
+                        &stream_id,
+                        EngineErrorEvent::error("noAdapter", err.to_string()),
+                    ),
                 );
-                emit_engine_event(&app, EngineEvent::status(EngineStatus::Stopped));
+                emit_engine_event(&app, EngineEvent::status(&stream_id, EngineStatus::Stopped));
                 running.store(false, Ordering::Relaxed);
             }
         }
         // The render loop ended (stream stopped / channel closed): tell the UI the
         // engine stopped so the preview badges "render stopped" rather than holding
-        // a stale frame forever (#62).
-        emit_engine_event(&app, EngineEvent::status(EngineStatus::Stopped));
+        // a stale frame forever (#62). The event is tagged with this stream's id, so
+        // a deliberate supersede (a newer stream already active) is ignored by the
+        // frontend and cannot clobber the new stream's live status or toast (#12,
+        // #13).
+        emit_engine_event(&app, EngineEvent::status(&stream_id, EngineStatus::Stopped));
     });
 }
 
@@ -435,7 +451,10 @@ pub fn load_chain_sources(
                 if let Some(pass_id) = &p.pass_id {
                     err = err.with_pass(pass_id.clone());
                 }
-                emit_engine_event(&app, EngineEvent::error(err));
+                // Tag with the active stream so the frontend routes it to the live
+                // preview (and ignores it if the stream has since been superseded).
+                let stream_id = state.active_id().unwrap_or_default();
+                emit_engine_event(&app, EngineEvent::error(stream_id, err));
                 return Err(message);
             }
         };
@@ -815,30 +834,35 @@ mod tests {
     #[test]
     fn maps_engine_status_transitions_to_wire_status() {
         assert_eq!(
-            map_engine_event(RenderEvent::Status(RenderStatus::Live)),
-            EngineEvent::status(EngineStatus::Live)
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::Live)),
+            EngineEvent::status("s1", EngineStatus::Live)
         );
         assert_eq!(
-            map_engine_event(RenderEvent::Status(RenderStatus::LastGood)),
-            EngineEvent::status(EngineStatus::LastGood)
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::LastGood)),
+            EngineEvent::status("s1", EngineStatus::LastGood)
         );
         assert_eq!(
-            map_engine_event(RenderEvent::Status(RenderStatus::Stopped)),
-            EngineEvent::status(EngineStatus::Stopped)
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::Stopped)),
+            EngineEvent::status("s1", EngineStatus::Stopped)
         );
     }
 
     #[test]
-    fn maps_engine_render_error_to_untagged_wire_error() {
+    fn maps_engine_render_error_to_untagged_wire_error_with_stream_id() {
         // A render-thread error carries no pass tag (the engine renders whatever
         // chain it was given); pass tagging is the app's job for slang failures.
-        let mapped = map_engine_event(RenderEvent::Error {
-            code: "deviceLost".to_string(),
-            message: "the device was lost".to_string(),
-        });
-        let EngineEvent::Error { error } = mapped else {
+        // It IS tagged with the owning stream id (#12/#13).
+        let mapped = map_engine_event(
+            "stream-7",
+            RenderEvent::Error {
+                code: "deviceLost".to_string(),
+                message: "the device was lost".to_string(),
+            },
+        );
+        let EngineEvent::Error { stream_id, error } = mapped else {
             panic!("expected an Error event, got {mapped:?}");
         };
+        assert_eq!(stream_id, "stream-7", "error carries the owning stream id");
         assert_eq!(error.code, "deviceLost");
         assert_eq!(error.message, "the device was lost");
         assert_eq!(error.severity, core_model::EngineSeverity::Error);

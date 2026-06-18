@@ -67,8 +67,15 @@ export function useEngineEvents(options: UseEngineEventsOptions = {}): void {
     let disposed = false;
 
     const handle = (event: EngineEvent): void => {
-      const { setEngineStatus, pushEngineProblem } = useDocumentStore.getState();
+      const { setEngineStatus, pushEngineProblem, activeStreamId } =
+        useDocumentStore.getState();
       const { push: pushToast } = useToastStore.getState();
+      // Ignore events from a superseded stream (#12/#13): a stopped/remounted old
+      // render thread's late status must not toast nor clobber the live stream's
+      // status. Only the currently-active stream's events are surfaced.
+      if (activeStreamId !== null && event.streamId !== activeStreamId) {
+        return;
+      }
       if (event.kind === "status") {
         setEngineStatus(event.status);
         if (event.status === "stopped") {

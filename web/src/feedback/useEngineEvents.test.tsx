@@ -42,6 +42,10 @@ beforeEach(() => {
   vi.useRealTimers();
   resetIdsForTest();
   doc().reset();
+  // The active stream id is stream-lifecycle state (not document state, so reset()
+  // leaves it) — clear it between tests so a prior test's stream doesn't filter the
+  // next test's events (#12/#13).
+  doc().setActiveStreamId(null);
   toasts().clear();
 });
 
@@ -51,10 +55,10 @@ describe("useEngineEvents", () => {
     render(<Harness subscribe={subscribe} />);
     await Promise.resolve();
 
-    fire({ kind: "status", status: "lastGood" });
+    fire({ kind: "status", streamId: "s1", status: "lastGood" });
     expect(doc().engineStatus).toBe("lastGood");
 
-    fire({ kind: "status", status: "live" });
+    fire({ kind: "status", streamId: "s1", status: "live" });
     expect(doc().engineStatus).toBe("live");
   });
 
@@ -63,9 +67,50 @@ describe("useEngineEvents", () => {
     render(<Harness subscribe={subscribe} />);
     await Promise.resolve();
 
-    fire({ kind: "status", status: "stopped" });
+    fire({ kind: "status", streamId: "s1", status: "stopped" });
     expect(doc().engineStatus).toBe("stopped");
     expect(toasts().toasts.some((t) => t.message.includes("render stopped"))).toBe(true);
+  });
+
+  it("ignores events from a superseded stream (no toast, no status clobber) (#12/#13)", async () => {
+    const { subscribe, fire } = makeSubscriber();
+    render(<Harness subscribe={subscribe} />);
+    await Promise.resolve();
+
+    // The active stream is "new"; the old "stale" stream is superseded.
+    doc().setActiveStreamId("new");
+    fire({ kind: "status", streamId: "new", status: "live" });
+    expect(doc().engineStatus).toBe("live");
+
+    // A late Stopped from the superseded stream must NOT toast nor clobber Live.
+    fire({ kind: "status", streamId: "stale", status: "stopped" });
+    expect(doc().engineStatus).toBe("live");
+    expect(toasts().toasts.some((t) => t.message.includes("render stopped"))).toBe(false);
+
+    // The active stream's own events still win.
+    fire({ kind: "status", streamId: "new", status: "lastGood" });
+    expect(doc().engineStatus).toBe("lastGood");
+  });
+
+  it("drops a superseded stream's error from the problems panel (#12/#13)", async () => {
+    const { subscribe, fire } = makeSubscriber();
+    render(<Harness subscribe={subscribe} />);
+    await Promise.resolve();
+
+    doc().setActiveStreamId("new");
+    fire({
+      kind: "error",
+      streamId: "stale",
+      error: {
+        severity: "error",
+        code: "deviceLost",
+        message: "old thread died",
+        passId: null,
+        nodeId: null,
+      },
+    });
+    expect(doc().engineProblems).toHaveLength(0);
+    expect(toasts().toasts).toHaveLength(0);
   });
 
   it("synthesizes an engine problem + a toast from an error event", async () => {
@@ -75,6 +120,7 @@ describe("useEngineEvents", () => {
 
     fire({
       kind: "error",
+      streamId: "s1",
       error: {
         severity: "error",
         code: "slangCompile",

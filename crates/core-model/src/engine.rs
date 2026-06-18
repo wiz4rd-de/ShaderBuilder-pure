@@ -130,31 +130,48 @@ pub enum EngineStatus {
 /// (live ↔ last-good ↔ stopped); [`Error`](EngineEvent::Error) reports a structured
 /// render/compile failure. Kept as ONE event type (tagged by `kind`) so the
 /// frontend registers a single listener and the wire shape is fixed.
+///
+/// Every event carries the `stream_id` of the preview stream that produced it (the
+/// id the frontend passed to `start_preview_stream`). The frontend IGNORES events
+/// from a superseded stream so a stopped/torn-down old render thread can neither
+/// raise a spurious toast nor clobber the new stream's live status (#12, #13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum EngineEvent {
     /// A liveness-status transition (live / last-good / stopped).
     Status {
+        /// The owning preview stream's id.
+        #[serde(rename = "streamId")]
+        stream_id: String,
         /// The new engine status.
         status: EngineStatus,
     },
     /// A structured render/compile error.
     Error {
+        /// The owning preview stream's id.
+        #[serde(rename = "streamId")]
+        stream_id: String,
         /// The error payload.
         error: EngineErrorEvent,
     },
 }
 
 impl EngineEvent {
-    /// Wrap a status into a [`Status`](EngineEvent::Status) event.
-    pub fn status(status: EngineStatus) -> Self {
-        EngineEvent::Status { status }
+    /// Wrap a status into a [`Status`](EngineEvent::Status) event for `stream_id`.
+    pub fn status(stream_id: impl Into<String>, status: EngineStatus) -> Self {
+        EngineEvent::Status {
+            stream_id: stream_id.into(),
+            status,
+        }
     }
 
-    /// Wrap an error into an [`Error`](EngineEvent::Error) event.
-    pub fn error(error: EngineErrorEvent) -> Self {
-        EngineEvent::Error { error }
+    /// Wrap an error into an [`Error`](EngineEvent::Error) event for `stream_id`.
+    pub fn error(stream_id: impl Into<String>, error: EngineErrorEvent) -> Self {
+        EngineEvent::Error {
+            stream_id: stream_id.into(),
+            error,
+        }
     }
 }
 
@@ -164,13 +181,18 @@ mod tests {
 
     #[test]
     fn status_event_serializes_tagged_camel_case() {
-        let json = serde_json::to_string(&EngineEvent::status(EngineStatus::LastGood)).unwrap();
-        assert_eq!(json, r#"{"kind":"status","status":"lastGood"}"#);
+        let json =
+            serde_json::to_string(&EngineEvent::status("s1", EngineStatus::LastGood)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"status","streamId":"s1","status":"lastGood"}"#
+        );
     }
 
     #[test]
     fn error_event_serializes_with_pass_and_node() {
         let ev = EngineEvent::error(
+            "s1",
             EngineErrorEvent::error("slangCompile", "boom")
                 .with_pass("pass-1")
                 .with_node("node-2"),
@@ -178,13 +200,13 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"error","error":{"severity":"error","code":"slangCompile","message":"boom","passId":"pass-1","nodeId":"node-2"}}"#
+            r#"{"kind":"error","streamId":"s1","error":{"severity":"error","code":"slangCompile","message":"boom","passId":"pass-1","nodeId":"node-2"}}"#
         );
     }
 
     #[test]
     fn error_event_omitted_ids_serialize_as_null() {
-        let ev = EngineEvent::error(EngineErrorEvent::warning("deviceLost", "lost"));
+        let ev = EngineEvent::error("s1", EngineErrorEvent::warning("deviceLost", "lost"));
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""passId":null"#));
         assert!(json.contains(r#""nodeId":null"#));
