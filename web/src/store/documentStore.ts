@@ -29,16 +29,38 @@ import { create } from "zustand";
 import type { Graph } from "../bindings/Graph";
 import type { Project } from "../bindings/Project";
 import type { Vec2 } from "../bindings/Vec2";
+import { addPass, removePass, reorderPass } from "../pipeline/passOps";
 import {
   captureClipboard,
   instantiateClipboard,
   type Clipboard,
 } from "./clipboard";
-import { emptyGraph, makeEdge, makeNode, makeProject, PLACEHOLDER_KIND } from "./factories";
+import {
+  emptyGraph,
+  makeEdge,
+  makeNode,
+  makePass,
+  makeProject,
+  PLACEHOLDER_KIND,
+} from "./factories";
 import { cloneSnapshot, deepClone, type DocSnapshot } from "./snapshot";
 
 /** The fixed offset applied to each successive paste/duplicate of a selection. */
 export const PASTE_OFFSET: Vec2 = { x: 32, y: 32 };
+
+/**
+ * Which editing level the canvas is showing (#46): the PIPELINE view (each pass
+ * is a node) or the per-pass node graph (drill-in). The level only swaps which
+ * graph the shared canvas renders — the document is unchanged.
+ */
+export type EditorLevel = "pipeline" | "pass";
+
+/** A remembered React Flow viewport (pan + zoom) for one level. */
+export interface ViewportState {
+  x: number;
+  y: number;
+  zoom: number;
+}
 
 /** Maximum number of undo entries retained (older entries are discarded). */
 const HISTORY_LIMIT = 200;
@@ -53,6 +75,22 @@ export interface DocumentState {
   // ---- document ----
   project: Project;
   activePassId: string;
+
+  // ---- navigation (#46) ----
+  /** Whether the canvas shows the pipeline view or a per-pass graph. */
+  level: EditorLevel;
+  /**
+   * Per-level remembered viewport (pan/zoom). Keyed by level for the pipeline,
+   * and by pass id for each per-pass graph, so navigating back restores the
+   * exact prior pan/zoom. Editor-only; never part of an undo snapshot.
+   */
+  viewports: { pipeline: ViewportState | null; passes: Record<string, ViewportState> };
+  /**
+   * Per-level remembered selection so drilling out and back restores it. The
+   * pipeline selection is a pass id; each pass graph remembers its own node/edge
+   * selection. Editor-only.
+   */
+  selections: { pipeline: string | null; passes: Record<string, Selection> };
 
   // ---- editor-only state (NOT part of an undo snapshot) ----
   selection: Selection;
@@ -87,6 +125,37 @@ export interface DocumentState {
   // ---- selection ----
   setSelection: (selection: Selection) => void;
   clearSelection: () => void;
+
+  // ---- pipeline / navigation (#46) ----
+  /**
+   * Append a fresh graph-authored pass at the END of the pipeline and make it
+   * active. Returns the new pass id. One undo entry.
+   */
+  addPass: (name?: string) => string;
+  /**
+   * Remove a pass. Index-based texture references (PassOutputN/PassFeedbackN)
+   * and feedbackPass are remapped; references to the removed pass become a
+   * dangling sentinel (see passOps). Removing the last pass is a no-op. If the
+   * active pass is removed, the active pass falls back to a neighbour. One undo
+   * entry.
+   */
+  removePass: (passId: string) => void;
+  /**
+   * Move a pass within the pipeline. Pass order IS the .slangp index, so index
+   * references are remapped to keep the chain wired identically. One undo entry.
+   */
+  reorderPass: (from: number, to: number) => void;
+
+  /** Set (or clear) the selected pass in the pipeline view. */
+  setPipelineSelection: (passId: string | null) => void;
+  /** Switch the canvas to the pipeline view (remembering the pass viewport). */
+  showPipeline: () => void;
+  /** Drill into a pass's graph (remembering the pipeline viewport + selection). */
+  openPass: (passId: string) => void;
+  /** Remember the current level's React Flow viewport (called on pan/zoom). */
+  setViewport: (viewport: ViewportState) => void;
+  /** The remembered viewport for the current level, or null if none yet. */
+  currentViewport: () => ViewportState | null;
 
   // ---- React Flow change plumbing (live, NON-committing) ----
   applyNodeChanges: (changes: NodeChange[]) => void;
@@ -158,6 +227,18 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     return { project: deepClone(project), activePassId };
   }
 
+  /**
+   * After a history jump (undo/redo) the restored project may no longer contain
+   * the pass we were drilled into. Fall back to the pipeline view so the canvas
+   * never renders a stale/empty pass graph.
+   */
+  function levelFor(project: Project, activePassId: string, level: EditorLevel): EditorLevel {
+    if (level === "pass" && !project.passes.some((p) => p.id === activePassId)) {
+      return "pipeline";
+    }
+    return level;
+  }
+
   /** Append `before` to the undo stack, capping its length. */
   function pushPast(before: DocSnapshot): DocSnapshot[] {
     const past = [...get().past, before];
@@ -186,6 +267,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
   return {
     project: initialProject,
     activePassId: initialActivePassId,
+    level: "pipeline" as EditorLevel,
+    viewports: { pipeline: null, passes: {} },
+    selections: { pipeline: null, passes: {} },
     selection: { nodeIds: [], edgeIds: [] },
     clipboard: null,
     dirty: false,
@@ -299,6 +383,130 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     setSelection: (selection) => set({ selection }),
     clearSelection: () => set({ selection: { nodeIds: [], edgeIds: [] } }),
 
+    addPass: (name) => {
+      const before = snapshot();
+      const { project } = get();
+      const pass = makePass(name ?? `Pass ${project.passes.length + 1}`);
+      set({
+        project: addPass(project, pass),
+        activePassId: pass.id,
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+      return pass.id;
+    },
+
+    removePass: (passId) => {
+      const { project } = get();
+      if (project.passes.length <= 1) {
+        return;
+      }
+      if (!project.passes.some((p) => p.id === passId)) {
+        return;
+      }
+      const before = snapshot();
+      const removedIndex = project.passes.findIndex((p) => p.id === passId);
+      const nextProject = removePass(project, passId);
+      // If the active pass was removed, fall back to the neighbour that now sits
+      // at the removed slot (or the new last pass).
+      let { activePassId } = get();
+      if (activePassId === passId) {
+        const fallbackIndex = Math.min(removedIndex, nextProject.passes.length - 1);
+        activePassId = nextProject.passes[fallbackIndex]!.id;
+      }
+      // Drop the removed pass's remembered viewport/selection.
+      const { viewports, selections } = get();
+      const passViewports = { ...viewports.passes };
+      delete passViewports[passId];
+      const passSelections = { ...selections.passes };
+      delete passSelections[passId];
+      set({
+        project: nextProject,
+        activePassId,
+        viewports: { ...viewports, passes: passViewports },
+        selections: { ...selections, passes: passSelections },
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    reorderPass: (from, to) => {
+      const { project } = get();
+      const n = project.passes.length;
+      if (from < 0 || from >= n || to < 0 || to >= n || from === to) {
+        return;
+      }
+      const before = snapshot();
+      set({
+        project: reorderPass(project, from, to),
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    setPipelineSelection: (passId) => {
+      set((s) => ({ selections: { ...s.selections, pipeline: passId } }));
+    },
+
+    showPipeline: () => {
+      const { level, activePassId, selection } = get();
+      if (level === "pipeline") {
+        return;
+      }
+      // Remember the pass-graph selection before switching out.
+      set((s) => ({
+        level: "pipeline",
+        selections: {
+          ...s.selections,
+          passes: { ...s.selections.passes, [activePassId]: selection },
+        },
+        selection: { nodeIds: [], edgeIds: [] },
+      }));
+    },
+
+    openPass: (passId) => {
+      const { project } = get();
+      if (!project.passes.some((p) => p.id === passId)) {
+        return;
+      }
+      // Restore the pass's remembered selection (empty if first visit).
+      const remembered = get().selections.passes[passId] ?? {
+        nodeIds: [],
+        edgeIds: [],
+      };
+      set((s) => ({
+        level: "pass",
+        activePassId: passId,
+        // Remember which pass was selected in the pipeline.
+        selections: { ...s.selections, pipeline: passId },
+        selection: remembered,
+      }));
+    },
+
+    setViewport: (viewport) => {
+      set((s) => {
+        if (s.level === "pipeline") {
+          return { viewports: { ...s.viewports, pipeline: viewport } };
+        }
+        return {
+          viewports: {
+            ...s.viewports,
+            passes: { ...s.viewports.passes, [s.activePassId]: viewport },
+          },
+        };
+      });
+    },
+
+    currentViewport: () => {
+      const { level, viewports, activePassId } = get();
+      return level === "pipeline"
+        ? viewports.pipeline
+        : (viewports.passes[activePassId] ?? null);
+    },
+
     applyNodeChanges: (changes) => {
       // Map RF node changes onto the document WITHOUT pushing history — this is
       // the live, per-pointermove path. Drag-stop is committed via commit().
@@ -383,6 +591,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set((s) => ({
         project: deepClone(previous.project),
         activePassId: previous.activePassId,
+        level: levelFor(previous.project, previous.activePassId, s.level),
         past: past.slice(0, -1),
         future: [...s.future, current],
         // Selection may reference deleted nodes after undo — clear it.
@@ -402,6 +611,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set((s) => ({
         project: deepClone(next.project),
         activePassId: next.activePassId,
+        level: levelFor(next.project, next.activePassId, s.level),
         past: [...s.past, current],
         future: future.slice(0, -1),
         selection: { nodeIds: [], edgeIds: [] },
@@ -433,6 +643,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set({
         project: deepClone(project),
         activePassId: active,
+        level: "pipeline",
+        viewports: { pipeline: null, passes: {} },
+        selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
         past: [],
@@ -447,6 +660,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set({
         project: fresh,
         activePassId: fresh.passes[0]!.id,
+        level: "pipeline",
+        viewports: { pipeline: null, passes: {} },
+        selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
         past: [],
