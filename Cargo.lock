@@ -64,6 +64,7 @@ dependencies = [
  "preset-io",
  "preview-engine",
  "serde",
+ "serde_json",
  "slang-compile",
  "source",
  "tauri",

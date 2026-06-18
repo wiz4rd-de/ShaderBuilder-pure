@@ -29,6 +29,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 # `#[derive(Serialize)]` for the `source-position` event payload (#31).
 serde = { workspace = true }
+# Parse the embedded example-project JSON resource (#66 `load_example_project`).
+serde_json = { workspace = true }
 core-model = { workspace = true }
 ir = { workspace = true }
 codegen-slang = { workspace = true }

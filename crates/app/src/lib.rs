@@ -96,6 +96,7 @@ pub fn run() {
             export::export_preset,
             export::validate_export,
             import::import_preset,
+            import::load_example_project,
             project::save_project,
             project::load_project,
             graph::compile_graph,

@@ -23,6 +23,23 @@ pub fn import_preset(path: String) -> Result<core_model::Project, String> {
     Ok(project)
 }
 
+/// The bundled example project JSON, embedded at build time (#66). This is the
+/// SAME `resources/example-project.json` the `testing` crate regenerates from the
+/// `fixtures/example` `.slangp` and asserts is drift-free, so the in-app "Open
+/// example" loads exactly the exportable, round-tripping example.
+const EXAMPLE_PROJECT_JSON: &str = include_str!("../resources/example-project.json");
+
+/// Load the bundled "CRT Scanlines + Curvature" example project (#66) the
+/// onboarding start screen's "Open example" action opens. Parses the embedded
+/// resource into the editor's [`core_model::Project`]; this never fails in
+/// practice (the JSON is committed + drift-guarded by `testing`), but maps a parse
+/// failure to a message rather than panicking.
+#[tauri::command]
+pub fn load_example_project() -> Result<core_model::Project, String> {
+    serde_json::from_str(EXAMPLE_PROJECT_JSON)
+        .map_err(|e| format!("could not load example project: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +77,14 @@ mod tests {
     fn a_missing_preset_returns_a_message_not_a_panic() {
         let err = import_preset("/no/such/preset.slangp".to_owned()).unwrap_err();
         assert!(err.contains("could not import preset"), "got: {err}");
+    }
+
+    #[test]
+    fn loads_the_bundled_example_project() {
+        let project = load_example_project().expect("example loads");
+        assert_eq!(project.name, "CRT Scanlines + Curvature");
+        assert_eq!(project.passes.len(), 2);
+        // Exportable as-is (whole-pass code, no graph passes).
+        assert!(preset_io::validate_for_export(&project).ok());
     }
 }
