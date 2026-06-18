@@ -9,3 +9,10 @@ publish.workspace = true
 
 [dependencies]
 ir = { workspace = true }
+core-model = { workspace = true }
+
+[dev-dependencies]
+# Emit-then-compile acceptance: the generated slang must compile through the
+# real Phase-1 slang-compile path (preprocess → glslang → SPIR-V). Kept as a
+# dev-dependency so the runtime crate graph stays codegen-slang → ir.
+slang-compile = { workspace = true }
