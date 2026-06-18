@@ -6,6 +6,9 @@
 
 .app__titlebar {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   font-weight: 600;
   background: var(--panel);
@@ -20,10 +23,165 @@
 }
 
 .app__project {
-  float: right;
+  margin-left: auto;
   font-weight: 400;
   font-size: 12px;
   color: var(--muted);
+}
+
+.app__path {
+  color: var(--muted);
+}
+
+/* --- File menu (#63) --- */
+.filemenu {
+  position: relative;
+  font-weight: 400;
+}
+
+.filemenu__trigger {
+  font: inherit;
+  font-size: 13px;
+  padding: 2px 10px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.filemenu__trigger:hover,
+.filemenu__trigger[aria-expanded="true"] {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.filemenu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  min-width: 220px;
+  margin-top: 4px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 35%);
+  display: flex;
+  flex-direction: column;
+}
+
+.filemenu__dropdown > button,
+.filemenu__recent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.filemenu__dropdown > button:hover,
+.filemenu__recent:hover {
+  background: var(--bg);
+}
+
+.filemenu__shortcut {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.filemenu__sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
+.filemenu__submenu {
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin: 2px 0;
+}
+
+.filemenu__submenu-label,
+.filemenu__empty {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 10px;
+}
+
+.filemenu__recent {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.filemenu__recent-name {
+  font-size: 13px;
+}
+
+.filemenu__recent-path {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* --- Confirm / recovery modal (#63) --- */
+.confirm__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 45%);
+}
+
+.confirm__dialog {
+  min-width: 320px;
+  max-width: 480px;
+  padding: 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
+}
+
+.confirm__message {
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+
+.confirm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm__btn {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 14px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.confirm__btn--primary {
+  background: var(--accent, #3b82f6);
+  border-color: var(--accent, #3b82f6);
+  color: #fff;
 }
 
 .app__body {

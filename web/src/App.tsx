@@ -5,6 +5,10 @@ import { ErrorBoundary } from "./feedback/ErrorBoundary";
 import { Toasts } from "./feedback/Toasts";
 import { useEngineEvents } from "./feedback/useEngineEvents";
 import { PanelLayout } from "./panels/PanelLayout";
+import { ConfirmDialog } from "./session/ConfirmDialog";
+import { FileMenu } from "./session/FileMenu";
+import { basename } from "./session/paths";
+import { useSession } from "./session/useSession";
 import { useDocumentStore } from "./store/documentStore";
 import { PreviewCanvas } from "./preview/PreviewCanvas";
 
@@ -13,6 +17,8 @@ import { PreviewCanvas } from "./preview/PreviewCanvas";
 // the live edit → compile → preview loop via useCompileLoop.
 export default function App() {
   const projectName = useDocumentStore((s) => s.project.name);
+  const dirty = useDocumentStore((s) => s.dirty);
+  const currentProjectPath = useDocumentStore((s) => s.currentProjectPath);
 
   // The debounced live compile loop (#54): document edits → graphToIr →
   // compile_graph per pass → node-keyed diagnostics + the generated chain pushed
@@ -23,11 +29,26 @@ export default function App() {
   // last-good / stopped) + render/compile errors → the store + non-blocking toasts.
   useEngineEvents();
 
+  // Session lifecycle (#63): mirror dirty to the backend, autosave recovery,
+  // guard the window close, and offer recovery on launch.
+  useSession();
+
   return (
     <div className="app">
       <header className="app__titlebar">
-        ShaderBuilder <span className="app__phase">Phase 5 editor</span>
-        <span className="app__project">{projectName}</span>
+        ShaderBuilder <span className="app__phase">editor</span>
+        <FileMenu />
+        <span className="app__project">
+          {/* `*` marks unsaved edits (#63). */}
+          {dirty ? "* " : ""}
+          {projectName}
+          {currentProjectPath ? (
+            <span className="app__path" title={currentProjectPath}>
+              {" "}
+              — {basename(currentProjectPath)}
+            </span>
+          ) : null}
+        </span>
       </header>
 
       {/* An error boundary keeps a render-time exception from white-screening the
@@ -58,6 +79,9 @@ export default function App() {
 
       {/* Non-blocking toast stack (#62): transient engine/render/IO failures. */}
       <Toasts />
+
+      {/* Blocking save/discard/cancel + recovery modal (#63). */}
+      <ConfirmDialog />
     </div>
   );
 }
