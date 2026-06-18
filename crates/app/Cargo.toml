@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 # Split lib + thin bin: the lib (`app_lib`) holds `run()` so it is unit-testable
