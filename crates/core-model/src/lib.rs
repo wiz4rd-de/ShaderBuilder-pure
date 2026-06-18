@@ -1155,6 +1155,85 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
+/// One structured reason a [`Project`] cannot be exported as-is (#64). The
+/// pre-export validation gate ([`preset_io::validate_for_export`]) returns a list
+/// of these; the export UX refuses to invoke the bundle writer while any are
+/// present and lists them as the blocking reasons. Each variant carries enough
+/// context for the UI to name the offending pass and (where possible) link into
+/// the Problems panel.
+///
+/// This is intentionally a SUPERSET of [`ExportError`]: `ExportError` is what the
+/// writer reports if it is somehow invoked anyway (a defense-in-depth surface),
+/// whereas an `ExportBlocker` is what the gate reports BEFORE the writer is asked
+/// to do anything — the fail-closed contract (Spec §8 item 4: an invalid graph is
+/// never silently exported).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ExportBlocker {
+    /// The project has no passes — there is nothing to write.
+    NoPasses,
+    /// A pass is still authored as a node [`Graph`] (it was not substituted with
+    /// its generated whole-pass slang before export). The writer cannot serialize
+    /// a graph pass, so the gate refuses. The frontend substitutes compiled graph
+    /// passes before export, so this only fires for a pass that did NOT compile —
+    /// i.e. an invalid pipeline. Carries the pass id + its display name.
+    UncompiledGraphPass {
+        /// The id of the graph pass that has no exportable slang.
+        pass_id: String,
+        /// The pass's display name (for the blocking-reason list).
+        pass_name: String,
+    },
+    /// A whole-pass code pass carries an empty source body — exporting it would
+    /// write an empty `.slang` the loader cannot use. Carries the pass id + name.
+    EmptyPassSource {
+        /// The id of the pass with no source body.
+        pass_id: String,
+        /// The pass's display name.
+        pass_name: String,
+    },
+}
+
+impl std::fmt::Display for ExportBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportBlocker::NoPasses => {
+                write!(f, "the project has no passes to export")
+            }
+            ExportBlocker::UncompiledGraphPass { pass_name, .. } => write!(
+                f,
+                "pass `{pass_name}` is an unresolved node graph (it did not compile, \
+                 so it has no slang to export)"
+            ),
+            ExportBlocker::EmptyPassSource { pass_name, .. } => {
+                write!(f, "pass `{pass_name}` has an empty source body")
+            }
+        }
+    }
+}
+
+/// The result of the pre-export validation gate (#64): the structured blockers (if
+/// any) that prevent exporting a [`Project`] as a RetroArch bundle. `ok()` is the
+/// fail-closed verdict the export UX checks before invoking the writer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportValidation {
+    /// Every reason the project cannot be exported as-is. Empty ⇒ exportable.
+    pub blockers: Vec<ExportBlocker>,
+}
+
+impl ExportValidation {
+    /// Whether the project is exportable (no blockers) — the fail-closed gate.
+    pub fn ok(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1888,6 +1967,39 @@ mod tests {
         );
         let back: ExportResult = serde_json::from_value(value).expect("round-trips");
         assert_eq!(result, back);
+    }
+
+    #[test]
+    fn export_validation_round_trips_and_reports_ok() {
+        // No blockers ⇒ exportable (the fail-closed gate's positive verdict).
+        let clean = ExportValidation::default();
+        assert!(clean.ok());
+
+        // A blocker list round-trips through serde and keeps each blocker's `kind`
+        // tag (#64) so the frontend can list + link the reasons.
+        let v = ExportValidation {
+            blockers: vec![
+                ExportBlocker::NoPasses,
+                ExportBlocker::UncompiledGraphPass {
+                    pass_id: "g".to_owned(),
+                    pass_name: "Graph".to_owned(),
+                },
+                ExportBlocker::EmptyPassSource {
+                    pass_id: "e".to_owned(),
+                    pass_name: "Empty".to_owned(),
+                },
+            ],
+        };
+        assert!(!v.ok());
+        let value = serde_json::to_value(&v).expect("serializes");
+        for b in value.get("blockers").and_then(|b| b.as_array()).unwrap() {
+            assert!(
+                b.get("kind").and_then(|k| k.as_str()).is_some(),
+                "each blocker carries a `kind` discriminator: {b}"
+            );
+        }
+        let back: ExportValidation = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(v, back);
     }
 
     #[test]
