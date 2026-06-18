@@ -57,6 +57,12 @@ export function useCollectedParameters(): Parameter[] {
   useEffect(() => {
     let cancelled = false;
     const ids = Object.keys(sources);
+    // Ids whose scan this effect run kicked off but hasn't yet resolved. If this
+    // run is cancelled (a dep changed before the scan came back), we roll their
+    // lastScanned entry back so the NEXT run retries them — otherwise a pass whose
+    // first scan was cancelled would be treated as already-scanned forever and its
+    // parameters would silently vanish.
+    const inFlight = new Map<string, string>();
 
     // Drop scan results for passes that are no longer whole-pass code.
     setScanned((prev) => {
@@ -82,17 +88,40 @@ export function useCollectedParameters(): Parameter[] {
       if (lastScanned.current[id] === src) {
         continue;
       }
+      const prevScanned = lastScanned.current[id];
       lastScanned.current[id] = src;
-      void scanPassSource(src, aliases, lutNames).then((result) => {
-        if (cancelled) {
-          return;
-        }
-        setScanned((prev) => ({ ...prev, [id]: result.parameters }));
-      });
+      inFlight.set(id, src);
+      void scanPassSource(src, aliases, lutNames).then(
+        (result) => {
+          inFlight.delete(id);
+          if (cancelled) {
+            return;
+          }
+          setScanned((prev) => ({ ...prev, [id]: result.parameters }));
+        },
+        () => {
+          // A failed scan also leaves no result; allow a retry on the next run.
+          inFlight.delete(id);
+          if (lastScanned.current[id] === src) {
+            if (prevScanned === undefined) {
+              delete lastScanned.current[id];
+            } else {
+              lastScanned.current[id] = prevScanned;
+            }
+          }
+        },
+      );
     }
 
     return () => {
       cancelled = true;
+      // Roll back any still-in-flight scans this run started, so a cancelled first
+      // scan is retried (its lastScanned guard would otherwise skip it forever).
+      for (const [id, src] of inFlight) {
+        if (lastScanned.current[id] === src) {
+          delete lastScanned.current[id];
+        }
+      }
     };
   }, [sources, aliases, lutNames]);
 
