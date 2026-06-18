@@ -16,8 +16,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use core_model::{EngineErrorEvent, EngineEvent, EngineStatus};
 use preview_engine::{
-    FrameSource, PositionUpdate, RenderCommand, RenderSource, SourceSpec, TestPattern,
+    EngineEvent as RenderEvent, EngineStatus as RenderStatus, FrameSource, PositionUpdate,
+    RenderCommand, RenderSource, SourceSpec, TestPattern,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
@@ -43,6 +45,37 @@ pub struct PositionPayload {
 
 /// The Tauri event name carrying [`PositionPayload`] (#31).
 const SOURCE_POSITION_EVENT: &str = "source-position";
+
+/// The Tauri event name carrying [`core_model::EngineEvent`] (#62): structured
+/// render status (live / last-good / stopped) + render/compile errors.
+const ENGINE_EVENT: &str = "engine-event";
+
+/// Map an engine-local [`RenderStatus`] (#62) to the `core_model` wire status.
+fn map_status(status: RenderStatus) -> EngineStatus {
+    match status {
+        RenderStatus::Live => EngineStatus::Live,
+        RenderStatus::LastGood => EngineStatus::LastGood,
+        RenderStatus::Stopped => EngineStatus::Stopped,
+    }
+}
+
+/// Map an engine-local [`RenderEvent`] (#62) to the `core_model` wire event. A
+/// render-thread error carries no pass tag (the engine renders a chain it was
+/// given); pass/node tagging is added by the app for slang-compile failures.
+fn map_engine_event(event: RenderEvent) -> EngineEvent {
+    match event {
+        RenderEvent::Status(status) => EngineEvent::status(map_status(status)),
+        RenderEvent::Error { code, message } => {
+            EngineEvent::error(EngineErrorEvent::error(code, message))
+        }
+    }
+}
+
+/// Emit a `core_model::EngineEvent` (#62) to the webview. A dropped/closed
+/// webview makes emit fail harmlessly — the app stays usable either way.
+fn emit_engine_event(app: &AppHandle, event: EngineEvent) {
+    let _ = app.emit(ENGINE_EVENT, event);
+}
 
 /// The single active preview stream: a caller-supplied id, its stop flag, the
 /// command channel to its render thread, and the current pane size (so a
@@ -148,12 +181,13 @@ pub fn start_preview_stream(
     // event. The render loop is never blocked on emission. The forwarder exits
     // when the render thread drops its sender (stream stopped).
     let (pos_tx, pos_rx) = mpsc::channel::<PositionUpdate>();
+    let pos_app = app.clone();
     let forward_running = running.clone();
     std::thread::spawn(move || {
         for update in pos_rx {
             // A dropped/closed webview makes emit fail — keep forwarding; the loop
             // ends when the render thread's sender is dropped.
-            let _ = app.emit(
+            let _ = pos_app.emit(
                 SOURCE_POSITION_EVENT,
                 PositionPayload {
                     index: update.index,
@@ -164,14 +198,40 @@ pub fn start_preview_stream(
         forward_running.store(false, Ordering::Relaxed);
     });
 
+    // Engine status/error event forwarding (#62): the render thread reports typed
+    // status transitions (live / last-good) and render errors on a channel; this
+    // forwarder (which holds the `AppHandle`) maps them to the `core_model` wire
+    // shape and emits the `engine-event` Tauri event. The render loop is never
+    // blocked on emission; the forwarder exits when the render thread drops its
+    // sender (stream stopped).
+    let (event_tx, event_rx) = mpsc::channel::<RenderEvent>();
+    let event_app = app.clone();
     std::thread::spawn(move || {
-        match RenderSource::with_position_sink(width, height, rx, Some(pos_tx)) {
+        for event in event_rx {
+            emit_engine_event(&event_app, map_engine_event(event));
+        }
+    });
+
+    std::thread::spawn(move || {
+        match RenderSource::with_sinks(width, height, rx, Some(pos_tx), Some(event_tx)) {
             Ok(source) => pump_frames(&channel, source, &running, FRAME_PERIOD),
             Err(err) => {
                 eprintln!("preview: renderer unavailable, no frames will stream: {err}");
+                // Surface the hard startup failure as a non-fatal engine error +
+                // a Stopped status so the UI shows a recoverable message, not a
+                // silent blank pane (#62).
+                emit_engine_event(
+                    &app,
+                    EngineEvent::error(EngineErrorEvent::error("noAdapter", err.to_string())),
+                );
+                emit_engine_event(&app, EngineEvent::status(EngineStatus::Stopped));
                 running.store(false, Ordering::Relaxed);
             }
         }
+        // The render loop ended (stream stopped / channel closed): tell the UI the
+        // engine stopped so the preview badges "render stopped" rather than holding
+        // a stale frame forever (#62).
+        emit_engine_event(&app, EngineEvent::status(EngineStatus::Stopped));
     });
 }
 
@@ -339,6 +399,12 @@ pub struct ChainPassInput {
     source: String,
     /// The pass's RetroArch render settings (scale/filter/wrap/format/alias).
     settings: core_model::PassSettings,
+    /// The owning pipeline pass id (#62), so a slang-compile failure on THIS pass
+    /// (the WholePassCode path bypasses node-IR, so the per-pass checker can't
+    /// catch it) maps to a pass-tagged engine error the editor surfaces against
+    /// the right pass. Optional for back-compat with callers that omit it.
+    #[serde(default)]
+    pass_id: Option<String>,
 }
 
 /// Build a multi-pass live-preview **chain** from in-memory generated sources
@@ -351,12 +417,28 @@ pub struct ChainPassInput {
 /// keeps running.
 #[tauri::command]
 pub fn load_chain_sources(
+    app: AppHandle,
     state: State<'_, PreviewState>,
     passes: Vec<ChainPassInput>,
 ) -> Result<(), String> {
     let mut chain = Vec::with_capacity(passes.len());
     for p in &passes {
-        let compiled = slang_compile::compile_slang(&p.source, None).map_err(|e| e.to_string())?;
+        let compiled = match slang_compile::compile_slang(&p.source, None) {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                let message = e.to_string();
+                // Surface the slang-compile failure as a pass-tagged engine error
+                // (#62): the WholePassCode path has no node-IR, so this is the only
+                // place the error can be mapped to its owning pass. The previous
+                // chain keeps rendering last-good output (we don't SetChain).
+                let mut err = EngineErrorEvent::error("slangCompile", message.clone());
+                if let Some(pass_id) = &p.pass_id {
+                    err = err.with_pass(pass_id.clone());
+                }
+                emit_engine_event(&app, EngineEvent::error(err));
+                return Err(message);
+            }
+        };
         chain.push(pass_from_settings(compiled, &p.settings));
     }
     state.send(RenderCommand::SetChain(chain))
@@ -674,6 +756,42 @@ mod tests {
     use preview_engine::{
         GradientSource, ScaleType as EngineScaleType, FRAME_HEADER_LEN, FRAME_MAGIC,
     };
+
+    // ---- Engine status/error event mapping (#62; no GPU, pure). ----
+
+    #[test]
+    fn maps_engine_status_transitions_to_wire_status() {
+        assert_eq!(
+            map_engine_event(RenderEvent::Status(RenderStatus::Live)),
+            EngineEvent::status(EngineStatus::Live)
+        );
+        assert_eq!(
+            map_engine_event(RenderEvent::Status(RenderStatus::LastGood)),
+            EngineEvent::status(EngineStatus::LastGood)
+        );
+        assert_eq!(
+            map_engine_event(RenderEvent::Status(RenderStatus::Stopped)),
+            EngineEvent::status(EngineStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn maps_engine_render_error_to_untagged_wire_error() {
+        // A render-thread error carries no pass tag (the engine renders whatever
+        // chain it was given); pass tagging is the app's job for slang failures.
+        let mapped = map_engine_event(RenderEvent::Error {
+            code: "deviceLost".to_string(),
+            message: "the device was lost".to_string(),
+        });
+        let EngineEvent::Error { error } = mapped else {
+            panic!("expected an Error event, got {mapped:?}");
+        };
+        assert_eq!(error.code, "deviceLost");
+        assert_eq!(error.message, "the device was lost");
+        assert_eq!(error.severity, core_model::EngineSeverity::Error);
+        assert!(error.pass_id.is_none(), "render errors are not pass-tagged");
+        assert!(error.node_id.is_none());
+    }
 
     // ---- Preset → engine scale-config mapping (#22; no GPU needed). ----
 
