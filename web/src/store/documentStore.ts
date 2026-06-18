@@ -29,6 +29,7 @@ import { create } from "zustand";
 import type { Diagnostic } from "../bindings/Diagnostic";
 import type { Graph } from "../bindings/Graph";
 import type { Node } from "../bindings/Node";
+import type { PassSettings } from "../bindings/PassSettings";
 import type { Project } from "../bindings/Project";
 import type { Vec2 } from "../bindings/Vec2";
 import { addPass, removePass, reorderPass } from "../pipeline/passOps";
@@ -173,6 +174,21 @@ export interface DocumentState {
    */
   reorderPass: (from: number, to: number) => void;
 
+  // ---- pass settings (#48) ----
+  /**
+   * Shallow-merge `patch` into a pass's `settings` (Pass.settings) as ONE
+   * undoable, dirty-marking edit. A `patch` value of `undefined` is ignored
+   * (use an explicit `null` to clear a setting back to "unset / engine
+   * default"). Nested ScaleAxis objects are replaced wholesale by the caller.
+   * No-op (no history entry) when the pass is unknown or nothing changes.
+   */
+  updatePassSettings: (passId: string, patch: Partial<PassSettings>) => void;
+  /**
+   * Set the project's global feedback pass index (Project.feedbackPass), or
+   * `null` to clear it. One undo entry; no-op when unchanged.
+   */
+  setFeedbackPass: (index: number | null) => void;
+
   /** Set (or clear) the selected pass in the pipeline view. */
   setPipelineSelection: (passId: string | null) => void;
   /** Switch the canvas to the pipeline view (remembering the pass viewport). */
@@ -285,6 +301,43 @@ function withNodeData(
     return next;
   });
   return touched ? { ...graph, nodes } : graph;
+}
+
+/**
+ * Shallow-merge a settings `patch` into a pass's `PassSettings`, returning a NEW
+ * object (or the same reference when nothing changes). A patch value of
+ * `undefined` is skipped — callers pass an explicit `null` to clear a key back
+ * to "unset". Object-valued keys (the ScaleAxis axes) are compared by deep
+ * equality so a structurally-identical replacement is a no-op.
+ */
+function mergeSettings(
+  settings: PassSettings,
+  patch: Partial<PassSettings>,
+): PassSettings {
+  const next: PassSettings = { ...settings };
+  let changed = false;
+  for (const [key, value] of Object.entries(patch) as [keyof PassSettings, unknown][]) {
+    if (value === undefined) {
+      continue;
+    }
+    const prev = next[key];
+    if (prev === value) {
+      continue;
+    }
+    if (
+      typeof prev === "object" &&
+      prev !== null &&
+      typeof value === "object" &&
+      value !== null &&
+      JSON.stringify(prev) === JSON.stringify(value)
+    ) {
+      continue;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (next as any)[key] = value;
+    changed = true;
+  }
+  return changed ? next : settings;
 }
 
 const initialProject = makeProject();
@@ -534,6 +587,44 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       const before = snapshot();
       set({
         project: reorderPass(project, from, to),
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    updatePassSettings: (passId, patch) => {
+      const { project } = get();
+      const pass = project.passes.find((p) => p.id === passId);
+      if (!pass) {
+        return;
+      }
+      const nextSettings = mergeSettings(pass.settings, patch);
+      if (nextSettings === pass.settings) {
+        return;
+      }
+      const before = snapshot();
+      set({
+        project: {
+          ...project,
+          passes: project.passes.map((p) =>
+            p.id === passId ? { ...p, settings: nextSettings } : p,
+          ),
+        },
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    setFeedbackPass: (index) => {
+      const { project } = get();
+      if (project.feedbackPass === index) {
+        return;
+      }
+      const before = snapshot();
+      set({
+        project: { ...project, feedbackPass: index },
         past: pushPast(before),
         future: [],
         dirty: true,
