@@ -3,10 +3,12 @@
 // components, and graphToIr ALL resolve nodes through here. Later issues EXTEND
 // the taxonomy by appending descriptors to `ALL_DESCRIPTORS` (#50 math, #51 color,
 // #52 custom snippet) — never by special-casing a kind elsewhere.
+import { colorDescriptors } from "./descriptors/color";
 import { coordinateDescriptors } from "./descriptors/coordinates";
 import { mathDescriptors } from "./descriptors/math";
 import { outputDescriptor } from "./descriptors/output";
 import { samplerDescriptors } from "./descriptors/samplers";
+import { samplingDescriptors } from "./descriptors/sampling";
 import { valueDescriptors } from "./descriptors/values";
 import { vectorDescriptors } from "./descriptors/vector";
 import type { NodeCategory, NodeData, NodeDescriptor } from "./types";
@@ -19,9 +21,11 @@ import type { NodeCategory, NodeData, NodeDescriptor } from "./types";
 export const ALL_DESCRIPTORS: ReadonlyArray<NodeDescriptor> = [
   ...samplerDescriptors,
   ...coordinateDescriptors,
+  ...samplingDescriptors,
   ...valueDescriptors,
   ...mathDescriptors,
   ...vectorDescriptors,
+  ...colorDescriptors,
   outputDescriptor,
 ];
 
