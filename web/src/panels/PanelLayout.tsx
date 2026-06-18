@@ -6,14 +6,16 @@
 import { useState } from "react";
 
 import { InspectorPanel } from "../inspector/InspectorPanel";
+import { ParameterPanel } from "../parameters/ParameterPanel";
 import { PassSettingsPanel } from "./PassSettingsPanel";
 import { SourcePanel } from "./SourcePanel";
 import { ViewportPanel } from "./ViewportPanel";
 
-type TabId = "inspector" | "pass" | "viewport" | "source";
+type TabId = "inspector" | "params" | "pass" | "viewport" | "source";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "inspector", label: "Inspector" },
+  { id: "params", label: "Parameters" },
   { id: "pass", label: "Pass" },
   { id: "viewport", label: "Viewport" },
   { id: "source", label: "Source" },
@@ -43,6 +45,7 @@ export function PanelLayout(): React.JSX.Element {
 
       <div className="panels__content">
         {active === "inspector" && <InspectorPanel />}
+        {active === "params" && <ParameterPanel />}
         {active === "pass" && <PassSettingsPanel />}
         {active === "viewport" && <ViewportPanel />}
         {active === "source" && <SourcePanel />}
