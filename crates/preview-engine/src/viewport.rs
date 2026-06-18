@@ -113,6 +113,75 @@ impl ViewportConfig {
     }
 }
 
+/// Where the content was composited in the **pane** and how big it is in
+/// **simulated-viewport** pixels — the two rectangles the pixel inspector (#61)
+/// needs to turn a PANE coordinate into a SIMULATED-VIEWPORT coordinate.
+///
+/// The renderer composites the §9 content rect (in output-resolution space) into a
+/// `pane_rect` sub-rectangle of the pane (centered, with black letterbox bars when
+/// a simulated viewport is active), and the content itself is `content_size`
+/// viewport pixels. With NO simulated viewport the pane *is* the content, so
+/// `pane_rect` is the whole pane and `content_size` equals the pane size — the
+/// mapping is then an identity. Pure (no GPU), so the pane↔viewport transform is
+/// unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneMapping {
+    /// The content's rectangle in PANE pixel space `(x, y, width, height)` — where
+    /// the final image was composited (the rest of the pane is letterbox bars).
+    pub pane_rect: (u32, u32, u32, u32),
+    /// The content's size in SIMULATED-VIEWPORT pixels `(width, height)` — the §9
+    /// content-rect size, the resolution the inspected value is reported against.
+    pub content_size: (u32, u32),
+}
+
+/// One mapped pixel (#61): whether the pane coordinate landed on the content, and
+/// the simulated-viewport pixel it maps to (`(0, 0)` when outside).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappedPixel {
+    /// `true` when the pane coordinate is inside the content rect (a real sample);
+    /// `false` when it landed in a letterbox bar (no sample).
+    pub inside: bool,
+    /// The simulated-viewport pixel X (content-rect space).
+    pub x: u32,
+    /// The simulated-viewport pixel Y (content-rect space).
+    pub y: u32,
+}
+
+impl PaneMapping {
+    /// Map a PANE pixel `(px, py)` to a SIMULATED-VIEWPORT pixel (#61).
+    ///
+    /// A pane pixel outside `pane_rect` (a letterbox bar) returns `inside == false`.
+    /// Inside, the pane pixel's CENTER is normalized within `pane_rect` and scaled
+    /// into the content size, floored to a whole viewport pixel and clamped to the
+    /// last valid index. Using the pixel center (`+0.5`) keeps the mapping centered
+    /// so the first/last pane pixels map to the first/last viewport pixels rather
+    /// than biasing toward the origin.
+    pub fn map_pane_pixel(&self, px: u32, py: u32) -> MappedPixel {
+        let (rx, ry, rw, rh) = self.pane_rect;
+        // Outside the content rect (a letterbox bar) — no sample. A zero-size rect
+        // (degenerate) is treated as wholly outside.
+        if rw == 0 || rh == 0 || px < rx || py < ry || px >= rx + rw || py >= ry + rh {
+            return MappedPixel {
+                inside: false,
+                x: 0,
+                y: 0,
+            };
+        }
+        let (cw, ch) = (self.content_size.0.max(1), self.content_size.1.max(1));
+        // Normalize the pane pixel center within the composite rect, scale into the
+        // content size, floor, and clamp to the last valid index.
+        let u = (px - rx) as f32 + 0.5;
+        let v = (py - ry) as f32 + 0.5;
+        let vx = ((u / rw as f32) * cw as f32).floor() as u32;
+        let vy = ((v / rh as f32) * ch as f32).floor() as u32;
+        MappedPixel {
+            inside: true,
+            x: vx.min(cw - 1),
+            y: vy.min(ch - 1),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +340,119 @@ mod tests {
         let c2 = cfg(640, 480, false);
         let r2 = c2.content_rect((0, 480));
         assert_within_output(&c2, &r2);
+    }
+
+    // ---- Pane → simulated-viewport pixel mapping (#61). ----
+
+    #[test]
+    fn pane_mapping_identity_when_pane_is_the_content() {
+        // No simulated viewport: pane == content, so the pane pixel maps 1:1.
+        let m = PaneMapping {
+            pane_rect: (0, 0, 100, 80),
+            content_size: (100, 80),
+        };
+        assert_eq!(
+            m.map_pane_pixel(0, 0),
+            MappedPixel {
+                inside: true,
+                x: 0,
+                y: 0
+            }
+        );
+        assert_eq!(
+            m.map_pane_pixel(50, 40),
+            MappedPixel {
+                inside: true,
+                x: 50,
+                y: 40
+            }
+        );
+        // The last pane pixel maps to the last viewport pixel (center sampling).
+        assert_eq!(
+            m.map_pane_pixel(99, 79),
+            MappedPixel {
+                inside: true,
+                x: 99,
+                y: 79
+            }
+        );
+    }
+
+    #[test]
+    fn pane_mapping_letterbox_bars_report_outside() {
+        // Content composited into a centered 60x40 rect inside a 100x80 pane: the
+        // bars (everything outside that rect) report `inside == false`.
+        let m = PaneMapping {
+            pane_rect: (20, 20, 60, 40),
+            content_size: (60, 40),
+        };
+        // Top-left corner of the pane is in the bar.
+        assert!(!m.map_pane_pixel(0, 0).inside, "top-left bar");
+        // Just left of the content rect.
+        assert!(!m.map_pane_pixel(19, 30).inside, "left bar");
+        // Just past the right edge (x = 20 + 60 = 80 is the first bar pixel).
+        assert!(!m.map_pane_pixel(80, 30).inside, "right bar");
+        // Inside the content rect.
+        let inner = m.map_pane_pixel(20, 20);
+        assert!(inner.inside, "content pixel is inside");
+        assert_eq!((inner.x, inner.y), (0, 0), "first content pixel");
+    }
+
+    #[test]
+    fn pane_mapping_upscales_pane_into_a_larger_viewport() {
+        // A small pane rect (50x40) showing a larger simulated viewport (200x160):
+        // each pane pixel maps to a 4x viewport pixel; the first/last span the
+        // content range.
+        let m = PaneMapping {
+            pane_rect: (0, 0, 50, 40),
+            content_size: (200, 160),
+        };
+        assert_eq!(
+            m.map_pane_pixel(0, 0),
+            MappedPixel {
+                inside: true,
+                x: 2,
+                y: 2
+            },
+            "pane (0,0) center maps into the first 4x cell"
+        );
+        // Mid-pane maps to mid-viewport.
+        let mid = m.map_pane_pixel(25, 20);
+        assert_eq!((mid.x, mid.y), (102, 82), "mid pane -> mid viewport");
+        // The last pane pixel maps to (clamped) the last viewport pixel.
+        let last = m.map_pane_pixel(49, 39);
+        assert_eq!((last.x, last.y), (198, 158), "last pane pixel near the end");
+    }
+
+    #[test]
+    fn pane_mapping_downscales_pane_from_a_smaller_viewport() {
+        // A large pane rect (200x160) showing a smaller viewport (50x40): several
+        // pane pixels collapse onto one viewport pixel, and the index never exceeds
+        // the content bounds.
+        let m = PaneMapping {
+            pane_rect: (0, 0, 200, 160),
+            content_size: (50, 40),
+        };
+        assert_eq!(
+            m.map_pane_pixel(0, 0),
+            MappedPixel {
+                inside: true,
+                x: 0,
+                y: 0
+            }
+        );
+        let last = m.map_pane_pixel(199, 159);
+        assert_eq!((last.x, last.y), (49, 39), "clamped to the last index");
+        assert!(last.x < 50 && last.y < 40, "never exceeds content bounds");
+    }
+
+    #[test]
+    fn pane_mapping_zero_size_rect_is_outside() {
+        let m = PaneMapping {
+            pane_rect: (0, 0, 0, 0),
+            content_size: (10, 10),
+        };
+        assert!(!m.map_pane_pixel(0, 0).inside, "degenerate rect -> outside");
     }
 
     #[test]

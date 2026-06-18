@@ -133,6 +133,44 @@ pub enum RenderCommand {
     /// Replace the registered LUTs (#27): the preset's `textures` family, decoded
     /// by the app and bound by name as `<NAME>`. An empty list clears stale LUTs.
     SetLuts(Vec<crate::LutSpec>),
+    /// Inspect one preview pixel ON DEMAND (#61, Spec §8.5): map the given PANE
+    /// coordinate to a simulated-viewport pixel, read that pixel back from the
+    /// offscreen target, and reply on `respond` with the [`InspectResult`]. Routed
+    /// through the render thread because [`crate::Renderer::read_pixel_region`]
+    /// blocks on a `device.poll(wait)` — only the render thread may touch the
+    /// renderer. Sent on hover/click (debounced by the app), NEVER per frame.
+    InspectPixel {
+        /// The pane pixel X to inspect (clamped to the pane by the mapping).
+        x: u32,
+        /// The pane pixel Y to inspect.
+        y: u32,
+        /// One-shot reply channel: the render thread sends exactly one
+        /// [`InspectResult`] (the app blocks on the receiving end).
+        respond: std::sync::mpsc::Sender<InspectResult>,
+    },
+}
+
+/// The result of an [`RenderCommand::InspectPixel`] probe (#61), computed on the
+/// render thread and sent back over the command's reply channel. Engine-local (the
+/// engine has no `core-model` dependency, like [`EngineStatus`]); the app maps it
+/// to [`core_model::PixelSample`] at the IPC boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectResult {
+    /// Whether the pane coordinate mapped to a real content pixel (`true`) or a
+    /// letterbox bar (`false` — no sample).
+    pub inside: bool,
+    /// The simulated-viewport pixel X the pane coordinate maps to (`0` when outside).
+    pub x: u32,
+    /// The simulated-viewport pixel Y.
+    pub y: u32,
+    /// The simulated-viewport width the coordinate is reported against (the §9
+    /// content-rect width).
+    pub viewport_width: u32,
+    /// The simulated-viewport height.
+    pub viewport_height: u32,
+    /// The inspected pixel's RGBA bytes from the offscreen target (`[0; 4]` when
+    /// outside). `Rgba8Unorm` today, so these are the exact stored values.
+    pub rgba: [u8; 4],
 }
 
 /// The transport's render rate (the §10 *animation* clock): `render_into` is
@@ -375,7 +413,51 @@ impl RenderSource {
                 RenderCommand::SetLuts(luts) => {
                     self.renderer.set_luts(luts);
                 }
+                RenderCommand::InspectPixel { x, y, respond } => {
+                    let result = self.inspect_pixel(x, y);
+                    // A dropped receiver (the app gave up waiting) is harmless.
+                    let _ = respond.send(result);
+                }
             }
+        }
+    }
+
+    /// Map a PANE coordinate to a simulated-viewport pixel and read it back ON
+    /// DEMAND (#61). Reuses [`crate::Renderer::pane_mapping`] (the §30 composite-rect
+    /// math) so the reported coordinate is in SIMULATED-VIEWPORT space — letterbox
+    /// bars map to "outside" (no sample). The readback BLOCKS, so this only runs
+    /// here on the render thread, in response to a single inspect command.
+    fn inspect_pixel(&self, x: u32, y: u32) -> InspectResult {
+        let mapping = self.renderer.pane_mapping();
+        let (vw, vh) = mapping.content_size;
+        let mapped = mapping.map_pane_pixel(x, y);
+        if !mapped.inside {
+            return InspectResult {
+                inside: false,
+                x: 0,
+                y: 0,
+                viewport_width: vw,
+                viewport_height: vh,
+                rgba: [0, 0, 0, 0],
+            };
+        }
+        // Read the SINGLE pane pixel under the cursor from the offscreen target. The
+        // value is the content as composited into the pane (pre-stream-downsample —
+        // the pane offscreen IS the read-back surface). A 1×1 region keeps the probe
+        // cheap. A readback failure degrades to a black sample rather than erroring.
+        let rgba = match self.renderer.read_pixel_region(x, y, 1, 1) {
+            Ok(frame) if frame.rgba.len() >= 4 => {
+                [frame.rgba[0], frame.rgba[1], frame.rgba[2], frame.rgba[3]]
+            }
+            _ => [0, 0, 0, 0],
+        };
+        InspectResult {
+            inside: true,
+            x: mapped.x,
+            y: mapped.y,
+            viewport_width: vw,
+            viewport_height: vh,
+            rgba,
         }
     }
 
@@ -903,6 +985,134 @@ void main() { FragColor = vec4(params.X, 0.0, 0.0, 1.0); }
             ],
             "expected exactly one LastGood then one Live transition, got {events:?}"
         );
+    }
+
+    // ---- Pixel inspector (#61): on-demand readback + pane→viewport mapping. ----
+
+    /// A constant-color fragment shader (R/G/B from params) so the inspected pixel
+    /// has a KNOWN value regardless of source content.
+    const CONST_COLOR_SHADER: &str = "#version 450
+#pragma parameter R \"R\" 0.0 0.0 1.0 0.01
+#pragma parameter G \"G\" 0.0 0.0 1.0 0.01
+#pragma parameter B \"B\" 0.0 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+layout(std140, set = 0, binding = 3) uniform Params { float R; float G; float B; } params;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() { FragColor = vec4(params.R, params.G, params.B, 1.0); }
+";
+
+    /// Drive an InspectPixel command through the channel exactly as the Tauri
+    /// command does, render a frame, then read the reply.
+    fn inspect(
+        src: &mut RenderSource,
+        tx: &mpsc::Sender<RenderCommand>,
+        x: u32,
+        y: u32,
+    ) -> InspectResult {
+        let (rtx, rrx) = mpsc::channel();
+        tx.send(RenderCommand::InspectPixel { x, y, respond: rtx })
+            .unwrap();
+        // The inspect command is drained at the start of the next render.
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+        rrx.recv().expect("inspect reply")
+    }
+
+    #[test]
+    fn inspect_pixel_reports_the_known_rendered_color() {
+        // No simulated viewport: the pane IS the content, so the inspected pixel is
+        // the rendered constant color and the coordinate maps 1:1.
+        let (tx, rx) = mpsc::channel();
+        let mut src = RenderSource::new(16, 16, rx).expect("wgpu device");
+        let shader = compile_slang(CONST_COLOR_SHADER, None).expect("compile const shader");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(8, 8)))
+            .unwrap();
+        // R=0.8 (~204), G=0.4 (~102), B=0.0.
+        tx.send(RenderCommand::SetParameter {
+            name: "R".into(),
+            value: 0.8,
+        })
+        .unwrap();
+        tx.send(RenderCommand::SetParameter {
+            name: "G".into(),
+            value: 0.4,
+        })
+        .unwrap();
+        // Render so the offscreen holds the color BEFORE inspecting (the inspector
+        // reads the currently-displayed offscreen, drained before its own render).
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+
+        let result = inspect(&mut src, &tx, 5, 7);
+        assert!(result.inside, "a pane pixel maps to content");
+        // Pane == viewport (no simulated viewport) so the coordinate is identity.
+        assert_eq!((result.x, result.y), (5, 7), "1:1 pane→viewport coordinate");
+        assert_eq!((result.viewport_width, result.viewport_height), (16, 16));
+        assert!(
+            (result.rgba[0] as i32 - 204).abs() <= 4,
+            "R~204, got {}",
+            result.rgba[0]
+        );
+        assert!(
+            (result.rgba[1] as i32 - 102).abs() <= 4,
+            "G~102, got {}",
+            result.rgba[1]
+        );
+        assert!(result.rgba[2] <= 4, "B~0, got {}", result.rgba[2]);
+        assert_eq!(result.rgba[3], 255, "opaque");
+    }
+
+    #[test]
+    fn inspect_pixel_maps_pane_to_simulated_viewport_and_flags_letterbox() {
+        // A simulated viewport larger than the pane with letterbox bars: an inside
+        // pane pixel reports a SIMULATED-VIEWPORT coordinate (not a raw pane pixel),
+        // and a bar pixel reports outside. Source 64x64 (square) into a 200x100
+        // output pillarboxes → content 100x100, bars left/right.
+        let (tx, rx) = mpsc::channel();
+        let mut src = RenderSource::new(40, 20, rx).expect("wgpu device");
+        let shader = compile_slang(DEFAULT_SHADER, None).expect("compile");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(64, 64)))
+            .unwrap();
+        tx.send(RenderCommand::SetSimulatedViewport(Some(
+            crate::ViewportConfig {
+                width: 200,
+                height: 100,
+                integer_scale: false,
+            },
+        )))
+        .unwrap();
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+
+        // The content is 100x100 (square source pillarboxed into 200x100), centered
+        // in the 200x100 output → composited into a centered rect in the 40x20 pane.
+        let center = inspect(&mut src, &tx, 20, 10);
+        assert!(center.inside, "pane center is on the content");
+        assert_eq!(
+            (center.viewport_width, center.viewport_height),
+            (100, 100),
+            "reported against the §9 content size, not the pane"
+        );
+        // The reported coordinate is in viewport (content) space, near the middle.
+        assert!(
+            center.x > 30 && center.x < 70 && center.y > 30 && center.y < 70,
+            "viewport-space coordinate near the content center, got ({},{})",
+            center.x,
+            center.y
+        );
+
+        // The far-left pane column is in the pillarbox bar → outside.
+        let bar = inspect(&mut src, &tx, 0, 10);
+        assert!(!bar.inside, "left pillarbox bar reports outside");
     }
 
     #[test]

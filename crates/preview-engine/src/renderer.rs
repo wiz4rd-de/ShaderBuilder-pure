@@ -34,7 +34,7 @@
 use crate::bindtable::{self, PlaceholderResolver, TextureClass, TextureResolver};
 use crate::pass::{AxisScale, Pass, ScaleConfig, WrapMode};
 use crate::uniforms::{self, BuiltinValues, ParamStore, ParamView};
-use crate::viewport::ViewportConfig;
+use crate::viewport::{PaneMapping, ViewportConfig};
 use slang_compile::{BlockBinding, CompiledShader, Parameter, SpirvReflection, UniformBlock};
 use source::Frame;
 
@@ -621,6 +621,29 @@ impl Renderer {
         let w = ((rect.width as f32 * sx).round() as u32).min(self.width.saturating_sub(x));
         let h = ((rect.height as f32 * sy).round() as u32).min(self.height.saturating_sub(y));
         Some((x, y, w.max(1), h.max(1)))
+    }
+
+    /// The pane↔simulated-viewport mapping for the pixel inspector (#61): where the
+    /// content is composited in the pane and how big it is in viewport pixels.
+    ///
+    /// With a simulated viewport active this is the §30 content rect mapped into
+    /// pane space ([`Renderer::final_composite_rect`]) paired with the content's
+    /// viewport-pixel size ([`Renderer::viewport_size`]) — so a pane pixel in a
+    /// letterbox bar maps to "outside" and a content pane pixel maps to the right
+    /// viewport pixel. With NO simulated viewport the pane IS the content: the whole
+    /// pane maps 1:1 to a pane-sized "viewport" (identity), matching the fact that
+    /// `read_back` reads the pane offscreen directly.
+    pub fn pane_mapping(&self) -> PaneMapping {
+        match self.final_composite_rect() {
+            Some(rect) => PaneMapping {
+                pane_rect: rect,
+                content_size: self.viewport_size(),
+            },
+            None => PaneMapping {
+                pane_rect: (0, 0, self.width, self.height),
+                content_size: (self.width, self.height),
+            },
+        }
     }
 
     /// The source texture's format. Linear RGBA8 — a passthrough shader
@@ -2232,6 +2255,95 @@ impl Renderer {
         buffer.unmap();
 
         Ok(Frame::new(self.width, self.height, rgba))
+    }
+
+    /// Read back a small **region** of the offscreen target ON DEMAND for the pixel
+    /// inspector (#61): the `w × h` block whose top-left is `(x, y)` in pane pixels,
+    /// clamped to the offscreen bounds. Like [`Renderer::read_back`] this BLOCKS on a
+    /// `device.poll(wait)`, so it must run on the render thread only — but it copies
+    /// just the requested block (not the whole frame), so an on-hover/on-click probe
+    /// is cheap and never per-frame.
+    ///
+    /// Returns a [`Frame`] sized to the clamped region (RGBA8), so the caller reads
+    /// the first pixel as `frame.rgba[0..4]`. The offscreen is [`OFFSCREEN_FORMAT`]
+    /// (`Rgba8Unorm`) today, so the bytes are the exact stored value; a float/sRGB
+    /// target (Spec §8.5) would need a format-aware decode here — documented hook.
+    pub fn read_pixel_region(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Frame, RendererError> {
+        // Clamp the region into the offscreen bounds; an x/y past the edge yields a
+        // 1px region at the edge so the readback always has a defined ≥1×1 size.
+        let x = x.min(self.width.saturating_sub(1));
+        let y = y.min(self.height.saturating_sub(1));
+        let region_w = w.clamp(1, self.width - x);
+        let region_h = h.clamp(1, self.height - y);
+
+        let bytes_per_pixel = 4u32;
+        let unpadded = region_w * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pixel readback"),
+            size: (padded * region_h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pixel readback encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.offscreen,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(region_h),
+                },
+            },
+            wgpu::Extent3d {
+                width: region_w,
+                height: region_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Readback(format!("{e:?}")))?;
+        rx.recv()
+            .map_err(|e| RendererError::Readback(e.to_string()))?
+            .map_err(|e| RendererError::Readback(format!("{e:?}")))?;
+
+        let data = slice.get_mapped_range();
+        let mut rgba = Vec::with_capacity((unpadded * region_h) as usize);
+        for row in 0..region_h {
+            let start = (row * padded) as usize;
+            rgba.extend_from_slice(&data[start..start + unpadded as usize]);
+        }
+        drop(data);
+        buffer.unmap();
+
+        Ok(Frame::new(region_w, region_h, rgba))
     }
 }
 
