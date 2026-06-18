@@ -1,0 +1,62 @@
+// The editor toolbar (#45): add-node, undo/redo, and clipboard buttons. All
+// actions go through the document store so they share the keyboard path's
+// history semantics exactly.
+import { useDocumentStore } from "../store/documentStore";
+import { PLACEHOLDER_KIND } from "../store/factories";
+
+export function EditorToolbar() {
+  const canUndo = useDocumentStore((s) => s.past.length > 0);
+  const canRedo = useDocumentStore((s) => s.future.length > 0);
+  const hasSelection = useDocumentStore((s) => s.selection.nodeIds.length > 0);
+  const hasClipboard = useDocumentStore((s) => (s.clipboard?.nodes.length ?? 0) > 0);
+
+  const addNode = useDocumentStore((s) => s.addNode);
+  const undo = useDocumentStore((s) => s.undo);
+  const redo = useDocumentStore((s) => s.redo);
+  const copy = useDocumentStore((s) => s.copy);
+  const paste = useDocumentStore((s) => s.paste);
+  const duplicate = useDocumentStore((s) => s.duplicate);
+  const removeSelection = useDocumentStore((s) => s.removeSelection);
+
+  return (
+    <div className="editor__toolbar" role="toolbar" aria-label="Editor actions">
+      <button
+        type="button"
+        onClick={() => addNode(PLACEHOLDER_KIND, { x: 120, y: 80 })}
+        title="Add a placeholder node"
+      >
+        Add node
+      </button>
+      <span className="editor__toolbar-sep" aria-hidden="true" />
+      <button type="button" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)">
+        Undo
+      </button>
+      <button type="button" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)">
+        Redo
+      </button>
+      <span className="editor__toolbar-sep" aria-hidden="true" />
+      <button type="button" onClick={copy} disabled={!hasSelection} title="Copy (Ctrl+C)">
+        Copy
+      </button>
+      <button type="button" onClick={paste} disabled={!hasClipboard} title="Paste (Ctrl+V)">
+        Paste
+      </button>
+      <button
+        type="button"
+        onClick={duplicate}
+        disabled={!hasSelection}
+        title="Duplicate (Ctrl+D)"
+      >
+        Duplicate
+      </button>
+      <button
+        type="button"
+        onClick={removeSelection}
+        disabled={!hasSelection}
+        title="Delete (Del)"
+      >
+        Delete
+      </button>
+    </div>
+  );
+}
