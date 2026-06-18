@@ -23,6 +23,10 @@ function Harness() {
 beforeEach(() => {
   resetIdsForTest();
   useDocumentStore.getState().reset();
+  // The toolbar/status here exercise the per-pass graph level; drill into the
+  // initial pass so the status bar reports node/edge counts (not pass counts).
+  const firstPass = useDocumentStore.getState().project.passes[0]!.id;
+  useDocumentStore.getState().openPass(firstPass);
 });
 
 describe("EditorToolbar + EditorStatusBar", () => {

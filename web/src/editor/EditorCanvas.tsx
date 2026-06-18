@@ -1,6 +1,12 @@
-// The node editor canvas (#45). React Flow in controlled mode: nodes/edges are
-// DERIVED from the document store, and all interactions write back through it.
-// History semantics:
+// The node editor canvas (#45, #46). React Flow in controlled mode: nodes/edges
+// are DERIVED from the document store, and all interactions write back through it.
+//
+// Two-level editing (#46): the SAME canvas surface renders either the PIPELINE
+// view (each pass = a node) or a drilled-in pass's per-pass node graph, switched
+// by the store's `level`. A breadcrumb returns to the pipeline; per-level pan/zoom
+// and selection are remembered so navigating back restores them.
+//
+// History semantics (pass graph):
 //   * Discrete edits (palette insert, connect, paste, delete) push one entry.
 //   * A node/selection drag is COALESCED: beginInteraction() on drag-start,
 //     live position updates during drag, commit() once on drag-stop.
@@ -14,10 +20,14 @@ import {
   type EdgeChange,
   type NodeChange,
   type OnSelectionChangeParams,
+  type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { PipelineBreadcrumb } from "../pipeline/PipelineBreadcrumb";
+import { PipelineCanvas } from "../pipeline/PipelineCanvas";
+import { PipelineToolbar } from "../pipeline/PipelineToolbar";
 import { NODE_TYPES } from "../nodes/nodeTypes";
 import { useDocumentStore } from "../store/documentStore";
 import { EditorStatusBar } from "./EditorStatusBar";
@@ -31,24 +41,36 @@ interface PaletteAnchor {
   graphPosition: { x: number; y: number };
 }
 
-function CanvasInner() {
-  useEditorShortcuts();
-  const { screenToFlowPosition } = useReactFlow();
+/** The per-pass node graph (drilled-in level). */
+function PassGraph() {
+  const { screenToFlowPosition, setViewport: applyRfViewport } = useReactFlow();
 
   // Derive RF arrays from the store (single source of truth). Subscribing to
   // graph + selection means any store mutation re-renders the canvas.
   const graph = useDocumentStore((s) => s.activeGraph());
   const selection = useDocumentStore((s) => s.selection);
+  const activePassId = useDocumentStore((s) => s.activePassId);
+  const rememberedViewport = useDocumentStore((s) => s.viewports.passes[s.activePassId] ?? null);
   const { nodes, edges } = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
 
   const applyNodeChanges = useDocumentStore((s) => s.applyNodeChanges);
   const applyEdgeChanges = useDocumentStore((s) => s.applyEdgeChanges);
   const addEdge = useDocumentStore((s) => s.addEdge);
   const setSelection = useDocumentStore((s) => s.setSelection);
+  const setViewport = useDocumentStore((s) => s.setViewport);
   const beginInteraction = useDocumentStore((s) => s.beginInteraction);
   const commit = useDocumentStore((s) => s.commit);
 
   const [palette, setPalette] = useState<PaletteAnchor | null>(null);
+
+  // Restore this pass's remembered viewport once on mount (drill-in remounts).
+  const restored = useRef(false);
+  useEffect(() => {
+    if (!restored.current && rememberedViewport) {
+      restored.current = true;
+      applyRfViewport(rememberedViewport);
+    }
+  }, [rememberedViewport, applyRfViewport]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => applyNodeChanges(changes),
@@ -86,6 +108,11 @@ function CanvasInner() {
   const onSelectionDragStart = useCallback(() => beginInteraction(), [beginInteraction]);
   const onSelectionDragStop = useCallback(() => commit(), [commit]);
 
+  const onMoveEnd = useCallback(
+    (_event: unknown, viewport: Viewport) => setViewport(viewport),
+    [setViewport],
+  );
+
   const onPaneContextMenu = useCallback(
     (event: React.MouseEvent | MouseEvent) => {
       event.preventDefault();
@@ -98,10 +125,11 @@ function CanvasInner() {
   const closePalette = useCallback(() => setPalette(null), []);
 
   return (
-    <div className="editor__canvas-host">
+    <>
       <EditorToolbar />
       <div className="editor__canvas" onClick={palette ? closePalette : undefined}>
         <ReactFlow
+          key={activePassId}
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}
@@ -113,10 +141,11 @@ function CanvasInner() {
           onNodeDragStop={onNodeDragStop}
           onSelectionDragStart={onSelectionDragStart}
           onSelectionDragStop={onSelectionDragStop}
+          onMoveEnd={onMoveEnd}
           onPaneContextMenu={onPaneContextMenu}
           selectionOnDrag
           panOnDrag={[1, 2]}
-          fitView
+          fitView={!rememberedViewport}
           proOptions={{ hideAttribution: true }}
         >
           <Background />
@@ -130,6 +159,27 @@ function CanvasInner() {
           />
         ) : null}
       </div>
+    </>
+  );
+}
+
+function CanvasInner() {
+  useEditorShortcuts();
+  const level = useDocumentStore((s) => s.level);
+
+  return (
+    <div className="editor__canvas-host">
+      <PipelineBreadcrumb />
+      {level === "pipeline" ? (
+        <>
+          <PipelineToolbar />
+          <div className="editor__canvas">
+            <PipelineCanvas />
+          </div>
+        </>
+      ) : (
+        <PassGraph />
+      )}
       <EditorStatusBar />
     </div>
   );

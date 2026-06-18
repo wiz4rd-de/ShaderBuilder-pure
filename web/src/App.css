@@ -231,6 +231,135 @@
   opacity: 0.8;
 }
 
+/* ---- Pipeline view + breadcrumb (#46) ---- */
+.pipeline-breadcrumb {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.pipeline-breadcrumb__back {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.pipeline-breadcrumb__back:hover {
+  border-color: var(--accent);
+}
+
+.pipeline-breadcrumb__sep {
+  color: var(--muted);
+}
+
+.pipeline-breadcrumb__crumb--current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.pipeline-node {
+  position: relative;
+  min-width: 150px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 30%);
+}
+
+.react-flow__node.selected .pipeline-node {
+  border-color: var(--accent);
+}
+
+.pipeline-node__title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 10px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+
+.pipeline-node__index {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pipeline-node__subtitle {
+  padding: 4px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.pipeline-node__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 10px;
+}
+
+.pipeline-node__chip {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.pipeline-node__chip--lut {
+  border-color: #c792ea;
+  color: #c792ea;
+}
+
+.pipeline-node__chip--originalHistory {
+  border-color: #d6d65a;
+  color: #d6d65a;
+}
+
+.pipeline-node__handle {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--bg);
+  background: var(--accent);
+}
+
+.pipeline-node__handle--passOutput {
+  background: #e6a15a;
+}
+
+.pipeline-node__handle--passFeedback {
+  background: #e65a8b;
+}
+
+.pipeline-node__handle--out {
+  background: #5aa9e6;
+}
+
+/* Cross-pass edge styling: pass-output vs feedback distinguishable. */
+.react-flow__edge.pipeline-edge--passOutput .react-flow__edge-path {
+  stroke: #e6a15a;
+}
+
+.react-flow__edge.pipeline-edge--passFeedback .react-flow__edge-path {
+  stroke: #e65a8b;
+  stroke-dasharray: 5 4;
+}
+
 .editor__statusbar {
   flex: 0 0 auto;
   display: flex;
