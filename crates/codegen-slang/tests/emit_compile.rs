@@ -1009,3 +1009,70 @@ fn sampling_crt_mask_snippet_compiles_and_tracks_output_size() {
         panic!("crtMask sampling graph slang did not compile: {e}\n--- emitted ---\n{slang}")
     });
 }
+
+/// The frontend custom-snippet node (#52, web/src/nodes/descriptors/custom.ts)
+/// lowers to a `CustomSnippet` whose author-typed body reads its declared input
+/// ports and assigns its declared output ports. This pins the node's DEFAULT body
+/// (a colour-clamp pass-through over a `vec4 color` input → `vec4 result` output):
+/// the exact IrGraph the bridge emits for `Source → CustomSnippet → Output` must
+/// compile through the real slang pipeline (the #52 "a snippet block compiles +
+/// previews through compile_graph" acceptance bar).
+#[test]
+fn custom_snippet_node_default_body_compiles() {
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            // The descriptor's default data: one vec4 `color` in, one vec4 `result`
+            // out, body = the clamp pass-through (DEFAULT_BODY in custom.ts).
+            IrNode::new(
+                "snippet",
+                NodeOp::CustomSnippet {
+                    body: "result = clamp(color, vec4(0.0), vec4(1.0));".to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec4)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec4)],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "snippet", "color"),
+            IrEdge::new("snippet", "result", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "custom-snippet default-body graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("custom-snippet graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("custom_snippet_node".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    assert!(
+        slang.contains("result = clamp(color, vec4(0.0), vec4(1.0));"),
+        "snippet body inlined verbatim:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("custom-snippet node slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
