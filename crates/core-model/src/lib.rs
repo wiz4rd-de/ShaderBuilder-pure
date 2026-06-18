@@ -38,10 +38,15 @@ pub mod engine;
 pub mod inspect;
 pub mod ir;
 pub mod library;
+pub mod session;
 
 pub use engine::{EngineErrorEvent, EngineEvent, EngineSeverity, EngineStatus};
 pub use inspect::{PixelFormat, PixelSample};
 pub use library::{delete_item, list_items, save_item, LibraryError};
+pub use session::{
+    clear_recovery, file_modified_ms, load_recents, push_recent, read_recovery, recovery_is_newer,
+    write_recovery, RecentProject, Recovery, RecoveryMeta, SessionError, MAX_RECENTS,
+};
 
 use crate::ir::PortType;
 
