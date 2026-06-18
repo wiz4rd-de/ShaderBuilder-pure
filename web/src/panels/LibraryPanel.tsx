@@ -21,7 +21,7 @@ import type { Vec2 } from "../bindings/Vec2";
 import { collapseSelection as collapse } from "../store/collapse";
 import { useDocumentStore } from "../store/documentStore";
 import { nextId } from "../store/ids";
-import { readSubgraph, SUBGRAPH_KIND } from "../nodes/subgraph";
+import { readSubgraph } from "../nodes/subgraph";
 import {
   deleteLibraryNode,
   listLibraryNode,
@@ -62,7 +62,10 @@ function payloadFromSelection(name: string): LibraryPayload | null {
   if (!result) {
     return null;
   }
-  const wrapper = result.graph.nodes.find((n) => n.kind === SUBGRAPH_KIND);
+  // Locate the wrapper by its known id. collapseSelection appends the NEW wrapper
+  // LAST, so a `.find(kind === SUBGRAPH_KIND)` would return a PRE-EXISTING
+  // (unselected) subgraph node that sits earlier — saving the wrong body.
+  const wrapper = result.graph.nodes.find((n) => n.id === result.subgraphNodeId);
   if (!wrapper) {
     return null;
   }

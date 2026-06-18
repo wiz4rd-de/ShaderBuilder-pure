@@ -227,6 +227,50 @@ describe("LibraryPanel", () => {
     promptSpy.mockRestore();
   });
 
+  it("multi-selection save uses the NEW collapse wrapper, not a pre-existing subgraph", async () => {
+    // Fix D: a graph already containing an UNSELECTED subgraph node A (appears
+    // earlier) plus primitives B+C. Selecting only B+C and saving must persist the
+    // B+C subgraph (the new wrapper, appended last), NOT A's body.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_library_node") return Promise.resolve([]);
+      return Promise.resolve();
+    });
+    openPass();
+    // A: a pre-existing collapsed subgraph (collapse a lone node so it sits first).
+    const a0 = store().addNode("source", { x: -100, y: 0 });
+    store().setSelection({ nodeIds: [a0], edgeIds: [] });
+    store().collapseSelection("PreExisting A");
+    const aId = store().activeGraph().nodes.find(isSubgraphNode)!.id;
+    // B + C: two primitives wired together, both selected.
+    const b = store().addNode("texcoord", { x: 0, y: 0 });
+    const c = store().addNode("source", { x: 100, y: 0 });
+    store().addEdge(b, "uv", c, "coord");
+    store().setSelection({ nodeIds: [b, c], edgeIds: [] });
+
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValueOnce("BC") // name
+      .mockReturnValueOnce("") // description
+      .mockReturnValueOnce(""); // tags
+
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((call) => call[0] === "save_library_node")).toBe(true),
+    );
+    const item = (invoke.mock.calls.find((call) => call[0] === "save_library_node")![1] as {
+      item: LibraryItem;
+    }).item;
+    expect(item.payload.kind).toBe("subgraph");
+    if (item.payload.kind !== "subgraph") throw new Error("kind");
+    const sub = item.payload.subgraph;
+    // The saved body is B+C (a texcoord + a source), NOT A's lone source.
+    expect(sub.nodes.map((n) => n.kind).sort()).toEqual(["source", "texcoord"]);
+    // A's id is nowhere in the saved interior.
+    expect(sub.nodes.some((n) => n.id === aId)).toBe(false);
+    promptSpy.mockRestore();
+  });
+
   it("deletes an item behind a confirm and refreshes", async () => {
     let listed: LibraryItem[] = [nodeItem()];
     invoke.mockImplementation((cmd: string, args?: unknown) => {
