@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { SplitDivider } from "./SplitDivider";
 import { useCompareStore } from "./compareStore";
+import type { CanvasGeometry } from "./InspectorOverlay";
 
 beforeEach(() => {
   useCompareStore.setState({
@@ -15,24 +16,36 @@ beforeEach(() => {
 });
 
 /**
- * Render the divider inside a pane whose geometry is stubbed (jsdom returns a
- * zero rect otherwise), so the pointer-to-normalized math is exercised for real.
+ * Render the divider with a stubbed canvas whose displayed box (200x100) EQUALS
+ * its backing pixels (no object-fit:contain margin), so the pointer→normalized
+ * mapping is 1:1 and the legacy assertions still hold. (The contain-aware math is
+ * unit-tested directly in pixelInspect.test.ts, #1.)
  */
 function renderDivider(orientation: "vertical" | "horizontal") {
-  const paneRef = createRef<HTMLDivElement>();
+  const canvasRef = createRef<HTMLCanvasElement>();
+  const geometry: CanvasGeometry = {
+    boxWidth: 200,
+    boxHeight: 100,
+    canvasWidth: 200,
+    canvasHeight: 100,
+    offsetLeft: 0,
+    offsetTop: 0,
+  };
   const utils = render(
-    <div
-      ref={paneRef}
-      style={{ position: "relative" }}
-      data-testid="pane"
-    >
-      <SplitDivider paneRef={paneRef} orientation={orientation} pos={0.5} />
+    <div style={{ position: "relative" }} data-testid="pane">
+      <canvas ref={canvasRef} width={200} height={100} />
+      <SplitDivider
+        canvasRef={canvasRef}
+        geometry={geometry}
+        orientation={orientation}
+        pos={0.5}
+      />
     </div>,
   );
-  // Stub the pane's box: 200px wide, 100px tall, at the viewport origin.
-  paneRef.current!.getBoundingClientRect = () =>
+  // Stub the canvas's box: 200px wide, 100px tall, at the viewport origin.
+  canvasRef.current!.getBoundingClientRect = () =>
     ({ left: 0, top: 0, width: 200, height: 100, right: 200, bottom: 100, x: 0, y: 0 }) as DOMRect;
-  return { ...utils, paneRef };
+  return { ...utils, canvasRef };
 }
 
 describe("SplitDivider", () => {

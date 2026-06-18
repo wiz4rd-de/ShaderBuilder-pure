@@ -1,43 +1,61 @@
-// The draggable split divider overlay (#60). A thin DOM line + grab handle laid
-// over the preview pane; dragging it sets the normalized divider position in the
-// compare store. The COMPOSITED pixels are clipped at the boundary by the canvas
-// compositor (compareCompositor) — this overlay is only the visible handle, so
-// the line and the pixel seam stay in lockstep (both derive from `splitPos`).
+// The draggable split divider overlay (#60, contain-corrected #1). A thin DOM line
+// + grab handle laid over the preview canvas; dragging it sets the normalized
+// divider position in the compare store. The COMPOSITED pixels are clipped at the
+// boundary by the canvas compositor (compareCompositor) at `splitClip`'s
+// `Math.round(canvas*pos)` seam.
 //
-// Position is normalized (CSS percent), so the handle tracks the pane regardless
-// of the canvas's object-fit scaling. Pointer math goes through
-// `paneToNormalized`, the single pane<->normalized mapping (the #61 seam).
+// The canvas renders `object-fit: contain` (App.css), so its bitmap is letterboxed
+// inside the element box when the pane aspect != the canvas aspect. The divider is
+// therefore CONTAIN-AWARE: pointer math and line placement both go through the
+// SHARED contain helpers in pixelInspect (`domToSplitNormalized` /
+// `splitSeamBoxOffset` / `containRect`) — the SAME math the pixel inspector uses —
+// so the visible line lands exactly on the pixel seam for ANY pane aspect, not just
+// 4:3 (#1).
 
 import { useCallback, useEffect, useRef, type RefObject } from "react";
 
-import { paneToNormalized, type SplitOrientation } from "./compareGeometry";
+import type { SplitOrientation } from "./compareGeometry";
 import { useCompareStore } from "./compareStore";
+import type { CanvasGeometry } from "./InspectorOverlay";
+import { domToSplitNormalized, splitSeamBoxOffset } from "./pixelInspect";
 
 export interface SplitDividerProps {
-  /** The pane element the divider is laid over (for pointer-to-pane geometry). */
-  paneRef: RefObject<HTMLDivElement | null>;
+  /** The canvas element the divider is laid over (for pointer-to-canvas geometry). */
+  canvasRef: RefObject<HTMLCanvasElement | null>;
+  /** The canvas's measured contain geometry (box size, canvas px, offset in pane). */
+  geometry: CanvasGeometry;
   orientation: SplitOrientation;
   /** Normalized divider position in [0,1]. */
   pos: number;
 }
 
-export function SplitDivider({ paneRef, orientation, pos }: SplitDividerProps) {
+export function SplitDivider({ canvasRef, geometry, orientation, pos }: SplitDividerProps) {
   const setSplitPos = useCompareStore((s) => s.setSplitPos);
   const draggingRef = useRef(false);
 
-  /** Convert a pointer event to a normalized position within the pane. */
+  /**
+   * Convert a pointer event to a normalized position over the RENDERED image,
+   * undoing the `object-fit: contain` letterbox via the shared contain math (#1),
+   * so a drag maps to the same space as the composited pixel seam.
+   */
   const posFromEvent = useCallback(
     (clientX: number, clientY: number): number => {
-      const pane = paneRef.current;
-      if (!pane) {
+      const canvas = canvasRef.current;
+      if (!canvas) {
         return pos;
       }
-      const rect = pane.getBoundingClientRect();
-      return orientation === "vertical"
-        ? paneToNormalized(clientX - rect.left, rect.width, "vertical")
-        : paneToNormalized(clientY - rect.top, rect.height, "horizontal");
+      const rect = canvas.getBoundingClientRect();
+      const offset = orientation === "vertical" ? clientX - rect.left : clientY - rect.top;
+      return domToSplitNormalized(
+        offset,
+        rect.width,
+        rect.height,
+        canvas.width,
+        canvas.height,
+        orientation,
+      );
     },
-    [paneRef, orientation, pos],
+    [canvasRef, orientation, pos],
   );
 
   // Window-level pointer listeners during a drag so the divider keeps tracking
@@ -71,11 +89,21 @@ export function SplitDivider({ paneRef, orientation, pos }: SplitDividerProps) {
     [posFromEvent, setSplitPos],
   );
 
-  const percent = `${Math.min(Math.max(pos, 0), 1) * 100}%`;
+  // Place the line on the SEAM: the canvas-pixel boundary (rounded exactly as the
+  // compositor) mapped back into box CSS space, plus the canvas's offset within the
+  // positioning parent. Line and pixel seam now share one space (#1).
+  const seamOffset = splitSeamBoxOffset(
+    pos,
+    geometry.boxWidth,
+    geometry.boxHeight,
+    geometry.canvasWidth,
+    geometry.canvasHeight,
+    orientation,
+  );
   const style: React.CSSProperties =
     orientation === "vertical"
-      ? { left: percent, top: 0, bottom: 0, width: 0 }
-      : { top: percent, left: 0, right: 0, height: 0 };
+      ? { left: `${geometry.offsetLeft + seamOffset}px`, top: 0, bottom: 0, width: 0 }
+      : { top: `${geometry.offsetTop + seamOffset}px`, left: 0, right: 0, height: 0 };
 
   return (
     <div

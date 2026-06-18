@@ -31,6 +31,13 @@ export interface CanvasGeometry {
   /** The canvas backing pixel size (== the pane size). */
   canvasWidth: number;
   canvasHeight: number;
+  /**
+   * The canvas element's offset within its positioning parent (the
+   * `.preview__viewport`, CSS px), so the split divider — absolutely positioned
+   * over that parent — can align its line with the canvas's contain rect (#1).
+   */
+  offsetLeft: number;
+  offsetTop: number;
 }
 
 export interface InspectorOverlayProps {

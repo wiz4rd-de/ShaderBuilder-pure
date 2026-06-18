@@ -51,6 +51,9 @@ export function PreviewCanvas() {
   // The engine's liveness state (#62), driven by the `engine-event` stream: badge
   // whether the pane is live, holding last-good, or render-stopped.
   const engineStatus = useDocumentStore((s) => s.engineStatus);
+  // Mark which stream is active so the engine-event listener can ignore a
+  // superseded stream's late events (#12/#13).
+  const setActiveStreamId = useDocumentStore((s) => s.setActiveStreamId);
 
   // Compare (#60): mode / divider / captured reference — all UI-only state.
   const mode = useCompareStore((s) => s.mode);
@@ -119,6 +122,9 @@ export function PreviewCanvas() {
     // stop (StrictMode mount→unmount→mount, or rapid Start/Stop) can't kill a
     // newer stream — the backend ignores a stop whose id is no longer active.
     const streamId = crypto.randomUUID();
+    // Become the active stream so the engine-event listener accepts THIS stream's
+    // events and ignores a prior (superseded) stream's late ones (#12/#13).
+    setActiveStreamId(streamId);
 
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = (message) => {
@@ -176,6 +182,11 @@ export function PreviewCanvas() {
 
     return () => {
       cancelled = true;
+      // Only relinquish active status if a newer stream hasn't already claimed it
+      // (guards the StrictMode mount→unmount→mount ordering, #12/#13).
+      if (useDocumentStore.getState().activeStreamId === streamId) {
+        setActiveStreamId(null);
+      }
       void invoke("stop_preview_stream", { streamId });
     };
     // `composite` is intentionally omitted: re-subscribing the stream on a compare
@@ -218,6 +229,10 @@ export function PreviewCanvas() {
         boxHeight: rect.height,
         canvasWidth: canvas.width,
         canvasHeight: canvas.height,
+        // Offset within the `.preview__viewport` (the canvas's offset parent), so
+        // the split divider aligns its line with the canvas's contain rect (#1).
+        offsetLeft: canvas.offsetLeft,
+        offsetTop: canvas.offsetTop,
       });
     };
     measure();
@@ -336,9 +351,10 @@ export function PreviewCanvas() {
           onPointerLeave={handlePointerLeave}
           onClick={handleClick}
         />
-        {mode === "split" && reference ? (
+        {mode === "split" && reference && canvasGeometry ? (
           <SplitDivider
-            paneRef={paneRef}
+            canvasRef={canvasRef}
+            geometry={canvasGeometry}
             orientation={orientation}
             pos={splitPos}
           />

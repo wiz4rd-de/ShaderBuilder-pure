@@ -11,6 +11,8 @@ const GEOMETRY: CanvasGeometry = {
   boxHeight: 384,
   canvasWidth: 512,
   canvasHeight: 384,
+  offsetLeft: 0,
+  offsetTop: 0,
 };
 
 function sample(rgba: [number, number, number, number]): PixelSample {

@@ -4,11 +4,14 @@ import type { PixelSample } from "../bindings/PixelSample";
 import {
   canvasPixelToBoxPosition,
   domToCanvasPixel,
+  domToSplitNormalized,
   formatChannel,
   formatCoord,
   formatRgba,
   linearToSrgb,
+  splitSeamBoxOffset,
 } from "./pixelInspect";
+import { splitClip } from "./compareGeometry";
 
 describe("domToCanvasPixel", () => {
   it("maps 1:1 when the box matches the canvas pixels (no contain margin)", () => {
@@ -143,5 +146,52 @@ describe("formatRgba (toggle changes display, not the readback)", () => {
 describe("formatCoord", () => {
   it("renders the simulated-viewport coordinate", () => {
     expect(formatCoord(sample([0, 0, 0, 1]))).toBe("(128, 96)");
+  });
+});
+
+describe("split divider contain-correctness (#1)", () => {
+  // A NON-4:3 pane: the canvas is 512x384 (4:3) but the element box is 800x300
+  // (wide/short), so object-fit:contain letterboxes with LEFT/RIGHT margins for a
+  // vertical split. The bug: the divider line sat at pos*boxWidth (ignoring the
+  // letterbox) while the pixel seam is at Math.round(canvasWidth*pos) — they only
+  // coincided at pos=0.5 / zero margin. The fix shares the contain math.
+  const box = { w: 800, h: 300 };
+  const canvas = { w: 512, h: 384 };
+
+  it("places the line exactly on the composited pixel seam for a non-4:3 pane at pos=0.25", () => {
+    const pos = 0.25;
+
+    // Where the compositor actually clips (canvas-pixel seam).
+    const seamCanvasPx = splitClip(canvas.w, canvas.h, pos, "vertical").reference.width;
+    expect(seamCanvasPx).toBe(Math.round(canvas.w * pos)); // 128
+
+    // The contain rect for an 800x300 box around a 512x384 canvas: scale by the
+    // tighter axis (height: 300/384), centered horizontally.
+    const scale = Math.min(box.w / canvas.w, box.h / canvas.h);
+    const renderedW = canvas.w * scale;
+    const marginX = (box.w - renderedW) / 2;
+    const expectedLinePx = marginX + seamCanvasPx * scale;
+
+    const linePx = splitSeamBoxOffset(pos, box.w, box.h, canvas.w, canvas.h, "vertical");
+    expect(linePx).toBeCloseTo(expectedLinePx, 6);
+
+    // The naive (buggy) placement was pos*boxWidth — and for this non-4:3 pane that
+    // is a DIFFERENT pixel, proving the test would fail against the old code.
+    expect(linePx).not.toBeCloseTo(pos * box.w, 1);
+  });
+
+  it("pointer mapping is the inverse of the line placement (drag round-trips)", () => {
+    // Dragging the pointer to the line's CSS px must recover the same normalized
+    // pos (within one canvas pixel of rounding), since both go through containRect.
+    const pos = 0.25;
+    const linePx = splitSeamBoxOffset(pos, box.w, box.h, canvas.w, canvas.h, "vertical");
+    const back = domToSplitNormalized(linePx, box.w, box.h, canvas.w, canvas.h, "vertical");
+    expect(back).toBeCloseTo(pos, 2);
+  });
+
+  it("clamps a pointer in the contain margin to 0 or 1", () => {
+    // Left of the rendered image (in the letterbox) pins to 0; right pins to 1.
+    expect(domToSplitNormalized(0, box.w, box.h, canvas.w, canvas.h, "vertical")).toBe(0);
+    expect(domToSplitNormalized(box.w, box.w, box.h, canvas.w, canvas.h, "vertical")).toBe(1);
   });
 });
