@@ -34,6 +34,8 @@ pub use export::{export_preset, ExportError, ExportReport, PRESET_FILENAME, TEXT
 pub use import::{
     import_parsed_preset, import_preset, ImportDiagnostic, ImportDiagnostics, Severity,
 };
+pub use params::{reconcile_parameters, scan_parameters, ParamWarning};
+pub use scan::scan_references;
 pub use slangp::{
     parse_slangp, parse_slangp_str, LutEntry, ParseError, Pass, Preset, ScaleType, WrapMode,
 };
