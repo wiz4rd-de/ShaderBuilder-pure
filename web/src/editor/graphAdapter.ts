@@ -10,6 +10,7 @@ import type { Edge as RfEdge, Node as RfNode } from "@xyflow/react";
 import type { Edge } from "../bindings/Edge";
 import type { Graph } from "../bindings/Graph";
 import type { Node } from "../bindings/Node";
+import { getDescriptor } from "../nodes/registry";
 import type { Selection } from "../store/documentStore";
 
 /** The RF node data we carry: the core node's free-form data plus its label. */
@@ -57,11 +58,18 @@ export function toRfGraph(
   };
 }
 
-/** A human label for a node — its data.label, else its kind. */
+/**
+ * A human label for a node: a user-set `data.label` wins, then the descriptor's
+ * data-derived `title` (e.g. a subgraph's `name`), else its kind.
+ */
 function deriveLabel(node: Node): string {
   const fromData = node.data["label"];
   if (typeof fromData === "string" && fromData.length > 0) {
     return fromData;
+  }
+  const derived = getDescriptor(node.kind)?.title?.(node.data);
+  if (typeof derived === "string" && derived.length > 0) {
+    return derived;
   }
   return node.kind;
 }

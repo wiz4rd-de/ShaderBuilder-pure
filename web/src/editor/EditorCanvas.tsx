@@ -29,6 +29,7 @@ import { PipelineBreadcrumb } from "../pipeline/PipelineBreadcrumb";
 import { PipelineCanvas } from "../pipeline/PipelineCanvas";
 import { PipelineToolbar } from "../pipeline/PipelineToolbar";
 import { NODE_TYPES } from "../nodes/nodeTypes";
+import { isSubgraphNode } from "../nodes/subgraph";
 import { useDocumentStore } from "../store/documentStore";
 import { WholePassEditor } from "../wholePass/WholePassEditor";
 import { EditorStatusBar } from "./EditorStatusBar";
@@ -51,7 +52,12 @@ function PassGraph() {
   const graph = useDocumentStore((s) => s.activeGraph());
   const selection = useDocumentStore((s) => s.selection);
   const activePassId = useDocumentStore((s) => s.activePassId);
-  const rememberedViewport = useDocumentStore((s) => s.viewports.passes[s.activePassId] ?? null);
+  const subgraphPath = useDocumentStore((s) => s.subgraphPath);
+  // The active graph's nav key: the pass id, or the deepest drilled-in subgraph
+  // node id. Drives the per-graph remembered viewport AND the canvas remount key
+  // so drilling into a subgraph (same pass) gives a fresh React Flow instance.
+  const navKey = subgraphPath.length > 0 ? subgraphPath[subgraphPath.length - 1]! : activePassId;
+  const rememberedViewport = useDocumentStore((s) => s.viewports.passes[navKey] ?? null);
   const { nodes, edges } = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
 
   const applyNodeChanges = useDocumentStore((s) => s.applyNodeChanges);
@@ -61,6 +67,7 @@ function PassGraph() {
   const setViewport = useDocumentStore((s) => s.setViewport);
   const beginInteraction = useDocumentStore((s) => s.beginInteraction);
   const commit = useDocumentStore((s) => s.commit);
+  const openSubgraph = useDocumentStore((s) => s.openSubgraph);
 
   const [palette, setPalette] = useState<PaletteAnchor | null>(null);
 
@@ -113,6 +120,17 @@ function PassGraph() {
     [setSelection],
   );
 
+  // Double-click a subgraph node to drill into its interior (#57).
+  const onNodeDoubleClick = useCallback(
+    (_event: React.MouseEvent, rfNode: { id: string }) => {
+      const target = graph.nodes.find((n) => n.id === rfNode.id);
+      if (target && isSubgraphNode(target)) {
+        openSubgraph(rfNode.id);
+      }
+    },
+    [graph, openSubgraph],
+  );
+
   // Drag coalescing: one undo entry per drag, committed on stop.
   const onNodeDragStart = useCallback(() => beginInteraction(), [beginInteraction]);
   const onNodeDragStop = useCallback(() => commit(), [commit]);
@@ -140,7 +158,7 @@ function PassGraph() {
       <EditorToolbar />
       <div className="editor__canvas" onClick={palette ? closePalette : undefined}>
         <ReactFlow
-          key={activePassId}
+          key={navKey}
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}
@@ -148,6 +166,7 @@ function PassGraph() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onSelectionChange={onSelectionChange}
+          onNodeDoubleClick={onNodeDoubleClick}
           onNodeDragStart={onNodeDragStart}
           onNodeDragStop={onNodeDragStop}
           onSelectionDragStart={onSelectionDragStart}

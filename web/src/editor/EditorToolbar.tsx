@@ -1,6 +1,7 @@
 // The editor toolbar (#45): add-node, undo/redo, and clipboard buttons. All
 // actions go through the document store so they share the keyboard path's
 // history semantics exactly.
+import { isSubgraphNode } from "../nodes/subgraph";
 import { useDocumentStore } from "../store/documentStore";
 import { PLACEHOLDER_KIND } from "../store/factories";
 
@@ -9,6 +10,15 @@ export function EditorToolbar() {
   const canRedo = useDocumentStore((s) => s.future.length > 0);
   const hasSelection = useDocumentStore((s) => s.selection.nodeIds.length > 0);
   const hasClipboard = useDocumentStore((s) => (s.clipboard?.nodes.length ?? 0) > 0);
+  // Expand is offered only when the selection is EXACTLY one subgraph node.
+  const selectedSubgraphId = useDocumentStore((s) => {
+    if (s.selection.nodeIds.length !== 1) {
+      return null;
+    }
+    const id = s.selection.nodeIds[0]!;
+    const node = s.activeGraph().nodes.find((n) => n.id === id);
+    return node && isSubgraphNode(node) ? id : null;
+  });
 
   const addNode = useDocumentStore((s) => s.addNode);
   const undo = useDocumentStore((s) => s.undo);
@@ -17,6 +27,21 @@ export function EditorToolbar() {
   const paste = useDocumentStore((s) => s.paste);
   const duplicate = useDocumentStore((s) => s.duplicate);
   const removeSelection = useDocumentStore((s) => s.removeSelection);
+  const collapseSelection = useDocumentStore((s) => s.collapseSelection);
+  const expandSubgraphNode = useDocumentStore((s) => s.expandSubgraphNode);
+
+  const onCollapse = () => {
+    // Prompt for a name (falls back to a sensible default if cancelled/blank or
+    // when no prompt is available, e.g. in a test harness).
+    const name =
+      typeof window !== "undefined" && typeof window.prompt === "function"
+        ? window.prompt("Subgraph name", "Subgraph")
+        : "Subgraph";
+    if (name === null) {
+      return; // user cancelled
+    }
+    collapseSelection(name.trim().length > 0 ? name.trim() : "Subgraph");
+  };
 
   return (
     <div className="editor__toolbar" role="toolbar" aria-label="Editor actions">
@@ -56,6 +81,23 @@ export function EditorToolbar() {
         title="Delete (Del)"
       >
         Delete
+      </button>
+      <span className="editor__toolbar-sep" aria-hidden="true" />
+      <button
+        type="button"
+        onClick={onCollapse}
+        disabled={!hasSelection}
+        title="Collapse selection into a subgraph"
+      >
+        Collapse
+      </button>
+      <button
+        type="button"
+        onClick={() => selectedSubgraphId && expandSubgraphNode(selectedSubgraphId)}
+        disabled={selectedSubgraphId === null}
+        title="Expand the selected subgraph"
+      >
+        Expand
       </button>
     </div>
   );

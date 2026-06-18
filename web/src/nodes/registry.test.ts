@@ -63,8 +63,10 @@ describe("node-descriptor registry", () => {
 
   it("every descriptor's defaultData lowers to a NodeOp without throwing", () => {
     // `param` and `lut` require a user-supplied name (an empty default is an
-    // intentional lowering error until the inspector fills it in) — exclude them.
-    const requiresUserData = new Set(["param", "lut"]);
+    // intentional lowering error until the inspector fills it in). `subgraph`
+    // NEVER lowers directly (graphToIr inlines it first); its toNodeOp throws a
+    // guard by design — exclude these from the "defaults lower cleanly" check.
+    const requiresUserData = new Set(["param", "lut", "subgraph"]);
     for (const d of listDescriptors()) {
       if (requiresUserData.has(d.kind)) {
         continue;

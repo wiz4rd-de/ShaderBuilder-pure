@@ -10,6 +10,7 @@
 
 mod export;
 mod graph;
+mod library;
 mod preview;
 mod project;
 mod scan;
@@ -66,6 +67,9 @@ pub fn run() {
             project::load_project,
             graph::compile_graph,
             scan::scan_pass_source,
+            library::save_library_node,
+            library::list_library_node,
+            library::delete_library_node,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");

@@ -10,6 +10,7 @@ import { ProblemsPanel } from "../compile/ProblemsPanel";
 import { InspectorPanel } from "../inspector/InspectorPanel";
 import { ParameterPanel } from "../parameters/ParameterPanel";
 import { useDocumentStore } from "../store/documentStore";
+import { LibraryPanel } from "./LibraryPanel";
 import { PassSettingsPanel } from "./PassSettingsPanel";
 import { SourcePanel } from "./SourcePanel";
 import { ViewportPanel } from "./ViewportPanel";
@@ -21,6 +22,7 @@ type TabId =
   | "viewport"
   | "source"
   | "code"
+  | "library"
   | "problems";
 
 const TABS: { id: TabId; label: string }[] = [
@@ -30,6 +32,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "viewport", label: "Viewport" },
   { id: "source", label: "Source" },
   { id: "code", label: "Code" },
+  { id: "library", label: "Library" },
   { id: "problems", label: "Problems" },
 ];
 
@@ -70,6 +73,7 @@ export function PanelLayout(): React.JSX.Element {
         {active === "viewport" && <ViewportPanel />}
         {active === "source" && <SourcePanel />}
         {active === "code" && <GeneratedCodePanel />}
+        {active === "library" && <LibraryPanel />}
         {active === "problems" && <ProblemsPanel />}
       </div>
     </section>

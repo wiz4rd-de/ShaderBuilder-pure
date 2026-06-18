@@ -35,6 +35,11 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod ir;
+pub mod library;
+
+pub use library::{delete_item, list_items, save_item, LibraryError};
+
+use crate::ir::PortType;
 
 /// Crate identity marker. Kept from the Phase 0 scaffold so the inter-crate
 /// dependency edges stay referenced; see the workspace stub crates.
@@ -161,6 +166,212 @@ pub struct LibraryRef {
     /// `None` if not captured.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+/// A named, collapsible group of nodes/edges with declared typed boundary ports
+/// — the typed body of a **collapsed-subgraph node** and one of the two
+/// [`LibraryPayload`] kinds (Phase 6, #56).
+///
+/// ## How a subgraph lives in a [`Graph`]
+///
+/// A collapsed subgraph is **not** a new graph variant: it is a perfectly
+/// ordinary skeletal [`Node`] whose [`Node::kind`] is `"subgraph"` and whose
+/// free-form [`Node::data`] (a `serde_json::Value`) holds **this** struct,
+/// serialized. The Phase-5 architecture deliberately keeps `Node.kind: String`
+/// and `Node.data: Record<string, unknown>` free-form and lets the TypeScript
+/// descriptor registry interpret `kind`; `Subgraph` is simply the typed *shape*
+/// of a `kind == "subgraph"` node's `data`. `Node`/`Graph` therefore stay plain
+/// structs (never an enum), and a `Graph` can hold subgraph nodes and ordinary
+/// nodes side by side and round-trip losslessly.
+///
+/// ## Body
+///
+/// The interior is held as the **same** skeletal [`Node`]/[`Edge`] types as any
+/// graph, plus an ordered list of typed [`BoundaryPort`]s describing the ports
+/// the collapsed node exposes to the exterior. Inlining/lowering a subgraph into
+/// the typed IR happens later, in the TypeScript `graphToIr` bridge (#57) — *not*
+/// in Rust. core-model only fixes the data shape and the instantiate contract;
+/// it never touches the IR / checker / lower / emit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Subgraph {
+    /// Stable unique id of this subgraph body. Distinct from the id of the
+    /// wrapping `kind == "subgraph"` [`Node`] that carries it (the wrapper node's
+    /// id is minted by the store when the node is placed on the canvas).
+    pub id: String,
+    /// Human-readable name shown on the collapsed subgraph node and in the
+    /// library.
+    pub name: String,
+    /// The interior nodes — ordinary skeletal [`Node`]s (Phase-5 shape).
+    pub nodes: Vec<Node>,
+    /// The interior, port-to-port [`Edge`]s between interior nodes.
+    pub edges: Vec<Edge>,
+    /// The ordered list of typed ports the collapsed subgraph node exposes to the
+    /// exterior, each mapping to one interior endpoint.
+    pub boundary_ports: Vec<BoundaryPort>,
+}
+
+/// One typed port the collapsed subgraph node exposes to the exterior, bound to
+/// a single interior endpoint (Phase 6, #56).
+///
+/// A boundary port is the bridge between the subgraph's *outside* (an edge on the
+/// collapsed `kind == "subgraph"` [`Node`]) and its *inside* (a port on one
+/// interior [`Node`]):
+///
+/// - An [`PortDirection::In`] port **feeds an interior input port**: an exterior
+///   edge connects into it, and the value flows to `(interior_node,
+///   interior_port)` inside.
+/// - An [`PortDirection::Out`] port **carries an interior output port to the
+///   exterior**: it surfaces the value produced at `(interior_node,
+///   interior_port)` so exterior edges can read it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BoundaryPort {
+    /// The port name exposed on the collapsed subgraph node (what exterior edges
+    /// connect to). Stable across [`LibraryItem::instantiate`] — it is a port
+    /// name, not an id.
+    pub name: String,
+    /// The typed value flowing through this port. Reuses the frozen IR
+    /// [`PortType`] so boundary ports type-check identically to interior ports.
+    pub ty: PortType,
+    /// Whether this port is an exterior **input** (feeds an interior input) or an
+    /// exterior **output** (carries an interior output out).
+    pub direction: PortDirection,
+    /// The id of the interior [`Node`] this boundary maps to. **Rewritten** by
+    /// [`LibraryItem::instantiate`] through the old→new node-id map.
+    pub interior_node: String,
+    /// The port name on `interior_node` this boundary maps to. Stable across
+    /// instantiation — it is a port name, not an id.
+    pub interior_port: String,
+}
+
+/// The direction of a [`BoundaryPort`] relative to the collapsed subgraph node
+/// (Phase 6, #56). Serializes camelCase to `"in"` / `"out"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PortDirection {
+    /// An exterior **input** port: it feeds an interior input port.
+    In,
+    /// An exterior **output** port: it carries an interior output port out.
+    Out,
+}
+
+/// A project-independent, reusable building block in the personal library
+/// (Phase 6, #56) — either a single [`Node`] or a whole [`Subgraph`]. A project
+/// records which library items it instantiated via lightweight [`LibraryRef`]s;
+/// the item bodies live in the library store (#58), never inline in the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LibraryItem {
+    /// Stable unique id the library store assigns; what a [`LibraryRef::item_id`]
+    /// points at.
+    pub id: String,
+    /// Human-readable name shown in the library panel.
+    pub name: String,
+    /// An optional longer description, or `None` if unset.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Free-form tags for filtering/grouping in the library panel.
+    pub tags: Vec<String>,
+    /// The reusable payload — a single node or a subgraph.
+    pub payload: LibraryPayload,
+}
+
+/// The reusable body of a [`LibraryItem`] — the "single node vs subgraph" kind
+/// from the issue, expressed as the tagged-union discriminant (Phase 6, #56).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum LibraryPayload {
+    /// A single skeletal [`Node`] (its `kind`/`data` are whatever the descriptor
+    /// registry understands).
+    Node {
+        /// The library node.
+        node: Node,
+    },
+    /// A whole [`Subgraph`] body (the typed shape of a `kind == "subgraph"`
+    /// node's `data`).
+    Subgraph {
+        /// The library subgraph.
+        subgraph: Subgraph,
+    },
+}
+
+impl LibraryItem {
+    /// Clone this item's [`payload`](LibraryItem::payload) with **fresh ids**, so
+    /// two inserts of the same item into one graph never clash.
+    ///
+    /// `new_id` is a caller-supplied id factory (each call returns a fresh,
+    /// globally-unique id — e.g. the store's `nextId`). The frontend (#59) mirrors
+    /// this exact algorithm in TypeScript, so it is documented precisely:
+    ///
+    /// - **[`LibraryPayload::Node`]**: clone the node and give it a fresh id.
+    /// - **[`LibraryPayload::Subgraph`]**: clone the subgraph and
+    ///   1. give the [`Subgraph`] body a fresh id;
+    ///   2. build an `old node id → new node id` map by assigning each interior
+    ///      [`Node`] a fresh id;
+    ///   3. rewrite every interior [`Edge`]'s `source`/`target` through that map
+    ///      and give each interior edge a fresh id;
+    ///   4. rewrite every [`BoundaryPort::interior_node`] through the same map.
+    ///      [`BoundaryPort::name`] and [`BoundaryPort::interior_port`] are left
+    ///      untouched — they are stable *port names*, not ids.
+    ///
+    /// The wrapping `kind == "subgraph"` [`Node`]'s own id is **not** minted here:
+    /// the caller/store assigns it when it drops the node onto the canvas.
+    /// `instantiate` returns the fresh [`Subgraph`] body for that node's `data`.
+    pub fn instantiate(&self, mut new_id: impl FnMut() -> String) -> LibraryPayload {
+        match &self.payload {
+            LibraryPayload::Node { node } => {
+                let mut node = node.clone();
+                node.id = new_id();
+                LibraryPayload::Node { node }
+            }
+            LibraryPayload::Subgraph { subgraph } => {
+                let mut subgraph = subgraph.clone();
+                subgraph.id = new_id();
+
+                // (b.2) old node id -> new node id, minting a fresh id per node.
+                let id_map: std::collections::HashMap<String, String> = subgraph
+                    .nodes
+                    .iter()
+                    .map(|n| (n.id.clone(), new_id()))
+                    .collect();
+
+                // Apply the fresh interior-node ids.
+                for node in &mut subgraph.nodes {
+                    node.id = id_map[&node.id].clone();
+                }
+
+                // (b.3) rewrite edge endpoints through the map + fresh edge ids.
+                for edge in &mut subgraph.edges {
+                    if let Some(new) = id_map.get(&edge.source) {
+                        edge.source = new.clone();
+                    }
+                    if let Some(new) = id_map.get(&edge.target) {
+                        edge.target = new.clone();
+                    }
+                    edge.id = new_id();
+                }
+
+                // (b.4) rewrite boundary-port interior endpoints (names stay).
+                for port in &mut subgraph.boundary_ports {
+                    if let Some(new) = id_map.get(&port.interior_node) {
+                        port.interior_node = new.clone();
+                    }
+                }
+
+                LibraryPayload::Subgraph { subgraph }
+            }
+        }
+    }
 }
 
 /// One render pass — exactly one fragment shader (Spec §3). A pass is authored
@@ -1239,6 +1450,259 @@ mod tests {
         // `name` is optional.
         let minimal: LibraryRef = serde_json::from_str(r#"{"itemId":"x"}"#).unwrap();
         assert_eq!(minimal.name, None);
+    }
+
+    /// A [`Subgraph`] body with one node, one edge, and >=1 input AND >=1 output
+    /// boundary port for the round-trip / instantiate tests.
+    fn sample_subgraph() -> Subgraph {
+        Subgraph {
+            id: "sg-1".to_owned(),
+            name: "Blur".to_owned(),
+            nodes: vec![
+                Node {
+                    id: "in".to_owned(),
+                    kind: "math.mix".to_owned(),
+                    position: Vec2 { x: 0.0, y: 0.0 },
+                    data: serde_json::json!({ "factor": 0.5 }),
+                },
+                Node {
+                    id: "out".to_owned(),
+                    kind: "output".to_owned(),
+                    position: Vec2 { x: 100.0, y: 0.0 },
+                    data: empty_object(),
+                },
+            ],
+            edges: vec![Edge {
+                id: "e0".to_owned(),
+                source: "in".to_owned(),
+                source_port: "result".to_owned(),
+                target: "out".to_owned(),
+                target_port: "color".to_owned(),
+            }],
+            boundary_ports: vec![
+                BoundaryPort {
+                    name: "src".to_owned(),
+                    ty: PortType::Vec4,
+                    direction: PortDirection::In,
+                    interior_node: "in".to_owned(),
+                    interior_port: "a".to_owned(),
+                },
+                BoundaryPort {
+                    name: "result".to_owned(),
+                    ty: PortType::Vec4,
+                    direction: PortDirection::Out,
+                    interior_node: "out".to_owned(),
+                    interior_port: "color".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn subgraph_round_trips() {
+        // A subgraph with >=1 input AND >=1 output boundary port survives
+        // serialize -> deserialize identically.
+        let sg = sample_subgraph();
+        assert!(sg
+            .boundary_ports
+            .iter()
+            .any(|p| p.direction == PortDirection::In));
+        assert!(sg
+            .boundary_ports
+            .iter()
+            .any(|p| p.direction == PortDirection::Out));
+
+        let json = serde_json::to_value(&sg).unwrap();
+        // PortDirection serializes camelCase to "in"/"out".
+        assert_eq!(json["boundaryPorts"][0]["direction"], "in");
+        assert_eq!(json["boundaryPorts"][1]["direction"], "out");
+        let back: Subgraph = serde_json::from_value(json).unwrap();
+        assert_eq!(sg, back);
+    }
+
+    #[test]
+    fn library_item_node_round_trips() {
+        let item = LibraryItem {
+            id: "li-node".to_owned(),
+            name: "Scanline".to_owned(),
+            description: Some("a single node".to_owned()),
+            tags: vec!["crt".to_owned(), "filter".to_owned()],
+            payload: LibraryPayload::Node {
+                node: Node {
+                    id: "n0".to_owned(),
+                    kind: "math.mix".to_owned(),
+                    position: Vec2 { x: 3.0, y: 4.0 },
+                    data: serde_json::json!({ "factor": 0.25 }),
+                },
+            },
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["payload"]["kind"], "node");
+        let back: LibraryItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item, back);
+        // `description` is optional.
+        let minimal: LibraryItem = serde_json::from_str(
+            r#"{"id":"x","name":"y","tags":[],"payload":{"kind":"node","node":{"id":"n","kind":"k","position":{"x":0,"y":0}}}}"#,
+        )
+        .expect("library item without description deserializes");
+        assert_eq!(minimal.description, None);
+    }
+
+    #[test]
+    fn library_item_subgraph_round_trips() {
+        let item = LibraryItem {
+            id: "li-sg".to_owned(),
+            name: "Blur".to_owned(),
+            description: None,
+            tags: vec!["blur".to_owned()],
+            payload: LibraryPayload::Subgraph {
+                subgraph: sample_subgraph(),
+            },
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["payload"]["kind"], "subgraph");
+        let back: LibraryItem = serde_json::from_value(json).unwrap();
+        assert_eq!(item, back);
+    }
+
+    #[test]
+    fn graph_holds_a_collapsed_subgraph_node_alongside_ordinary_nodes() {
+        // A collapsed subgraph is a normal Node with kind == "subgraph" whose
+        // `data` is the serialized Subgraph. It round-trips inside a Graph next to
+        // ordinary nodes losslessly.
+        let subgraph_data = serde_json::to_value(sample_subgraph()).unwrap();
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: "ordinary".to_owned(),
+                    kind: "math.mix".to_owned(),
+                    position: Vec2 { x: 0.0, y: 0.0 },
+                    data: empty_object(),
+                },
+                Node {
+                    id: "collapsed".to_owned(),
+                    kind: "subgraph".to_owned(),
+                    position: Vec2 { x: 200.0, y: 0.0 },
+                    data: subgraph_data,
+                },
+            ],
+            edges: vec![Edge {
+                id: "e".to_owned(),
+                source: "ordinary".to_owned(),
+                source_port: "result".to_owned(),
+                target: "collapsed".to_owned(),
+                target_port: "src".to_owned(),
+            }],
+        };
+
+        let json = serde_json::to_value(&graph).unwrap();
+        let back: Graph = serde_json::from_value(json).unwrap();
+        assert_eq!(graph, back);
+        // The collapsed node's data really is a parseable Subgraph.
+        let collapsed = back.nodes.iter().find(|n| n.kind == "subgraph").unwrap();
+        let parsed: Subgraph = serde_json::from_value(collapsed.data.clone()).unwrap();
+        assert_eq!(parsed, sample_subgraph());
+    }
+
+    #[test]
+    fn instantiate_node_mints_fresh_id() {
+        let item = LibraryItem {
+            id: "li".to_owned(),
+            name: "n".to_owned(),
+            description: None,
+            tags: vec![],
+            payload: LibraryPayload::Node {
+                node: Node {
+                    id: "orig".to_owned(),
+                    kind: "k".to_owned(),
+                    position: Vec2 { x: 0.0, y: 0.0 },
+                    data: empty_object(),
+                },
+            },
+        };
+        let counter = std::cell::Cell::new(0);
+        let factory = || {
+            let n = counter.get();
+            counter.set(n + 1);
+            format!("fresh-{n}")
+        };
+        let LibraryPayload::Node { node } = item.instantiate(factory) else {
+            panic!("expected node payload");
+        };
+        assert_eq!(node.id, "fresh-0");
+        // Everything else is preserved.
+        assert_eq!(node.kind, "k");
+    }
+
+    #[test]
+    fn instantiate_subgraph_twice_yields_no_shared_ids() {
+        // Insert the SAME subgraph library item into one graph twice and assert
+        // the two instantiations share NO node id and NO edge id.
+        let item = LibraryItem {
+            id: "li-sg".to_owned(),
+            name: "Blur".to_owned(),
+            description: None,
+            tags: vec![],
+            payload: LibraryPayload::Subgraph {
+                subgraph: sample_subgraph(),
+            },
+        };
+
+        // One counter-based factory shared across both inserts (as the store's
+        // global id minter would be), so the two results draw from one id space.
+        let counter = std::cell::Cell::new(0usize);
+        let mut factory = || {
+            let n = counter.get();
+            counter.set(n + 1);
+            format!("id-{n}")
+        };
+
+        let first = item.instantiate(&mut factory);
+        let second = item.instantiate(&mut factory);
+
+        let (LibraryPayload::Subgraph { subgraph: a }, LibraryPayload::Subgraph { subgraph: b }) =
+            (&first, &second)
+        else {
+            panic!("expected subgraph payloads");
+        };
+
+        // The subgraph body ids differ.
+        assert_ne!(a.id, b.id);
+
+        // No interior node id is shared between the two.
+        let a_nodes: std::collections::HashSet<&str> =
+            a.nodes.iter().map(|n| n.id.as_str()).collect();
+        let b_nodes: std::collections::HashSet<&str> =
+            b.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            a_nodes.is_disjoint(&b_nodes),
+            "two inserts must not share any node id"
+        );
+
+        // No interior edge id is shared between the two.
+        let a_edges: std::collections::HashSet<&str> =
+            a.edges.iter().map(|e| e.id.as_str()).collect();
+        let b_edges: std::collections::HashSet<&str> =
+            b.edges.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            a_edges.is_disjoint(&b_edges),
+            "two inserts must not share any edge id"
+        );
+
+        // Edge endpoints + boundary interior_node were rewritten to the fresh
+        // interior node ids (no dangling refs to the original "in"/"out").
+        for edge in &a.edges {
+            assert!(a_nodes.contains(edge.source.as_str()));
+            assert!(a_nodes.contains(edge.target.as_str()));
+        }
+        for port in &a.boundary_ports {
+            assert!(a_nodes.contains(port.interior_node.as_str()));
+        }
+        // Port names + interior_port names are stable across instantiation.
+        let names: Vec<&str> = a.boundary_ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "result"]);
+        assert_eq!(a.boundary_ports[0].interior_port, "a");
+        assert_eq!(a.boundary_ports[1].interior_port, "color");
     }
 
     #[test]

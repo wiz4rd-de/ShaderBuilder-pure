@@ -22,6 +22,7 @@ import type { IrGraph } from "../bindings/IrGraph";
 import type { IrNode } from "../bindings/IrNode";
 import type { Parameter } from "../bindings/Parameter";
 import { getDescriptor } from "./registry";
+import { inlineAllSubgraphs, type MintId } from "./subgraph";
 import { NodeLoweringError } from "./types";
 
 /** A non-fatal problem graphToIr hit while lowering one node. */
@@ -57,6 +58,13 @@ export interface GraphToIrResult {
  * Pure: no IPC, no Tauri runtime — safe to unit-test and to call on every edit.
  */
 export function graphToIr(graph: Graph): GraphToIrResult {
+  // INLINE collapsed subgraphs FIRST (#57): replace every `kind === "subgraph"`
+  // node with its interior nodes/edges (recursively), so the per-node lowering
+  // loop — and therefore compile_graph / codegen-slang — only ever sees
+  // primitive nodes. No new IR op kind; codegen-slang is untouched. Pure: ids
+  // come from a deterministic per-call counter so the result is stable in tests.
+  graph = inlineAllSubgraphs(graph, deterministicMintId());
+
   const nodes: IrNode[] = [];
   const issues: GraphToIrIssue[] = [];
   const parameters: Parameter[] = [];
@@ -121,6 +129,20 @@ export function graphToIr(graph: Graph): GraphToIrResult {
   }
 
   return { ir: { nodes, edges }, parameters, luts, issues };
+}
+
+/**
+ * A fresh deterministic id minter for the (pure) subgraph-inlining step. Ids are
+ * prefixed `inl-<prefix>-<n>` so they never collide with the store's `node-N` /
+ * `edge-N` ids, and a new counter per `graphToIr` call keeps results stable +
+ * independent across calls (so the equivalence test gets matching topology).
+ */
+function deterministicMintId(): MintId {
+  let n = 0;
+  return (prefix: string) => {
+    n += 1;
+    return `inl-${prefix}-${n}`;
+  };
 }
 
 /** Map a skeletal Edge to an IrEdge: source-output port → target-input port. */

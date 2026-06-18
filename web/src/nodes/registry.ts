@@ -10,6 +10,7 @@ import { mathDescriptors } from "./descriptors/math";
 import { outputDescriptor } from "./descriptors/output";
 import { samplerDescriptors } from "./descriptors/samplers";
 import { samplingDescriptors } from "./descriptors/sampling";
+import { subgraphDescriptors } from "./descriptors/subgraph";
 import { valueDescriptors } from "./descriptors/values";
 import { vectorDescriptors } from "./descriptors/vector";
 import type { NodeCategory, NodeData, NodeDescriptor } from "./types";
@@ -28,6 +29,7 @@ export const ALL_DESCRIPTORS: ReadonlyArray<NodeDescriptor> = [
   ...vectorDescriptors,
   ...colorDescriptors,
   ...customDescriptors,
+  ...subgraphDescriptors,
   outputDescriptor,
 ];
 

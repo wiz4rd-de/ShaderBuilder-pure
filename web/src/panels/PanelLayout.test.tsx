@@ -40,5 +40,8 @@ describe("PanelLayout", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "Source" }));
     expect(screen.getByLabelText("Source")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Library" }));
+    expect(screen.getByLabelText("Library")).toBeInTheDocument();
   });
 });

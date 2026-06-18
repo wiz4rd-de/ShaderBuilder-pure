@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 
+import type { BoundaryPort } from "../bindings/BoundaryPort";
 import type { Edge } from "../bindings/Edge";
 import type { Graph } from "../bindings/Graph";
+import type { IrGraph } from "../bindings/IrGraph";
 import type { Node } from "../bindings/Node";
+import type { Subgraph } from "../bindings/Subgraph";
 import { defaultDataFor } from "./registry";
+import { SUBGRAPH_KIND } from "./subgraph";
 import { graphToIr, graphToIrGraph } from "./graphToIr";
 
 let seq = 0;
@@ -175,5 +179,144 @@ describe("graphToIr — robustness", () => {
     const { ir, issues } = graphToIr(graph);
     expect(ir.nodes).toEqual([]);
     expect(issues[0]!.reason).toBe("loweringError");
+  });
+});
+
+// ---- subgraph inlining (#57) ------------------------------------------------
+
+function subgraphNode(id: string, sub: Subgraph): Node {
+  return {
+    id,
+    kind: SUBGRAPH_KIND,
+    position: { x: 0, y: 0 },
+    data: sub as unknown as Record<string, unknown>,
+  };
+}
+
+/**
+ * Canonical, id-independent signature of an IrGraph: the multiset of node ops
+ * plus the multiset of edges expressed as `(sourceOp, sourcePort) →
+ * (targetOp, targetPort)`. Two graphs with this same signature are structurally
+ * equivalent modulo id renaming (sufficient here: every fixture node has a
+ * distinct op, so the op uniquely identifies its endpoints).
+ */
+function irSignature(ir: IrGraph): { ops: string[]; edges: string[] } {
+  const opById = new Map(ir.nodes.map((n) => [n.id, JSON.stringify(n.op)]));
+  return {
+    ops: ir.nodes.map((n) => JSON.stringify(n.op)).sort(),
+    edges: ir.edges
+      .map(
+        (e) =>
+          `${opById.get(e.source.node)}#${e.source.port} -> ${opById.get(e.target.node)}#${e.target.port}`,
+      )
+      .sort(),
+  };
+}
+
+describe("graphToIr — subgraph inlining EXIT GATE (collapsed ≡ expanded)", () => {
+  // Interior: Texcoord → Sample(Source) → Output, with the Texcoord's `uv` fed
+  // from a boundary INPUT and the Sample feeding a boundary OUTPUT. Wrap the
+  // Sample in a subgraph; an exterior Texcoord drives the input boundary and an
+  // exterior Output reads the output boundary.
+  function buildPair(): { expanded: Graph; collapsed: Graph } {
+    // The fully-inlined ("expanded") reference graph.
+    const tc = node("texcoord");
+    const src = node("source");
+    const out = node("output");
+    const expanded: Graph = {
+      nodes: [tc, src, out],
+      edges: [
+        edge(tc.id, "uv", src.id, "coord"),
+        edge(src.id, "out", out.id, "color"),
+      ],
+    };
+
+    // The collapsed equivalent: the Source sample lives INSIDE a subgraph with a
+    // vec2 `coordIn` input boundary (→ the interior sample's coord) and a vec4
+    // `colorOut` output boundary (← the interior sample's out).
+    const interior = node("source");
+    const boundaryPorts: BoundaryPort[] = [
+      { name: "coordIn", ty: "vec2", direction: "in", interiorNode: interior.id, interiorPort: "coord" },
+      { name: "colorOut", ty: "vec4", direction: "out", interiorNode: interior.id, interiorPort: "out" },
+    ];
+    const sub: Subgraph = {
+      id: "sub-1",
+      name: "Sampler",
+      nodes: [interior],
+      edges: [],
+      boundaryPorts,
+    };
+    const ctc = node("texcoord");
+    const cout = node("output");
+    const sg = subgraphNode("sg-node", sub);
+    const collapsed: Graph = {
+      nodes: [ctc, sg, cout],
+      edges: [
+        edge(ctc.id, "uv", sg.id, "coordIn"),
+        edge(sg.id, "colorOut", cout.id, "color"),
+      ],
+    };
+    return { expanded, collapsed };
+  }
+
+  it("a collapsed subgraph lowers to the SAME IR (modulo ids) as its inlined form", () => {
+    const { expanded, collapsed } = buildPair();
+    const irExpanded = graphToIrGraph(expanded);
+    const irCollapsed = graphToIrGraph(collapsed);
+    // No subgraph op kind ever reaches the IR — every node lowered to a primitive.
+    expect(irCollapsed.nodes.length).toBe(irExpanded.nodes.length);
+    expect(irSignature(irCollapsed)).toEqual(irSignature(irExpanded));
+  });
+
+  it("reports no lowering issues for a collapsed graph (the subgraph node is inlined first)", () => {
+    const { collapsed } = buildPair();
+    const { issues } = graphToIr(collapsed);
+    expect(issues).toEqual([]);
+  });
+
+  // Acceptance (c): a type-mismatched boundary connection must surface a
+  // typeMismatch via the EXISTING compile_graph type-checker — there is NO
+  // drag-time check. graphToIr can't run the Rust checker (that lives in the
+  // `ir` crate, proven in crates/ir/tests/typecheck.rs), so the frontend's job
+  // is to PRESERVE the mismatched edge into the IR. Here a subgraph exposes an
+  // interior Const(FLOAT) through a (declared vec4) output boundary feeding the
+  // exterior Output.color (vec4) — after inlining the IR carries a
+  // const(float).out → output.color edge, which the checker flags as typeMismatch.
+  it("preserves a type-mismatched boundary edge into the IR (checker flags it)", () => {
+    const interiorConst = node("const", { constType: "float", value: 1 });
+    const sub: Subgraph = {
+      id: "sub-mismatch",
+      name: "BadColor",
+      nodes: [interiorConst],
+      edges: [],
+      boundaryPorts: [
+        // Declared vec4, but the interior Const actually produces a FLOAT.
+        { name: "colorOut", ty: "vec4", direction: "out", interiorNode: interiorConst.id, interiorPort: "out" },
+      ],
+    };
+    const out = node("output");
+    const sg = subgraphNode("sg-mismatch", sub);
+    const graph: Graph = {
+      nodes: [sg, out],
+      edges: [edge(sg.id, "colorOut", out.id, "color")],
+    };
+
+    const { ir, issues } = graphToIr(graph);
+    // The subgraph inlined cleanly (no node dropped) — the const + output remain.
+    expect(issues).toEqual([]);
+    const constNode = ir.nodes.find((n) => n.op.kind === "const")!;
+    const outputNode = ir.nodes.find((n) => n.op.kind === "output")!;
+    expect(constNode).toBeDefined();
+    expect(outputNode).toBeDefined();
+    // The mismatched edge survives: float-producing const → vec4 color input.
+    const mismatchEdge = ir.edges.find(
+      (e) => e.source.node === constNode.id && e.target.node === outputNode.id,
+    )!;
+    expect(mismatchEdge).toBeDefined();
+    expect(mismatchEdge.source.port).toBe("out");
+    expect(mismatchEdge.target.port).toBe("color");
+    if (constNode.op.kind === "const") {
+      expect(constNode.op.value.kind).toBe("float");
+    }
   });
 });
