@@ -171,6 +171,13 @@ export interface DocumentState {
   /** Whether the document has unsaved edits since the last load/save/reset. */
   dirty: boolean;
   /**
+   * The native project-file path the document is currently associated with (#63),
+   * or `null` for a new/untitled document that has never been saved. Set on
+   * Save-As / Open / a successful Save; cleared on `reset`/`newProject`. Drives the
+   * title bar and decides Save (overwrite) vs Save-As (prompt for a path).
+   */
+  currentProjectPath: string | null;
+  /**
    * Compile diagnostics keyed by the offending node id (#54 populates this from
    * each pass's `compile_graph` result). The inspector (#47) reads it read-only
    * to surface per-node problems; it is editor-only, never part of a snapshot.
@@ -419,10 +426,25 @@ export interface DocumentState {
   toSnapshot: () => DocSnapshot;
   fromSnapshot: (snap: DocSnapshot, options?: { resetHistory?: boolean }) => void;
 
-  /** Replace the whole project (e.g. on file load); clears history + selection. */
-  loadProject: (project: Project, activePassId?: string) => void;
-  /** Reset to a fresh single-pass project. */
+  /**
+   * Replace the whole project (e.g. on file load); clears history + selection.
+   * `path` records the native file the document came from (#63) so the title bar
+   * + Save flow know it; pass `null`/omit for a recovered/untitled document.
+   */
+  loadProject: (project: Project, activePassId?: string, path?: string | null) => void;
+  /** Reset to a fresh single-pass untitled project (#63 New). Clears the path. */
   reset: () => void;
+  /**
+   * Set (or clear) the native file path the document is associated with (#63) —
+   * called after a successful Save / Save-As. Does not touch the document.
+   */
+  setCurrentProjectPath: (path: string | null) => void;
+  /**
+   * Mark the document as saved (#63): clears `dirty` and (optionally) records the
+   * file it was saved to. Used by the Save/Save-As flow after a successful write
+   * so the title-bar `*` indicator and the close-prompt clear.
+   */
+  markSaved: (path?: string) => void;
 }
 
 /**
@@ -637,6 +659,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     selection: { nodeIds: [], edgeIds: [] },
     clipboard: null,
     dirty: false,
+    currentProjectPath: null,
     diagnosticsByNode: {},
     problems: [],
     pipelineValid: null,
@@ -1348,7 +1371,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       });
     },
 
-    loadProject: (project, activePassId) => {
+    loadProject: (project, activePassId, path) => {
       const firstGraphPass = project.passes.find((p) => p.source.kind === "graph");
       const active = activePassId ?? firstGraphPass?.id ?? project.passes[0]?.id ?? "";
       set({
@@ -1371,6 +1394,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         future: [],
         pendingBaseline: null,
         dirty: false,
+        // `undefined` (path omitted) leaves the current path untouched is NOT what
+        // we want here — loading always re-associates the document, so an omitted
+        // path clears it (a recovered/untitled doc passes null explicitly).
+        currentProjectPath: path ?? null,
       });
     },
 
@@ -1396,8 +1423,17 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         future: [],
         pendingBaseline: null,
         dirty: false,
+        currentProjectPath: null,
       });
     },
+
+    setCurrentProjectPath: (path) => set({ currentProjectPath: path }),
+
+    markSaved: (path) =>
+      set((s) => ({
+        dirty: false,
+        currentProjectPath: path ?? s.currentProjectPath,
+      })),
   };
 });
 
