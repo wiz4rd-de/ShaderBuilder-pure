@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod ir;
+pub mod library;
+
+pub use library::{delete_item, list_items, save_item, LibraryError};
 
 use crate::ir::PortType;
 

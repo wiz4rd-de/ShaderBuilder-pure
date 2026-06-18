@@ -12,3 +12,7 @@ readme = "README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ts-rs = { workspace = true }
+
+[dev-dependencies]
+# Throwaway dirs for the library-store pure-fn tests (#58).
+tempfile = { workspace = true }
