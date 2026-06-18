@@ -16,10 +16,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use core_model::{EngineErrorEvent, EngineEvent, EngineStatus};
+use core_model::{EngineErrorEvent, EngineEvent, EngineStatus, PixelFormat, PixelSample};
 use preview_engine::{
-    EngineEvent as RenderEvent, EngineStatus as RenderStatus, FrameSource, PositionUpdate,
-    RenderCommand, RenderSource, SourceSpec, TestPattern,
+    EngineEvent as RenderEvent, EngineStatus as RenderStatus, FrameSource, InspectResult,
+    PositionUpdate, RenderCommand, RenderSource, SourceSpec, TestPattern,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
@@ -703,6 +703,59 @@ pub fn set_simulated_viewport(
     state.send(RenderCommand::SetSimulatedViewport(config))
 }
 
+/// How long [`inspect_pixel`] waits for the render thread's reply before giving up
+/// (#61). The probe runs on the render thread between frames at ~60 fps, so a reply
+/// normally lands within a frame; this just bounds a stalled/teardown case so the
+/// command never hangs the webview.
+const INSPECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Map an engine-local [`InspectResult`] (#61) to the `core_model` wire sample. The
+/// offscreen is `Rgba8Unorm` today, so the raw bytes are exact stored values; we
+/// normalize to `0..1` and tag the format (the float/srgb hook lives in
+/// [`PixelFormat`]). The sRGB/linear and 0-255/0-1 display toggles are a frontend
+/// concern and do not touch this raw value.
+fn map_inspect(result: InspectResult) -> PixelSample {
+    PixelSample {
+        inside: result.inside,
+        x: result.x,
+        y: result.y,
+        viewport_width: result.viewport_width,
+        viewport_height: result.viewport_height,
+        rgba: [
+            result.rgba[0] as f32 / 255.0,
+            result.rgba[1] as f32 / 255.0,
+            result.rgba[2] as f32 / 255.0,
+            result.rgba[3] as f32 / 255.0,
+        ],
+        format: PixelFormat::Rgba8Unorm,
+    }
+}
+
+/// Inspect one preview pixel ON DEMAND (#61, Spec §8.5): map the PANE coordinate
+/// `(x, y)` to a SIMULATED-VIEWPORT pixel and read that pixel back from the
+/// offscreen target, returning a typed [`PixelSample`].
+///
+/// The actual readback BLOCKS on a `device.poll(wait)`, so it must run on the
+/// render thread — this command sends an [`RenderCommand::InspectPixel`] with a
+/// one-shot reply channel and waits (bounded by [`INSPECT_TIMEOUT`]) for the render
+/// thread to reply. The frontend calls this on hover/click (debounced), NEVER per
+/// frame, so it adds no measurable stutter to the 60 fps stream. A pane coordinate
+/// that lands in a letterbox bar comes back with `inside == false` (no sample).
+#[tauri::command]
+pub fn inspect_pixel(
+    state: State<'_, PreviewState>,
+    x: u32,
+    y: u32,
+) -> Result<PixelSample, String> {
+    let (respond, reply) = mpsc::channel();
+    state.send(RenderCommand::InspectPixel { x, y, respond })?;
+    // Bounded wait: a torn-down/stalled render thread must not hang the webview.
+    reply
+        .recv_timeout(INSPECT_TIMEOUT)
+        .map(map_inspect)
+        .map_err(|_| "preview render thread did not reply to the pixel probe".to_string())
+}
+
 /// Drive a [`FrameSource`], sending each rendered frame over `channel` as raw
 /// binary, paced to `period`, until `running` is cleared or the channel closes.
 ///
@@ -791,6 +844,48 @@ mod tests {
         assert_eq!(error.severity, core_model::EngineSeverity::Error);
         assert!(error.pass_id.is_none(), "render errors are not pass-tagged");
         assert!(error.node_id.is_none());
+    }
+
+    // ---- Pixel-inspector result mapping (#61; pure, no GPU). ----
+
+    #[test]
+    fn map_inspect_normalizes_bytes_and_keeps_viewport_coords() {
+        let result = InspectResult {
+            inside: true,
+            x: 42,
+            y: 17,
+            viewport_width: 320,
+            viewport_height: 240,
+            rgba: [255, 128, 0, 255],
+        };
+        let sample = map_inspect(result);
+        assert!(sample.inside);
+        assert_eq!((sample.x, sample.y), (42, 17), "viewport coords preserved");
+        assert_eq!((sample.viewport_width, sample.viewport_height), (320, 240));
+        assert_eq!(sample.rgba[0], 1.0, "255 -> 1.0");
+        assert!(
+            (sample.rgba[1] - 128.0 / 255.0).abs() < 1e-6,
+            "128 -> ~0.502"
+        );
+        assert_eq!(sample.rgba[2], 0.0, "0 -> 0.0");
+        assert_eq!(sample.rgba[3], 1.0);
+        assert_eq!(sample.format, PixelFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn map_inspect_outside_is_black_with_no_coord() {
+        let result = InspectResult {
+            inside: false,
+            x: 0,
+            y: 0,
+            viewport_width: 100,
+            viewport_height: 80,
+            rgba: [0, 0, 0, 0],
+        };
+        let sample = map_inspect(result);
+        assert!(!sample.inside, "letterbox bar -> outside");
+        assert_eq!(sample.rgba, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!((sample.viewport_width, sample.viewport_height), (100, 80));
     }
 
     // ---- Preset → engine scale-config mapping (#22; no GPU needed). ----

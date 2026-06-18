@@ -57,6 +57,7 @@ pub fn run() {
             preview::set_viewport,
             preview::set_simulated_viewport,
             preview::set_parameter,
+            preview::inspect_pixel,
             preview::play,
             preview::pause,
             preview::step,
