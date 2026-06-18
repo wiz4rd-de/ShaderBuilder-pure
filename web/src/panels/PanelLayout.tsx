@@ -5,13 +5,15 @@
 // inline — App now just renders <PanelLayout/>.
 import { useState } from "react";
 
+import { ProblemsPanel } from "../compile/ProblemsPanel";
 import { InspectorPanel } from "../inspector/InspectorPanel";
 import { ParameterPanel } from "../parameters/ParameterPanel";
+import { useDocumentStore } from "../store/documentStore";
 import { PassSettingsPanel } from "./PassSettingsPanel";
 import { SourcePanel } from "./SourcePanel";
 import { ViewportPanel } from "./ViewportPanel";
 
-type TabId = "inspector" | "params" | "pass" | "viewport" | "source";
+type TabId = "inspector" | "params" | "pass" | "viewport" | "source" | "problems";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "inspector", label: "Inspector" },
@@ -19,10 +21,14 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "pass", label: "Pass" },
   { id: "viewport", label: "Viewport" },
   { id: "source", label: "Source" },
+  { id: "problems", label: "Problems" },
 ];
 
 export function PanelLayout(): React.JSX.Element {
   const [active, setActive] = useState<TabId>("inspector");
+  // A live problem count badges the Problems tab so issues are visible without
+  // opening it (the live compile loop, #54, keeps `problems` current).
+  const problemCount = useDocumentStore((s) => s.problems.length);
 
   return (
     <section className="panels" aria-label="Panels">
@@ -39,6 +45,11 @@ export function PanelLayout(): React.JSX.Element {
             onClick={() => setActive(tab.id)}
           >
             {tab.label}
+            {tab.id === "problems" && problemCount > 0 ? (
+              <span className="panels__tab-badge" aria-label={`${problemCount} problems`}>
+                {problemCount}
+              </span>
+            ) : null}
           </button>
         ))}
       </div>
@@ -49,6 +60,7 @@ export function PanelLayout(): React.JSX.Element {
         {active === "pass" && <PassSettingsPanel />}
         {active === "viewport" && <ViewportPanel />}
         {active === "source" && <SourcePanel />}
+        {active === "problems" && <ProblemsPanel />}
       </div>
     </section>
   );

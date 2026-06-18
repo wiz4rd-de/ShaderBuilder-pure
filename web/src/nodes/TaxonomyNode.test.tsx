@@ -1,7 +1,8 @@
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { useDocumentStore } from "../store/documentStore";
 import { requireDescriptor } from "./registry";
 import { TaxonomyNode } from "./TaxonomyNode";
 
@@ -33,6 +34,11 @@ function renderNode(kind: string, data: Record<string, unknown> = {}) {
   );
 }
 
+afterEach(() => {
+  // Clear diagnostics so badge tests don't bleed into the others.
+  useDocumentStore.getState().setDiagnosticsByNode({});
+});
+
 describe("TaxonomyNode", () => {
   it("renders a sampler's title + its coord input and out output handles", () => {
     const { container } = renderNode("source");
@@ -58,6 +64,29 @@ describe("TaxonomyNode", () => {
     expect(screen.getByText("Output")).toBeInTheDocument();
     expect(container.querySelectorAll(".react-flow__handle-left")).toHaveLength(1);
     expect(container.querySelectorAll(".react-flow__handle-right")).toHaveLength(0);
+  });
+
+  it("shows an inline error badge when the node has a compile diagnostic (#54)", () => {
+    useDocumentStore.getState().setDiagnosticsByNode({
+      "source-1": [
+        { severity: "error", code: "danglingInput", message: "coord unconnected", node: "source-1", port: "coord" },
+      ],
+    });
+    const { container } = renderNode("source");
+    const badge = container.querySelector(".taxonomy-node__badge--error");
+    expect(badge).not.toBeNull();
+    expect(container.querySelector(".taxonomy-node--error")).not.toBeNull();
+  });
+
+  it("shows a warning badge (not error) for a warning-only diagnostic", () => {
+    useDocumentStore.getState().setDiagnosticsByNode({
+      "source-1": [
+        { severity: "warning", code: "unusedPort", message: "meh", node: "source-1", port: null },
+      ],
+    });
+    const { container } = renderNode("source");
+    expect(container.querySelector(".taxonomy-node__badge--warning")).not.toBeNull();
+    expect(container.querySelector(".taxonomy-node__badge--error")).toBeNull();
   });
 
   it("falls back to an 'unknown node' card for an unregistered kind", () => {

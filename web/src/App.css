@@ -1075,3 +1075,143 @@
 .preview__stat {
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- Live compile loop: node badges, problems, status (#54) ---- */
+.taxonomy-node--error {
+  border-color: #e65a8b;
+}
+.taxonomy-node--warning {
+  border-color: #d6d65a;
+}
+
+.taxonomy-node__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: 6px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--bg);
+  vertical-align: middle;
+}
+.taxonomy-node__badge--error {
+  background: #e65a8b;
+}
+.taxonomy-node__badge--warning {
+  background: #d6d65a;
+}
+
+/* Problems panel */
+.problems {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.problems__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.problems__status {
+  font-weight: 600;
+}
+.problems__status--invalid {
+  color: #e65a8b;
+}
+.problems__status--valid {
+  color: #7fc97f;
+}
+
+.problems__counts {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.problems__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.problems__item {
+  border-left: 3px solid var(--border);
+}
+.problems__item--error {
+  border-left-color: #e65a8b;
+}
+.problems__item--warning {
+  border-left-color: #d6d65a;
+}
+
+.problems__jump {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 6px;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.problems__jump:hover {
+  background: var(--panel-2);
+}
+
+.problems__pass {
+  color: var(--accent);
+  font-weight: 600;
+}
+.problems__code {
+  color: var(--muted);
+  font-weight: 600;
+}
+.problems__message {
+  color: var(--text);
+}
+
+/* Problems tab badge */
+.panels__tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--bg);
+  background: #e65a8b;
+}
+
+/* Status bar compile indicator */
+.editor__compile {
+  font-weight: 600;
+}
+.editor__compile--invalid {
+  color: #e65a8b;
+}
+.editor__compile--valid {
+  color: #7fc97f;
+}
+.editor__compile--pending {
+  color: var(--muted);
+}

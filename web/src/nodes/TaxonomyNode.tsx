@@ -5,6 +5,7 @@
 // e.g. a Const's output type). Adding a node kind needs no new component.
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 
+import { useDocumentStore } from "../store/documentStore";
 import { getDescriptor } from "./registry";
 import type { NodeData, PortSpec } from "./types";
 
@@ -49,6 +50,17 @@ export function TaxonomyNode(props: NodeProps): React.JSX.Element {
   const descriptor = getDescriptor(kind);
   const data = props.data as TaxonomyNodeData;
 
+  // Inline diagnostics (#54): the live compile loop keys each Diagnostic by the
+  // offending IrNode id (== this node's id). Surface the worst severity as a badge
+  // + tooltip so an invalid node is flagged on the canvas, not just in the inspector.
+  const diagnostics = useDocumentStore((s) => s.diagnosticsByNode[props.id]);
+  const severity =
+    diagnostics && diagnostics.length > 0
+      ? diagnostics.some((d) => d.severity === "error")
+        ? "error"
+        : "warning"
+      : null;
+
   if (!descriptor) {
     return (
       <div className="taxonomy-node taxonomy-node--unknown">
@@ -63,8 +75,27 @@ export function TaxonomyNode(props: NodeProps): React.JSX.Element {
   const title = typeof data.label === "string" && data.label.length > 0 ? data.label : descriptor.label;
 
   return (
-    <div className={`taxonomy-node ${categoryClass(kind)}`} data-kind={kind}>
-      <div className="taxonomy-node__title">{title}</div>
+    <div
+      className={`taxonomy-node ${categoryClass(kind)}${
+        severity ? ` taxonomy-node--${severity}` : ""
+      }`}
+      data-kind={kind}
+      data-diagnostic={severity ?? undefined}
+    >
+      <div className="taxonomy-node__title">
+        {title}
+        {severity ? (
+          <span
+            className={`taxonomy-node__badge taxonomy-node__badge--${severity}`}
+            title={diagnostics!.map((d) => `${d.code}: ${d.message}`).join("\n")}
+            aria-label={`${severity}: ${diagnostics!.length} ${
+              diagnostics!.length === 1 ? "diagnostic" : "diagnostics"
+            }`}
+          >
+            {severity === "error" ? "!" : "?"}
+          </span>
+        ) : null}
+      </div>
       <div className="taxonomy-node__ports">
         <div className="taxonomy-node__col taxonomy-node__col--in">
           {inputs.map((p) => (

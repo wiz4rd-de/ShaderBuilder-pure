@@ -7,6 +7,13 @@ export function EditorStatusBar() {
   const level = useDocumentStore((s) => s.level);
   const dirty = useDocumentStore((s) => s.dirty);
 
+  // Live compile status (#54): an invalid pipeline (cycle / type error → no
+  // source) is unmistakably flagged so the user knows the preview is NOT
+  // reflecting the document.
+  const pipelineValid = useDocumentStore((s) => s.pipelineValid);
+  const compiling = useDocumentStore((s) => s.compiling);
+  const problemCount = useDocumentStore((s) => s.problems.length);
+
   const passCount = useDocumentStore((s) => s.project.passes.length);
   const selectedPassId = useDocumentStore((s) => s.selections.pipeline);
 
@@ -48,6 +55,27 @@ export function EditorStatusBar() {
         data-testid="status-dirty"
       >
         {dirty ? "Unsaved changes" : "Saved"}
+      </span>
+
+      <span
+        className={`editor__status-item editor__compile editor__compile--${
+          pipelineValid === false ? "invalid" : pipelineValid === true ? "valid" : "pending"
+        }`}
+        data-testid="status-compile"
+        data-valid={pipelineValid === null ? "pending" : String(pipelineValid)}
+        title={
+          pipelineValid === false
+            ? `${problemCount} problem${problemCount === 1 ? "" : "s"} — preview not updated`
+            : undefined
+        }
+      >
+        {compiling
+          ? "Compiling…"
+          : pipelineValid === false
+            ? `Invalid (${problemCount})`
+            : pipelineValid === true
+              ? "Valid"
+              : "—"}
       </span>
     </footer>
   );
