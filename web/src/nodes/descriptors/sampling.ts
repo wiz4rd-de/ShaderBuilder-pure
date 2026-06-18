@@ -206,11 +206,13 @@ function maskBody(type: string, strength: number): string {
   const head = "vec2 px = uv * outputSize.xy;";
   switch (type) {
     case "slotMask": {
-      // RGB columns with a vertical half-cell stagger (the slot offset).
+      // RGB columns with a vertical half-cell stagger: alternate 2-pixel-tall rows
+      // shift the column phase by half a triad (1.5px) so the RGB stripes interlock
+      // into the classic slot pattern instead of forming straight grille lines.
       return [
         head,
-        "float col = mod(px.x, 3.0);",
-        "float row = mod(floor(px.y / 1.0) + step(1.5, mod(px.x, 6.0)) * 0.0, 2.0);",
+        "float row = mod(floor(px.y / 2.0), 2.0);",
+        "float col = mod(px.x + row * 1.5, 3.0);",
         "vec3 m = vec3(step(col, 1.0), step(1.0, col) * step(col, 2.0), step(2.0, col));",
         "float slot = step(0.5, mod(floor(px.y / 2.0) + floor(px.x / 3.0), 2.0));",
         "m *= mix(1.0, slot, 0.5);",

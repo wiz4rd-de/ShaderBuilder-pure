@@ -232,6 +232,18 @@ describe("CRT mask", () => {
       expect(op.kind).toBe("customSnippet");
     }
   });
+
+  it("slot-mask actually staggers alternate rows (no dead * 0.0 stagger term)", () => {
+    const op = requireDescriptor("crtMask").toNodeOp({ mask: "slotMask", strength: 1 });
+    if (op.kind !== "customSnippet") throw new Error("expected customSnippet");
+    // The vertical half-cell stagger must be live: `row` is computed AND fed into
+    // the column phase. A multiply-by-zero stagger term means the documented
+    // interlock is a no-op (the original bug).
+    expect(op.body).not.toContain("* 0.0");
+    expect(op.body).toMatch(/float row = mod\(/);
+    expect(op.body).toContain("row * 1.5");
+    expect(op.body).toContain("mod(px.x + row * 1.5, 3.0)");
+  });
 });
 
 describe("sharp-bilinear", () => {
