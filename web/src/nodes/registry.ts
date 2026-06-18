@@ -4,9 +4,11 @@
 // the taxonomy by appending descriptors to `ALL_DESCRIPTORS` (#50 math, #51 color,
 // #52 custom snippet) — never by special-casing a kind elsewhere.
 import { coordinateDescriptors } from "./descriptors/coordinates";
+import { mathDescriptors } from "./descriptors/math";
 import { outputDescriptor } from "./descriptors/output";
 import { samplerDescriptors } from "./descriptors/samplers";
 import { valueDescriptors } from "./descriptors/values";
+import { vectorDescriptors } from "./descriptors/vector";
 import type { NodeCategory, NodeData, NodeDescriptor } from "./types";
 
 /**
@@ -18,6 +20,8 @@ export const ALL_DESCRIPTORS: ReadonlyArray<NodeDescriptor> = [
   ...samplerDescriptors,
   ...coordinateDescriptors,
   ...valueDescriptors,
+  ...mathDescriptors,
+  ...vectorDescriptors,
   outputDescriptor,
 ];
 
