@@ -635,6 +635,79 @@ fn fixtures_emit_compile_and_match_snapshots() {
     }
 }
 
+/// Phase-5 graph→IR bridge acceptance (#49): the minimal editor graph
+/// `Texcoord → Sample(Source) → Output` must type-check, lower, emit, and COMPILE.
+///
+/// The frontend `graphToIr` bridge lowers a `Texcoord` node to a `CustomSnippet`
+/// with **no inputs** and one `vec2 uv` output whose body reads `vTexCoord` (the
+/// raw fragment UV — there is no Builtin texcoord semantic and the IR is frozen).
+/// This test pins that design: it reconstructs the EXACT `IrGraph` the bridge
+/// emits and proves the `vTexCoord`-in-a-snippet assumption holds — the snippet
+/// wrapper function is emitted at fragment-stage file scope where `vTexCoord`
+/// (declared `layout(location = 0) in vec2 vTexCoord;`) is in scope, so the
+/// generated slang compiles through the real Phase-1 path.
+#[test]
+fn texcoord_snippet_minimal_graph_compiles() {
+    // Mirrors web/src/nodes/{descriptors/coordinates.ts texcoord, graphToIr.ts}.
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "texcoord",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("texcoord", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+
+    // Type-checks clean — the coord source feeds the required Sample.coord input.
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "minimal texcoord graph did not type-check clean: {diags:?}"
+    );
+
+    let lowered = lower(&graph, &ctx).expect("minimal texcoord graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("texcoord_minimal".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+
+    // The snippet body reads the in-scope `vTexCoord` global from its wrapper fn.
+    assert!(
+        slang.contains("void snippet_texcoord("),
+        "texcoord emitted its own wrapper fn:\n{slang}"
+    );
+    assert!(
+        slang.contains("uv = vTexCoord;"),
+        "snippet body reads vTexCoord:\n{slang}"
+    );
+
+    // Compiles through the real preprocess → glslang → SPIR-V path: a snippet body
+    // referencing an out-of-scope `vTexCoord` would fail here.
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("minimal texcoord graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
 /// Dedup acceptance: a graph sampling both `Original` and `OriginalHistory{0}`
 /// (the same RetroArch texture) must emit a SINGLE `sampler2D Original` decl — two
 /// would be a GLSL redefinition. Proves the lowering canonicalization reaches the
