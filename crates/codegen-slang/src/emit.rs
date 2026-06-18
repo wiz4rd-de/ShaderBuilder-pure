@@ -348,7 +348,18 @@ fn emit_fragment_stage(out: &mut String, lowered: &LoweredIr, opts: &EmitOptions
             expr
         );
     }
-    let _ = writeln!(out, "    FragColor = {};", lowered.output);
+    // `FragColor` is a vec4. When the output source temp is already a vec4 we
+    // write it verbatim; when it is a scalar (`Float`/`Int`) we broadcast it with
+    // `vec4(<temp>)` — the documented grayscale-scalar→color shorthand the type
+    // checker honors on `Output.color` (a vec2/vec3 can never legally reach here:
+    // the `Output.color` edge requires assignability to vec4, which only a vec4 or
+    // a broadcast scalar satisfies).
+    let output_expr = if lowered.output_ty == PortType::Vec4 {
+        lowered.output.to_string()
+    } else {
+        format!("vec4({})", lowered.output)
+    };
+    let _ = writeln!(out, "    FragColor = {output_expr};");
     out.push_str("}\n");
 }
 

@@ -408,6 +408,103 @@ fn fixture_builtins() -> Fixture {
     }
 }
 
+/// A scalar `Const(Float)` wired straight into `Output.color`. `Output.color` is a
+/// `vec4` sink, so the documented `Float→vecN` broadcast applies: the type checker
+/// accepts the edge and the emitter must broadcast the scalar at the `FragColor`
+/// write (`FragColor = vec4(<temp>);`), not write `FragColor = <float>;` (illegal
+/// GLSL). This fixture proves that broadcast path emits + compiles.
+fn fixture_scalar_to_output_broadcast() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "gray",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.5 },
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![IrEdge::new("gray", "out", "output", "color")],
+    };
+    Fixture {
+        name: "scalar_to_output_broadcast",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("gray".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    }
+}
+
+/// `add(Float, FrameCount[int]) → vec4 sample mul → Output`. Exercises the
+/// Int-among-scalars arithmetic the checker now permits (`float + int` is legal
+/// GLSL via int→float promotion): the `add` lowers to a Float temp emitted as
+/// `(t_f + int(params.FrameCount))`, which must compile. Proves the Int operand
+/// decision keeps the clean-checks ⇒ compiles invariant end-to-end.
+fn fixture_int_scalar_arithmetic() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::Const {
+                    value: ConstValue::Vec2 { value: [0.5, 0.5] },
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "half",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.5 },
+                },
+            ),
+            IrNode::new(
+                "fc",
+                NodeOp::Builtin {
+                    semantic: BuiltinSemantic::FrameCount,
+                },
+            ),
+            // float + int -> float (scalar promotion).
+            IrNode::new(
+                "add",
+                NodeOp::Expr {
+                    op: ExprOp::Add,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            // vec4 * float (the promoted scalar broadcasts into the vector).
+            IrNode::new(
+                "mul",
+                NodeOp::Expr {
+                    op: ExprOp::Mul,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out", "src", "coord"),
+            IrEdge::new("half", "out", "add", "a"),
+            IrEdge::new("fc", "out", "add", "b"),
+            IrEdge::new("src", "out", "mul", "a"),
+            IrEdge::new("add", "out", "mul", "b"),
+            IrEdge::new("mul", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "int_scalar_arithmetic",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions::default(),
+    }
+}
+
 fn all_fixtures() -> Vec<Fixture> {
     vec![
         fixture_passthrough_brightness(),
@@ -416,6 +513,8 @@ fn all_fixtures() -> Vec<Fixture> {
         fixture_custom_snippet(),
         fixture_two_snippets_like_named_locals(),
         fixture_builtins(),
+        fixture_scalar_to_output_broadcast(),
+        fixture_int_scalar_arithmetic(),
     ]
 }
 
