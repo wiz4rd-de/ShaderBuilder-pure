@@ -1,6 +1,6 @@
 import "./App.css";
 import { EditorCanvas } from "./editor/EditorCanvas";
-import { InspectorPanel } from "./inspector/InspectorPanel";
+import { PanelLayout } from "./panels/PanelLayout";
 import { useDocumentStore } from "./store/documentStore";
 import { PreviewCanvas } from "./preview/PreviewCanvas";
 
@@ -23,10 +23,10 @@ export default function App() {
           <EditorCanvas />
         </main>
 
-        {/* Right region — a simple rail (#47) the inspector + preview stack in.
-            #48 replaces this with the dockable/tabbed panel layout. */}
+        {/* Right region — the tabbed panel layout (#48): inspector + the
+            engine-driving panels above the always-visible preview pane. */}
         <div className="app__right" aria-label="Panels">
-          <InspectorPanel />
+          <PanelLayout />
 
           {/* Preview region — the wgpu frame stream blits into a <canvas> here. */}
           <aside className="preview" aria-label="Preview">
