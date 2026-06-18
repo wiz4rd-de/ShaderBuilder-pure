@@ -53,7 +53,10 @@ import {
   makeProject,
   PLACEHOLDER_KIND,
 } from "./factories";
+import { collapseSelection, expandSubgraph } from "./collapse";
 import { cloneSnapshot, deepClone, type DocSnapshot } from "./snapshot";
+import { resolveGraph, replaceGraph, subgraphAt } from "./subgraphNav";
+import { nextId } from "./ids";
 
 /** The fixed offset applied to each successive paste/duplicate of a selection. */
 export const PASTE_OFFSET: Vec2 = { x: 32, y: 32 };
@@ -129,6 +132,14 @@ export interface DocumentState {
   // ---- navigation (#46) ----
   /** Whether the canvas shows the pipeline view or a per-pass graph. */
   level: EditorLevel;
+  /**
+   * Subgraph drill-in path (#57): the chain of `kind=="subgraph"` node ids the
+   * editor has drilled into, from the pass graph downward. Empty == editing the
+   * pass graph itself; non-empty == editing the interior of the last node's
+   * subgraph body. Only meaningful when `level === "pass"`. Editor-only nav
+   * state — never part of an undo snapshot (validated/reset on history jumps).
+   */
+  subgraphPath: string[];
   /**
    * Per-level remembered viewport (pan/zoom). Keyed by level for the pipeline,
    * and by pass id for each per-pass graph, so navigating back restores the
@@ -293,6 +304,36 @@ export interface DocumentState {
   showPipeline: () => void;
   /** Drill into a pass's graph (remembering the pipeline viewport + selection). */
   openPass: (passId: string) => void;
+
+  // ---- subgraph collapse / expand / drill-in (#57) ----
+  /**
+   * Collapse the current node selection into ONE named `kind=="subgraph"` node:
+   * the boundary (edges crossing the selection) becomes typed boundary ports,
+   * the interior nodes/edges move into the new node's `data` Subgraph, and the
+   * crossing parent edges are rewired to the new node's boundary ports. One undo
+   * entry; no-op when fewer than one node is selected. Selects the new node.
+   */
+  collapseSelection: (name: string) => void;
+  /**
+   * Expand a `kind=="subgraph"` node back to its interior (fresh ids),
+   * reconnecting boundary ports to the exterior endpoints on the parent edges —
+   * the inverse of `collapseSelection`. One undo entry; no-op when `nodeId` is
+   * not a subgraph node. Selects the restored interior nodes.
+   */
+  expandSubgraphNode: (nodeId: string) => void;
+  /**
+   * Drill INTO a subgraph node's interior body (#57): push `nodeId` onto the
+   * drill-in path and edit its interior as a graph (boundary ports rendered as
+   * in/out terminals). Remembers the current level's selection. No-op when
+   * `nodeId` is not a subgraph node in the active graph.
+   */
+  openSubgraph: (nodeId: string) => void;
+  /**
+   * Drill OUT one subgraph level (#57): pop the last entry off the drill-in path
+   * (back to the parent graph), or to the pipeline when already at the pass
+   * graph. Remembers/restores the per-level selection.
+   */
+  closeSubgraph: () => void;
   /** Remember the current level's React Flow viewport (called on pan/zoom). */
   setViewport: (viewport: ViewportState) => void;
   /** The remembered viewport for the current level, or null if none yet. */
@@ -332,30 +373,44 @@ export interface DocumentState {
   reset: () => void;
 }
 
-/** Read the active pass's graph out of a project, or an empty graph. */
-function graphOf(project: Project, activePassId: string): Graph {
-  const pass = project.passes.find((p) => p.id === activePassId);
-  if (pass && pass.source.kind === "graph") {
-    return pass.source.graph;
+/**
+ * Read the ACTIVE graph out of a project: the pass graph when `subgraphPath` is
+ * empty, else the interior body of the subgraph node chain `subgraphPath`
+ * addresses (drill-in, #57). An empty graph for opaque/code passes.
+ */
+function graphOf(project: Project, activePassId: string, subgraphPath: string[]): Graph {
+  if (subgraphPath.length === 0) {
+    const pass = project.passes.find((p) => p.id === activePassId);
+    if (pass && pass.source.kind === "graph") {
+      return pass.source.graph;
+    }
+    return emptyGraph();
   }
-  return emptyGraph();
+  return resolveGraph(project, activePassId, subgraphPath);
 }
 
 /**
- * Return a NEW project with the active pass's graph replaced by `next`. The
- * project (and the touched pass + its source) are shallow-cloned so React/zustand
- * see a fresh reference; untouched passes are shared.
+ * Return a NEW project with the ACTIVE graph (addressed by `subgraphPath`)
+ * replaced by `next`. Threads the edit back through any subgraph nodes so
+ * React/zustand see fresh references the whole way; untouched siblings shared.
  */
-function withGraph(project: Project, activePassId: string, next: Graph): Project {
-  return {
-    ...project,
-    passes: project.passes.map((p) => {
-      if (p.id !== activePassId || p.source.kind !== "graph") {
-        return p;
-      }
-      return { ...p, source: { ...p.source, graph: next } };
-    }),
-  };
+function withGraph(
+  project: Project,
+  activePassId: string,
+  subgraphPath: string[],
+  next: Graph,
+): Project {
+  return replaceGraph(project, activePassId, subgraphPath, next);
+}
+
+/**
+ * The key under which the active graph's per-level selection/viewport is
+ * remembered (#46/#57): the active pass id at the pass level, or the deepest
+ * drilled-in subgraph node id when editing a subgraph interior. Node ids and
+ * pass ids never collide (distinct id prefixes), so one map serves both.
+ */
+function navKey(activePassId: string, subgraphPath: string[]): string {
+  return subgraphPath.length > 0 ? subgraphPath[subgraphPath.length - 1]! : activePassId;
 }
 
 /**
@@ -478,6 +533,23 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     return level;
   }
 
+  /**
+   * Trim `subgraphPath` to the longest valid prefix in `project` (a history jump
+   * may have removed a subgraph node we were drilled into). Each step must name a
+   * subgraph node in the graph the prefix-so-far resolves to.
+   */
+  function validPath(project: Project, activePassId: string, path: string[]): string[] {
+    const valid: string[] = [];
+    for (const nodeId of path) {
+      const graph = graphOf(project, activePassId, valid);
+      if (!subgraphAt(graph, nodeId)) {
+        break;
+      }
+      valid.push(nodeId);
+    }
+    return valid;
+  }
+
   /** Append `before` to the undo stack, capping its length. */
   function pushPast(before: DocSnapshot): DocSnapshot[] {
     const past = [...get().past, before];
@@ -493,10 +565,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
    */
   function mutateGraph(transform: (graph: Graph) => Graph): void {
     const before = snapshot();
-    const { project, activePassId } = get();
-    const nextGraph = transform(graphOf(project, activePassId));
+    const { project, activePassId, subgraphPath } = get();
+    const nextGraph = transform(graphOf(project, activePassId, subgraphPath));
     set({
-      project: withGraph(project, activePassId, nextGraph),
+      project: withGraph(project, activePassId, subgraphPath, nextGraph),
       past: pushPast(before),
       future: [],
       dirty: true,
@@ -507,6 +579,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     project: initialProject,
     activePassId: initialActivePassId,
     level: "pipeline" as EditorLevel,
+    subgraphPath: [],
     viewports: { pipeline: null, passes: {} },
     selections: { pipeline: null, passes: {} },
     selection: { nodeIds: [], edgeIds: [] },
@@ -521,7 +594,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     future: [],
     pendingBaseline: null,
 
-    activeGraph: () => graphOf(get().project, get().activePassId),
+    activeGraph: () => graphOf(get().project, get().activePassId, get().subgraphPath),
 
     addNode: (kind, position, data) => {
       const node = makeNode(kind, position, data);
@@ -560,7 +633,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         project: withGraph(
           s.project,
           s.activePassId,
-          withNodeData(graphOf(s.project, s.activePassId), nodeId, patch),
+          s.subgraphPath,
+          withNodeData(graphOf(s.project, s.activePassId, s.subgraphPath), nodeId, patch),
         ),
         dirty: true,
       }));
@@ -670,6 +744,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set({
         project: addPass(project, pass),
         activePassId: pass.id,
+        // The new pass starts at its top-level graph.
+        subgraphPath: [],
         past: pushPast(before),
         future: [],
         dirty: true,
@@ -690,7 +766,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       const nextProject = removePass(project, passId);
       // If the active pass was removed, fall back to the neighbour that now sits
       // at the removed slot (or the new last pass).
-      let { activePassId } = get();
+      const priorActivePassId = get().activePassId;
+      let activePassId = priorActivePassId;
       if (activePassId === passId) {
         const fallbackIndex = Math.min(removedIndex, nextProject.passes.length - 1);
         activePassId = nextProject.passes[fallbackIndex]!.id;
@@ -701,15 +778,17 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       delete passViewports[passId];
       const passSelections = { ...selections.passes };
       delete passSelections[passId];
-      set({
+      set((s) => ({
         project: nextProject,
         activePassId,
+        // If the active pass changed, any drill-in into it is no longer valid.
+        subgraphPath: activePassId === priorActivePassId ? s.subgraphPath : [],
         viewports: { ...viewports, passes: passViewports },
         selections: { ...selections, passes: passSelections },
         past: pushPast(before),
         future: [],
         dirty: true,
-      });
+      }));
     },
 
     reorderPass: (from, to) => {
@@ -781,9 +860,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
           ...project,
           passes: project.passes.map((p) => (p.id === passId ? next : p)),
         },
-        // The pass no longer has a node graph — clear any node selection in it.
+        // The pass no longer has a node graph — clear any node selection + any
+        // drill-in into it.
         selection:
           get().activePassId === passId ? { nodeIds: [], edgeIds: [] } : get().selection,
+        subgraphPath: get().activePassId === passId ? [] : get().subgraphPath,
         past: pushPast(before),
         future: [],
         dirty: true,
@@ -837,16 +918,18 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     },
 
     showPipeline: () => {
-      const { level, activePassId, selection } = get();
+      const { level, activePassId, subgraphPath, selection } = get();
       if (level === "pipeline") {
         return;
       }
-      // Remember the pass-graph selection before switching out.
+      // Remember the current graph's selection (pass or subgraph interior).
+      const here = navKey(activePassId, subgraphPath);
       set((s) => ({
         level: "pipeline",
+        subgraphPath: [],
         selections: {
           ...s.selections,
-          passes: { ...s.selections.passes, [activePassId]: selection },
+          passes: { ...s.selections.passes, [here]: selection },
         },
         selection: { nodeIds: [], edgeIds: [] },
       }));
@@ -865,8 +948,100 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       set((s) => ({
         level: "pass",
         activePassId: passId,
+        // Opening a pass starts at its top-level graph (clear any drill-in).
+        subgraphPath: [],
         // Remember which pass was selected in the pipeline.
         selections: { ...s.selections, pipeline: passId },
+        selection: remembered,
+      }));
+    },
+
+    collapseSelection: (name) => {
+      const { selection } = get();
+      if (selection.nodeIds.length === 0) {
+        return;
+      }
+      const before = snapshot();
+      const { project, activePassId, subgraphPath } = get();
+      const graph = graphOf(project, activePassId, subgraphPath);
+      const result = collapseSelection(graph, selection.nodeIds, name, nextId);
+      if (!result) {
+        return;
+      }
+      set({
+        project: withGraph(project, activePassId, subgraphPath, result.graph),
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+        // Select the freshly-created collapsed node.
+        selection: { nodeIds: [result.subgraphNodeId], edgeIds: [] },
+      });
+    },
+
+    expandSubgraphNode: (nodeId) => {
+      const before = snapshot();
+      const { project, activePassId, subgraphPath } = get();
+      const graph = graphOf(project, activePassId, subgraphPath);
+      const next = expandSubgraph(graph, nodeId, nextId);
+      if (!next) {
+        return;
+      }
+      // The restored interior nodes are the ones absent from the original graph.
+      const priorIds = new Set(graph.nodes.map((n) => n.id));
+      const restoredIds = next.nodes.filter((n) => !priorIds.has(n.id)).map((n) => n.id);
+      set({
+        project: withGraph(project, activePassId, subgraphPath, next),
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+        selection: { nodeIds: restoredIds, edgeIds: [] },
+      });
+    },
+
+    openSubgraph: (nodeId) => {
+      const { project, activePassId, subgraphPath, selection } = get();
+      const graph = graphOf(project, activePassId, subgraphPath);
+      if (!subgraphAt(graph, nodeId)) {
+        return;
+      }
+      // Remember the current graph's selection before drilling in.
+      const here = navKey(activePassId, subgraphPath);
+      const nextPath = [...subgraphPath, nodeId];
+      const remembered = get().selections.passes[navKey(activePassId, nextPath)] ?? {
+        nodeIds: [],
+        edgeIds: [],
+      };
+      set((s) => ({
+        level: "pass",
+        subgraphPath: nextPath,
+        selections: {
+          ...s.selections,
+          passes: { ...s.selections.passes, [here]: selection },
+        },
+        selection: remembered,
+      }));
+    },
+
+    closeSubgraph: () => {
+      const { activePassId, subgraphPath, selection } = get();
+      if (subgraphPath.length === 0) {
+        // Already at the pass graph — fall back to the pipeline.
+        get().showPipeline();
+        return;
+      }
+      const here = navKey(activePassId, subgraphPath);
+      const nextPath = subgraphPath.slice(0, -1);
+      const parentKey = navKey(activePassId, nextPath);
+      const remembered = get().selections.passes[parentKey] ?? {
+        nodeIds: [],
+        edgeIds: [],
+      };
+      set((s) => ({
+        subgraphPath: nextPath,
+        selections: {
+          ...s.selections,
+          passes: { ...s.selections.passes, [here]: selection },
+        },
         selection: remembered,
       }));
     },
@@ -876,20 +1051,21 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         if (s.level === "pipeline") {
           return { viewports: { ...s.viewports, pipeline: viewport } };
         }
+        const here = navKey(s.activePassId, s.subgraphPath);
         return {
           viewports: {
             ...s.viewports,
-            passes: { ...s.viewports.passes, [s.activePassId]: viewport },
+            passes: { ...s.viewports.passes, [here]: viewport },
           },
         };
       });
     },
 
     currentViewport: () => {
-      const { level, viewports, activePassId } = get();
+      const { level, viewports, activePassId, subgraphPath } = get();
       return level === "pipeline"
         ? viewports.pipeline
-        : (viewports.passes[activePassId] ?? null);
+        : (viewports.passes[navKey(activePassId, subgraphPath)] ?? null);
     },
 
     applyNodeChanges: (changes) => {
@@ -917,7 +1093,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
           ? g.edges
           : g.edges.filter((e) => survivingIds.has(e.source) && survivingIds.has(e.target));
       set((s) => ({
-        project: withGraph(s.project, s.activePassId, { nodes: nextNodes, edges: nextEdges }),
+        project: withGraph(s.project, s.activePassId, s.subgraphPath, {
+          nodes: nextNodes,
+          edges: nextEdges,
+        }),
       }));
     },
 
@@ -934,7 +1113,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       const survivingIds = new Set(nextRf.map((e) => e.id));
       const nextEdges = g.edges.filter((e) => survivingIds.has(e.id));
       set((s) => ({
-        project: withGraph(s.project, s.activePassId, { nodes: g.nodes, edges: nextEdges }),
+        project: withGraph(s.project, s.activePassId, s.subgraphPath, {
+          nodes: g.nodes,
+          edges: nextEdges,
+        }),
       }));
     },
 
@@ -973,17 +1155,27 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       }
       const previous = past[past.length - 1]!;
       const current = snapshot();
-      set((s) => ({
-        project: deepClone(previous.project),
-        activePassId: previous.activePassId,
-        level: levelFor(previous.project, previous.activePassId, s.level),
-        past: past.slice(0, -1),
-        future: [...s.future, current],
-        // Selection may reference deleted nodes after undo — clear it.
-        selection: { nodeIds: [], edgeIds: [] },
-        pendingBaseline: null,
-        dirty: true,
-      }));
+      set((s) => {
+        const level = levelFor(previous.project, previous.activePassId, s.level);
+        // A history jump may have removed a subgraph node we were inside — trim
+        // the drill-in path to its longest still-valid prefix (empty at pipeline).
+        const subgraphPath =
+          level === "pass"
+            ? validPath(previous.project, previous.activePassId, s.subgraphPath)
+            : [];
+        return {
+          project: deepClone(previous.project),
+          activePassId: previous.activePassId,
+          level,
+          subgraphPath,
+          past: past.slice(0, -1),
+          future: [...s.future, current],
+          // Selection may reference deleted nodes after undo — clear it.
+          selection: { nodeIds: [], edgeIds: [] },
+          pendingBaseline: null,
+          dirty: true,
+        };
+      });
     },
 
     redo: () => {
@@ -993,16 +1185,24 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       }
       const next = future[future.length - 1]!;
       const current = snapshot();
-      set((s) => ({
-        project: deepClone(next.project),
-        activePassId: next.activePassId,
-        level: levelFor(next.project, next.activePassId, s.level),
-        past: [...s.past, current],
-        future: future.slice(0, -1),
-        selection: { nodeIds: [], edgeIds: [] },
-        pendingBaseline: null,
-        dirty: true,
-      }));
+      set((s) => {
+        const level = levelFor(next.project, next.activePassId, s.level);
+        const subgraphPath =
+          level === "pass"
+            ? validPath(next.project, next.activePassId, s.subgraphPath)
+            : [];
+        return {
+          project: deepClone(next.project),
+          activePassId: next.activePassId,
+          level,
+          subgraphPath,
+          past: [...s.past, current],
+          future: future.slice(0, -1),
+          selection: { nodeIds: [], edgeIds: [] },
+          pendingBaseline: null,
+          dirty: true,
+        };
+      });
     },
 
     canUndo: () => get().past.length > 0,
@@ -1012,14 +1212,23 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
 
     fromSnapshot: (snap, options) => {
       const cloned = cloneSnapshot(snap);
-      set((s) => ({
-        project: cloned.project,
-        activePassId: cloned.activePassId,
-        selection: { nodeIds: [], edgeIds: [] },
-        pendingBaseline: null,
-        past: options?.resetHistory ? [] : s.past,
-        future: options?.resetHistory ? [] : s.future,
-      }));
+      set((s) => {
+        const level = levelFor(cloned.project, cloned.activePassId, s.level);
+        const subgraphPath =
+          level === "pass"
+            ? validPath(cloned.project, cloned.activePassId, s.subgraphPath)
+            : [];
+        return {
+          project: cloned.project,
+          activePassId: cloned.activePassId,
+          level,
+          subgraphPath,
+          selection: { nodeIds: [], edgeIds: [] },
+          pendingBaseline: null,
+          past: options?.resetHistory ? [] : s.past,
+          future: options?.resetHistory ? [] : s.future,
+        };
+      });
     },
 
     loadProject: (project, activePassId) => {
@@ -1029,6 +1238,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         project: deepClone(project),
         activePassId: active,
         level: "pipeline",
+        subgraphPath: [],
         viewports: { pipeline: null, passes: {} },
         selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },
@@ -1051,6 +1261,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         project: fresh,
         activePassId: fresh.passes[0]!.id,
         level: "pipeline",
+        subgraphPath: [],
         viewports: { pipeline: null, passes: {} },
         selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },

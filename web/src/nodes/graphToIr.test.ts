@@ -273,4 +273,50 @@ describe("graphToIr — subgraph inlining EXIT GATE (collapsed ≡ expanded)", (
     const { issues } = graphToIr(collapsed);
     expect(issues).toEqual([]);
   });
+
+  // Acceptance (c): a type-mismatched boundary connection must surface a
+  // typeMismatch via the EXISTING compile_graph type-checker — there is NO
+  // drag-time check. graphToIr can't run the Rust checker (that lives in the
+  // `ir` crate, proven in crates/ir/tests/typecheck.rs), so the frontend's job
+  // is to PRESERVE the mismatched edge into the IR. Here a subgraph exposes an
+  // interior Const(FLOAT) through a (declared vec4) output boundary feeding the
+  // exterior Output.color (vec4) — after inlining the IR carries a
+  // const(float).out → output.color edge, which the checker flags as typeMismatch.
+  it("preserves a type-mismatched boundary edge into the IR (checker flags it)", () => {
+    const interiorConst = node("const", { constType: "float", value: 1 });
+    const sub: Subgraph = {
+      id: "sub-mismatch",
+      name: "BadColor",
+      nodes: [interiorConst],
+      edges: [],
+      boundaryPorts: [
+        // Declared vec4, but the interior Const actually produces a FLOAT.
+        { name: "colorOut", ty: "vec4", direction: "out", interiorNode: interiorConst.id, interiorPort: "out" },
+      ],
+    };
+    const out = node("output");
+    const sg = subgraphNode("sg-mismatch", sub);
+    const graph: Graph = {
+      nodes: [sg, out],
+      edges: [edge(sg.id, "colorOut", out.id, "color")],
+    };
+
+    const { ir, issues } = graphToIr(graph);
+    // The subgraph inlined cleanly (no node dropped) — the const + output remain.
+    expect(issues).toEqual([]);
+    const constNode = ir.nodes.find((n) => n.op.kind === "const")!;
+    const outputNode = ir.nodes.find((n) => n.op.kind === "output")!;
+    expect(constNode).toBeDefined();
+    expect(outputNode).toBeDefined();
+    // The mismatched edge survives: float-producing const → vec4 color input.
+    const mismatchEdge = ir.edges.find(
+      (e) => e.source.node === constNode.id && e.target.node === outputNode.id,
+    )!;
+    expect(mismatchEdge).toBeDefined();
+    expect(mismatchEdge.source.port).toBe("out");
+    expect(mismatchEdge.target.port).toBe("color");
+    if (constNode.op.kind === "const") {
+      expect(constNode.op.value.kind).toBe("float");
+    }
+  });
 });
