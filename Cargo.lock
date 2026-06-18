@@ -3766,8 +3766,10 @@ dependencies = [
 name = "testing"
 version = "0.1.0"
 dependencies = [
+ "codegen-slang",
  "core-model",
  "image",
+ "ir",
  "preset-io",
  "preview-engine",
  "slang-compile",

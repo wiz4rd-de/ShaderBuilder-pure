@@ -20,7 +20,15 @@ image = { workspace = true }
 # `core-model` is in the public surface of the round-trip harness (#37):
 # `compare_projects` / `RoundTrip` take and return `core_model::Project`.
 core-model = { workspace = true }
-
-[dev-dependencies]
-# `tempfile` backs the fuzzer's directory-walk + round-trip tests.
+# `ir` + `codegen-slang` back the graph→slang→preview parity harness (#44):
+# `render_graph_to_image` takes a `core_model::ir::IrGraph`, type-checks +
+# lowers it (`ir`), emits slang (`codegen-slang`), and renders it through the
+# engine. They are normal deps (not dev-only) because the harness fn is in the
+# library surface so the Phase-4 exit-gate test — and any future baseline tool —
+# can call it.
+ir = { workspace = true }
+codegen-slang = { workspace = true }
+# `tempfile` backs both the fuzzer's directory-walk round-trip tests and the
+# #44 harness's temp single-pass `.slangp`/`.slang` bundle, so it is a normal
+# dep now (the harness fn writes the generated bundle to a temp dir).
 tempfile = { workspace = true }
