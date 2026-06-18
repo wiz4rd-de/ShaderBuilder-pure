@@ -102,6 +102,22 @@ impl PortType {
         self.is_scalar() || self.is_vector()
     }
 
+    /// Whether this is a **float-family** type — a `Float` or a `vecN`
+    /// (`Vec2`/`Vec3`/`Vec4`). This is the operand class the component-wise math
+    /// [`ExprOp`](ExprOp)s (`add`/`sub`/`mul`/… plus `dot`/`normalize`/`length`/
+    /// the unary intrinsics and `construct`) require: an `Int` or `Bool` is
+    /// [`is_numeric`](PortType::is_numeric) but does **not** participate in this
+    /// arithmetic, because the lowering + emitter only ever produce float-typed
+    /// result temps and GLSL forbids e.g. `vec4 * int` / `bool + bool`. Keeping
+    /// the checker's operand gate aligned with what codegen can emit upholds the
+    /// "clean-checks ⇒ compiles" invariant.
+    pub const fn is_float_family(self) -> bool {
+        matches!(
+            self,
+            PortType::Float | PortType::Vec2 | PortType::Vec3 | PortType::Vec4
+        )
+    }
+
     /// The float-vector type with the given component count (`1 → Float`,
     /// `2 → Vec2`, `3 → Vec3`, `4 → Vec4`), or `None` for any other count.
     ///
@@ -829,6 +845,21 @@ mod port_type_tests {
         assert!(PortType::Float.is_numeric());
         assert!(PortType::Vec4.is_numeric());
         assert!(!PortType::Sampler2D.is_numeric());
+    }
+
+    #[test]
+    fn float_family_excludes_int_bool_and_sampler() {
+        // The float family is exactly Float + the vecN types.
+        assert!(PortType::Float.is_float_family());
+        assert!(PortType::Vec2.is_float_family());
+        assert!(PortType::Vec3.is_float_family());
+        assert!(PortType::Vec4.is_float_family());
+        // Int/Bool are numeric/scalar but NOT float-family (they cannot take
+        // part in the component-wise math the emitter lowers to GLSL operators).
+        assert!(!PortType::Int.is_float_family());
+        assert!(!PortType::Bool.is_float_family());
+        // Samplers are never float-family.
+        assert!(!PortType::Sampler2D.is_float_family());
     }
 
     #[test]
