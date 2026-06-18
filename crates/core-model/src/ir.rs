@@ -697,7 +697,14 @@ pub struct Diagnostic {
     /// The offending port name on [`node`](Diagnostic::node), when the diagnostic
     /// is about a specific port (e.g. a type mismatch on an input port); `None`
     /// for node-level problems (e.g. a cycle, an unknown parameter).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// Plain `#[serde(default)]` (no `skip_serializing_if`): ts-rs cannot parse
+    /// `skip_serializing_if` and would emit a required `port: string | null`
+    /// binding while the wire payload omitted the key — a mismatch. Always
+    /// serializing `null` when `None` keeps the wire shape and the generated TS
+    /// type identical (matching the [`crate::PassSource::WholePassCode`]
+    /// `filename` precedent).
+    #[serde(default)]
     pub port: Option<String>,
 }
 
@@ -808,7 +815,14 @@ impl Diagnostics {
 pub struct CompileGraphResult {
     /// The emitted `.slang` source, or `None` when the graph had blocking errors
     /// (and so was never lowered/emitted).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ///
+    /// Plain `#[serde(default)]` (no `skip_serializing_if`): ts-rs cannot parse
+    /// `skip_serializing_if` and would emit a required `source: string | null`
+    /// binding while the wire payload omitted the key — a mismatch. Always
+    /// serializing `null` when `None` keeps the wire shape and the generated TS
+    /// type identical (matching the [`crate::PassSource::WholePassCode`]
+    /// `filename` precedent).
+    #[serde(default)]
     pub source: Option<String>,
     /// The type-checker diagnostics (empty when the graph is fully clean). Always
     /// present so the editor can render them whether or not `source` was produced.
@@ -1262,13 +1276,21 @@ mod graph_tests {
         let back: Diagnostic = serde_json::from_value(v).unwrap();
         assert_eq!(d, back);
 
-        // A node-level (no-port) diagnostic omits `port` on the wire (skip-if-none).
+        // A node-level (no-port) diagnostic ALWAYS serializes `port` as JSON
+        // `null` (not omitted): ts-rs cannot parse `skip_serializing_if`, so the
+        // generated binding is a required `port: string | null` and the wire
+        // shape must match it — the key is always present.
         let warn = Diagnostic::warning("unusedNode", "node has no path to Output", "stray");
         let v = serde_json::to_value(&warn).unwrap();
         assert_eq!(v["severity"], "warning");
         assert!(
-            v.get("port").is_none(),
-            "no-port diagnostic omits `port`: {v}"
+            v.as_object().unwrap().contains_key("port"),
+            "no-port diagnostic still carries the `port` key: {v}"
+        );
+        assert_eq!(
+            v["port"],
+            serde_json::Value::Null,
+            "no-port diagnostic serializes `port` as null: {v}"
         );
         // ...and a payload that omitted `port` still deserializes (serde default).
         let back: Diagnostic = serde_json::from_value(v).unwrap();
@@ -1301,8 +1323,8 @@ mod graph_tests {
 
     #[test]
     fn compile_graph_result_round_trips_clean_and_errored() {
-        // Clean: a source and no diagnostics — `diagnostics` is always present,
-        // `source` is omitted on the wire only when it is `None`.
+        // Clean: a source and no diagnostics — both `source` and `diagnostics`
+        // are always present on the wire.
         let ok = CompileGraphResult {
             source: Some("#version 450\n".to_owned()),
             diagnostics: Diagnostics::new(),
@@ -1316,7 +1338,10 @@ mod graph_tests {
         let back: CompileGraphResult = serde_json::from_value(v).unwrap();
         assert_eq!(ok, back);
 
-        // Errored: no source, carries diagnostics.
+        // Errored: no source, carries diagnostics. `source` ALWAYS serializes as
+        // JSON `null` (not omitted): ts-rs cannot parse `skip_serializing_if`, so
+        // the generated binding is a required `source: string | null` and the wire
+        // shape must match it — the key is always present.
         let mut diags = Diagnostics::new();
         diags.push(Diagnostic::error("cycle", "graph has a cycle", "n1"));
         let err = CompileGraphResult {
@@ -1324,7 +1349,15 @@ mod graph_tests {
             diagnostics: diags,
         };
         let v = serde_json::to_value(&err).unwrap();
-        assert!(v.get("source").is_none(), "no source on error: {v}");
+        assert!(
+            v.as_object().unwrap().contains_key("source"),
+            "errored result still carries the `source` key: {v}"
+        );
+        assert_eq!(
+            v["source"],
+            serde_json::Value::Null,
+            "errored result serializes `source` as null: {v}"
+        );
         let back: CompileGraphResult = serde_json::from_value(v).unwrap();
         assert_eq!(err, back);
     }

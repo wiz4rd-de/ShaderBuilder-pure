@@ -18,6 +18,13 @@ export type CompileGraphResult = {
 /**
  * The emitted `.slang` source, or `None` when the graph had blocking errors
  * (and so was never lowered/emitted).
+ *
+ * Plain `#[serde(default)]` (no `skip_serializing_if`): ts-rs cannot parse
+ * `skip_serializing_if` and would emit a required `source: string | null`
+ * binding while the wire payload omitted the key — a mismatch. Always
+ * serializing `null` when `None` keeps the wire shape and the generated TS
+ * type identical (matching the [`crate::PassSource::WholePassCode`]
+ * `filename` precedent).
  */
 source: string | null, 
 /**

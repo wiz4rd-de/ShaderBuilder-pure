@@ -36,5 +36,12 @@ node: string,
  * The offending port name on [`node`](Diagnostic::node), when the diagnostic
  * is about a specific port (e.g. a type mismatch on an input port); `None`
  * for node-level problems (e.g. a cycle, an unknown parameter).
+ *
+ * Plain `#[serde(default)]` (no `skip_serializing_if`): ts-rs cannot parse
+ * `skip_serializing_if` and would emit a required `port: string | null`
+ * binding while the wire payload omitted the key — a mismatch. Always
+ * serializing `null` when `None` keeps the wire shape and the generated TS
+ * type identical (matching the [`crate::PassSource::WholePassCode`]
+ * `filename` precedent).
  */
 port: string | null, };
