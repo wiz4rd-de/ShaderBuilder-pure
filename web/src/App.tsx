@@ -1,6 +1,9 @@
 import "./App.css";
 import { useCompileLoop } from "./compile/useCompileLoop";
 import { EditorCanvas } from "./editor/EditorCanvas";
+import { ErrorBoundary } from "./feedback/ErrorBoundary";
+import { Toasts } from "./feedback/Toasts";
+import { useEngineEvents } from "./feedback/useEngineEvents";
 import { PanelLayout } from "./panels/PanelLayout";
 import { useDocumentStore } from "./store/documentStore";
 import { PreviewCanvas } from "./preview/PreviewCanvas";
@@ -16,6 +19,10 @@ export default function App() {
   // to the engine preview. Runs for the app's lifetime.
   useCompileLoop();
 
+  // Engine status/error events (#62): the render thread's typed status (live /
+  // last-good / stopped) + render/compile errors → the store + non-blocking toasts.
+  useEngineEvents();
+
   return (
     <div className="app">
       <header className="app__titlebar">
@@ -23,26 +30,34 @@ export default function App() {
         <span className="app__project">{projectName}</span>
       </header>
 
-      <div className="app__body">
-        {/* Editor region — the React Flow node graph (Architecture §A). */}
-        <main className="editor" aria-label="Node editor">
-          <EditorCanvas />
-        </main>
+      {/* An error boundary keeps a render-time exception from white-screening the
+          whole window (#62): the editor + preview subtree fails to a recoverable
+          screen while the title bar + document store stay intact. */}
+      <ErrorBoundary label="Editor">
+        <div className="app__body">
+          {/* Editor region — the React Flow node graph (Architecture §A). */}
+          <main className="editor" aria-label="Node editor">
+            <EditorCanvas />
+          </main>
 
-        {/* Right region — the tabbed panel layout (#48): inspector + the
-            engine-driving panels above the always-visible preview pane. */}
-        <div className="app__right" aria-label="Panels">
-          <PanelLayout />
+          {/* Right region — the tabbed panel layout (#48): inspector + the
+              engine-driving panels above the always-visible preview pane. */}
+          <div className="app__right" aria-label="Panels">
+            <PanelLayout />
 
-          {/* Preview region — the wgpu frame stream blits into a <canvas> here. */}
-          <aside className="preview" aria-label="Preview">
-            <div className="preview__header">Preview</div>
-            <div className="preview__pane">
-              <PreviewCanvas />
-            </div>
-          </aside>
+            {/* Preview region — the wgpu frame stream blits into a <canvas> here. */}
+            <aside className="preview" aria-label="Preview">
+              <div className="preview__header">Preview</div>
+              <div className="preview__pane">
+                <PreviewCanvas />
+              </div>
+            </aside>
+          </div>
         </div>
-      </div>
+      </ErrorBoundary>
+
+      {/* Non-blocking toast stack (#62): transient engine/render/IO failures. */}
+      <Toasts />
     </div>
   );
 }

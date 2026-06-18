@@ -59,4 +59,47 @@ describe("ProblemsPanel", () => {
     expect(store().activePassId).toBe(passId);
     expect(store().selection.nodeIds).toEqual(["theNode"]);
   });
+
+  it("renders an engine-synthesized render error alongside compile problems (#62)", () => {
+    const passId = store().project.passes[0]!.id;
+    store().pushEngineProblem({
+      severity: "error",
+      code: "slangCompile",
+      message: "syntax error near 'foo'",
+      passId,
+      nodeId: null,
+    });
+    render(<ProblemsPanel />);
+    expect(screen.getByText("syntax error near 'foo'")).toBeInTheDocument();
+    expect(screen.getByText("engine")).toBeInTheDocument();
+    // It still navigates to the owning pass (no node to select).
+    fireEvent.click(screen.getByText("syntax error near 'foo'"));
+    expect(store().activePassId).toBe(passId);
+  });
+
+  it("does not navigate for a pipeline-wide engine error with no pass (#62)", () => {
+    store().pushEngineProblem({
+      severity: "error",
+      code: "deviceLost",
+      message: "the GPU device was lost",
+      passId: null,
+      nodeId: null,
+    });
+    render(<ProblemsPanel />);
+    const button = screen.getByText("the GPU device was lost").closest("button")!;
+    expect(button).toBeDisabled();
+  });
+
+  it("clears engine problems when a fresh compile lands (#62)", () => {
+    store().pushEngineProblem({
+      severity: "error",
+      code: "slangCompile",
+      message: "boom",
+      passId: null,
+      nodeId: null,
+    });
+    expect(store().engineProblems).toHaveLength(1);
+    store().setCompileStatus({ diagnosticsByNode: {}, problems: [], valid: true, sourcesByPassId: {} });
+    expect(store().engineProblems).toHaveLength(0);
+  });
 });

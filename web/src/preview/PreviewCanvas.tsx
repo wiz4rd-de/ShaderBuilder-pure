@@ -1,7 +1,16 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 
+import type { EngineStatus } from "../bindings/EngineStatus";
+import { useDocumentStore } from "../store/documentStore";
 import { parseFrame, toArrayBuffer } from "./frame";
+
+/** The label + class suffix for each engine status (#62), badged on the preview. */
+const STATUS_LABEL: Record<EngineStatus, string> = {
+  live: "Live",
+  lastGood: "Last good",
+  stopped: "Render stopped",
+};
 
 const PREVIEW_WIDTH = 512;
 const PREVIEW_HEIGHT = 384;
@@ -18,6 +27,9 @@ export function PreviewCanvas() {
   const [streaming, setStreaming] = useState(true);
   const [fps, setFps] = useState(0);
   const [frameIndex, setFrameIndex] = useState(0);
+  // The engine's liveness state (#62), driven by the `engine-event` stream: badge
+  // whether the pane is live, holding last-good, or render-stopped.
+  const engineStatus = useDocumentStore((s) => s.engineStatus);
 
   useEffect(() => {
     if (!streaming) {
@@ -104,6 +116,14 @@ export function PreviewCanvas() {
         </button>
         <span className="preview__stat">{streaming ? `${fps} fps` : "stopped"}</span>
         <span className="preview__stat">frame {frameIndex}</span>
+        {streaming && engineStatus ? (
+          <span
+            className={`preview__status preview__status--${engineStatus}`}
+            data-testid="preview-status"
+          >
+            {STATUS_LABEL[engineStatus]}
+          </span>
+        ) : null}
       </div>
     </div>
   );

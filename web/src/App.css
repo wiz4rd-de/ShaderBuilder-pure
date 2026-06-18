@@ -1400,3 +1400,132 @@
   display: flex;
   gap: 6px;
 }
+
+/* ---- Error UX (#62): toasts, engine status badge, error boundary ---- */
+
+/* Engine status badge on the preview stats row. */
+.preview__status {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+}
+.preview__status--live {
+  color: #7ee0a0;
+  border-color: #2f6b46;
+}
+.preview__status--lastGood {
+  color: #e6c25a;
+  border-color: #6b5a2f;
+}
+.preview__status--stopped {
+  color: #e6705a;
+  border-color: #6b352f;
+}
+
+/* Engine-origin tag on a problems row. */
+.problems__origin {
+  color: #e6c25a;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.problems__jump:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+/* Non-blocking toast stack, bottom-right. */
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 380px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.toast--error {
+  border-left: 3px solid #e6705a;
+}
+.toast--warning {
+  border-left: 3px solid #e6c25a;
+}
+.toast--info {
+  border-left: 3px solid var(--accent);
+}
+.toast__message {
+  flex: 1 1 auto;
+  line-height: 1.35;
+}
+.toast__dismiss {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.toast__dismiss:hover {
+  color: var(--text);
+}
+
+/* Recoverable error-boundary fallback. */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+}
+.error-boundary__card {
+  max-width: 460px;
+  text-align: center;
+  padding: 24px;
+  border: 1px solid #6b352f;
+  border-radius: 8px;
+  background: var(--panel);
+}
+.error-boundary__title {
+  margin: 0 0 8px;
+  font-size: 16px;
+  color: #e6705a;
+}
+.error-boundary__message {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+  word-break: break-word;
+}
+.error-boundary__retry {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 16px;
+  cursor: pointer;
+}
+.error-boundary__retry:hover {
+  border-color: var(--accent);
+}
