@@ -918,10 +918,21 @@ impl Project {
             message: e.to_string(),
         })?;
         json.push('\n');
-        std::fs::write(path, json).map_err(|e| ProjectSaveError::Io {
+        // Write atomically: serialize to a sibling `<path>.tmp`, then rename over
+        // the destination. A crash/power-loss/kill mid-write leaves the temp file
+        // (which the next save overwrites) instead of a truncated project at the
+        // user's real path — the #63 recovery is built on top of this canonical
+        // save, so a half-written destination must never be observable.
+        let path = path.as_ref();
+        let io_err = |e: std::io::Error| ProjectSaveError::Io {
             error_kind: format!("{:?}", e.kind()),
             message: e.to_string(),
-        })
+        };
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, json).map_err(io_err)?;
+        std::fs::rename(&tmp, path).map_err(io_err)
     }
 
     /// Load a project from a single `.json` file at `path` (Spec §6, #38) — the
@@ -1888,6 +1899,54 @@ mod tests {
         // The written file ends in a newline (tool-friendly) but still parses.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.ends_with('\n'));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_to_file_is_atomic_via_tmp_rename() {
+        // F9: a user save must go through `<path>.tmp` + rename so a crash mid-write
+        // can never leave a truncated project at the real path. We prove the
+        // tmp+rename path two ways: (1) a successful save leaves no `.tmp` sibling
+        // (it was renamed away), and (2) when the rename target's *parent* makes the
+        // final write impossible, the pre-existing destination is left untouched.
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(format!("sb-atomic-{unique}.json"));
+        let tmp = std::env::temp_dir().join(format!("sb-atomic-{unique}.json.tmp"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+
+        let project = Project::empty("Atomic");
+        project.save_to_file(&path).expect("save");
+        // The temp file was renamed onto the destination, not left behind.
+        assert!(
+            !tmp.exists(),
+            "tmp sibling must not survive a successful save"
+        );
+        assert!(path.exists());
+
+        // Prove the write GOES THROUGH `<path>.tmp` (fails-before the fix): plant a
+        // *directory* at `<path>.tmp` so the temp write cannot succeed. The atomic
+        // writer must error here; a direct `write(path, ..)` would ignore the tmp
+        // path entirely and succeed, so this assertion only holds with the fix —
+        // and crucially the pre-existing destination is left untouched.
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir(&tmp).expect("plant a dir where the tmp file would go");
+        let err = project.save_to_file(&path).unwrap_err();
+        assert!(
+            matches!(err, ProjectSaveError::Io { .. }),
+            "tmp write must fail when its path is occupied by a dir: {err:?}"
+        );
+        // The destination still has its original contents — never truncated.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let _ = std::fs::remove_dir(&tmp);
         let _ = std::fs::remove_file(&path);
     }
 
