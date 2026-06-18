@@ -12,6 +12,7 @@ import { useState } from "react";
 import { HelpDialog } from "../help/HelpDialog";
 import { useRecents } from "./useRecents";
 import { openRecent } from "../session/projectActions";
+import { useDocumentStore } from "../store/documentStore";
 import { useOnboardingStore } from "./onboardingStore";
 import {
   startExample,
@@ -26,10 +27,15 @@ export function StartScreen() {
   const markStarted = useOnboardingStore((s) => s.markStarted);
 
   const openRecentAndEnter = (path: string): void => {
+    // openRecent toasts + drops nothing on a missing/malformed file, leaving the
+    // path unchanged. Mirror startOpen (F19): only enter the editor when the load
+    // actually replaced the current project path — otherwise stay on the start
+    // screen rather than dismissing onto a stale empty editor.
+    const before = useDocumentStore.getState().currentProjectPath;
     void openRecent(path).then(() => {
-      // openRecent toasts + drops nothing on a missing file; only enter the editor
-      // if the load actually replaced the path. Re-checking here mirrors startOpen.
-      markStarted();
+      if (useDocumentStore.getState().currentProjectPath !== before) {
+        markStarted();
+      }
     });
   };
 
