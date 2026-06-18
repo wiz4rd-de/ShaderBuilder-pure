@@ -111,10 +111,9 @@ fn item_path(dir: &Path, id: &str) -> std::path::PathBuf {
 pub fn save_item(dir: &Path, item: &LibraryItem) -> Result<(), LibraryError> {
     std::fs::create_dir_all(dir).map_err(io_err)?;
 
-    let mut json =
-        serde_json::to_string_pretty(item).map_err(|e| LibraryError::Malformed {
-            message: e.to_string(),
-        })?;
+    let mut json = serde_json::to_string_pretty(item).map_err(|e| LibraryError::Malformed {
+        message: e.to_string(),
+    })?;
     json.push('\n');
 
     let final_path = item_path(dir, &item.id);
