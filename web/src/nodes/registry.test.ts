@@ -36,6 +36,11 @@ describe("node-descriptor registry", () => {
       "builtin.finalViewportSize",
       "builtin.frameCount",
       "builtin.frameDirection",
+      // math + vector (#50)
+      "math",
+      "swizzle",
+      "split",
+      "combine",
       // output
       "output",
     ];
