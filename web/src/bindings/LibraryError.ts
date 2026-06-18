@@ -27,4 +27,8 @@ message: string, } | { "kind": "notFound",
 /**
  * The id that was not found.
  */
+id: string, } | { "kind": "invalidId", 
+/**
+ * The rejected id.
+ */
 id: string, };
