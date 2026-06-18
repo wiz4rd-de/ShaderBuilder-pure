@@ -125,6 +125,16 @@ export const customSnippetDescriptor: NodeDescriptor = {
       [OUTPUTS_KEY]: signature.outputs.map((p) => ({ name: p.name, type: p.type })),
     }),
   },
+  prevalidate: (data: NodeData) => {
+    const body = readString(data, BODY_KEY, "");
+    const unresolved = unresolvedSnippetPorts(body, {
+      inputs: snippetInputs(data),
+      outputs: snippetOutputs(data),
+    });
+    return unresolved.map(
+      (name) => `Port "${name}" is declared but never referenced in the body.`,
+    );
+  },
   toNodeOp: (data: NodeData) => {
     const inputs = snippetInputs(data);
     const outputs = snippetOutputs(data);

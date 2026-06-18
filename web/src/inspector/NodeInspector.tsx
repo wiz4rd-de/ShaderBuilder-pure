@@ -26,6 +26,9 @@ export function NodeInspector({ node }: NodeInspectorProps): React.JSX.Element {
   const outputs = descriptor.outputs(data);
   const fields = descriptor.inspector(data);
   const editablePorts = descriptor.editablePorts;
+  // A cheap, non-authoritative pre-check (only the custom-snippet node has one);
+  // compile_graph (#54) is the real validator, so these render as soft warnings.
+  const preWarnings = descriptor.prevalidate?.(data) ?? [];
 
   return (
     <div className="inspector__node">
@@ -59,6 +62,20 @@ export function NodeInspector({ node }: NodeInspectorProps): React.JSX.Element {
           <PortList title="Outputs" ports={outputs} />
         </section>
       )}
+
+      {preWarnings.length > 0 ? (
+        <section className="inspector__section inspector__diagnostics">
+          {preWarnings.map((message, i) => (
+            <div
+              key={`pre-${i}`}
+              className="inspector__diagnostic inspector__diagnostic--warning"
+            >
+              <span className="inspector__diagnostic-code">port</span>
+              <span className="inspector__diagnostic-message">{message}</span>
+            </div>
+          ))}
+        </section>
+      ) : null}
 
       {diagnostics && diagnostics.length > 0 ? (
         <section className="inspector__section inspector__diagnostics">

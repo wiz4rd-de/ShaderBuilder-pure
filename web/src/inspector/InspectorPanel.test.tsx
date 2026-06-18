@@ -105,6 +105,48 @@ describe("InspectorPanel — editing writes back into the document", () => {
   });
 });
 
+describe("InspectorPanel — custom snippet (#52)", () => {
+  it("shows the code body field and the editable port editor", () => {
+    addAndSelect("customSnippet");
+    renderPanel();
+    expect(screen.getByText("Body (slang)")).toBeInTheDocument();
+    // Editable-port controls (rename/retype/add) render for the snippet.
+    expect(screen.getByLabelText("Inputs port 0 name")).toBeInTheDocument();
+    expect(screen.getByLabelText("Outputs port 0 name")).toBeInTheDocument();
+  });
+
+  it("editing the body writes back into node.data", () => {
+    const id = addAndSelect("customSnippet");
+    renderPanel();
+    const body = screen.getByLabelText("Body (slang)") as HTMLTextAreaElement;
+    fireEvent.change(body, { target: { value: "result = color;" } });
+    fireEvent.blur(body);
+    expect(nodeData(id).body).toBe("result = color;");
+  });
+
+  it("renaming an input port keeps it editable + lowers with the new name", () => {
+    const id = addAndSelect("customSnippet");
+    renderPanel();
+    fireEvent.change(screen.getByLabelText("Inputs port 0 name"), {
+      target: { value: "rgb" },
+    });
+    const inputs = nodeData(id).inputs as { name: string }[];
+    expect(inputs[0]!.name).toBe("rgb");
+  });
+
+  it("surfaces a pre-check warning for a port the body never references", () => {
+    // Default body references `color`/`result`; rename the input so it no longer
+    // appears in the body — the cheap pre-check flags it (compile_graph is #54).
+    addAndSelect("customSnippet", {
+      body: "result = vec4(1.0);",
+      inputs: [{ name: "color", type: "vec4" }],
+      outputs: [{ name: "result", type: "vec4" }],
+    });
+    renderPanel();
+    expect(screen.getByText(/declared but never referenced/i)).toBeInTheDocument();
+  });
+});
+
 describe("InspectorPanel — diagnostics", () => {
   it("renders diagnostics keyed by the node id", () => {
     const id = addAndSelect("source");

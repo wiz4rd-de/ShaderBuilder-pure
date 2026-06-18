@@ -117,6 +117,14 @@ export interface NodeDescriptor<D extends NodeData = NodeData> {
    * ports are fixed by the descriptor and the inspector shows them read-only.
    */
   editablePorts?: EditablePorts<D>;
+  /**
+   * An optional CHEAP, non-authoritative pre-check the inspector surfaces as
+   * inline warnings (only the custom-snippet node, #52, has one — it flags a
+   * declared port the body never references). The AUTHORITATIVE validation is
+   * `compile_graph`'s diagnostics (#54); this is purely an early-feedback nicety.
+   * Returns one human message per problem, empty when the node looks well-formed.
+   */
+  prevalidate?: (data: D) => string[];
 }
 
 /** A node's full editable port signature (custom-snippet, #52). */
