@@ -35,10 +35,12 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod engine;
+pub mod inspect;
 pub mod ir;
 pub mod library;
 
 pub use engine::{EngineErrorEvent, EngineEvent, EngineSeverity, EngineStatus};
+pub use inspect::{PixelFormat, PixelSample};
 pub use library::{delete_item, list_items, save_item, LibraryError};
 
 use crate::ir::PortType;
