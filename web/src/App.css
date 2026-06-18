@@ -1215,3 +1215,101 @@
 .editor__compile--pending {
   color: var(--muted);
 }
+
+/* ---- Generated-code viewer (#55) ---------------------------------------- */
+.codeview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.codeview__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.codeview__title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.codeview__readonly {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.codeview__copy {
+  margin-left: auto;
+}
+
+.codeview__note {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 8px;
+  line-height: 1.4;
+}
+
+.codeview__banner {
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+}
+
+.codeview__banner--stale {
+  color: #d6a635;
+  border: 1px solid #6b5520;
+  background: rgba(214, 166, 53, 0.08);
+}
+
+.codeview__pre {
+  margin: 0;
+  overflow: auto;
+  max-height: 50vh;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  padding: 10px 12px;
+}
+
+.codeview__code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 2;
+}
+
+/* Token colours (a muted, readable palette over the dark canvas). */
+.tok--comment {
+  color: #6a7b6a;
+  font-style: italic;
+}
+.tok--directive {
+  color: #c08bd6;
+}
+.tok--keyword {
+  color: #d6896b;
+}
+.tok--type {
+  color: #6bb3d6;
+}
+.tok--builtin {
+  color: #8bd6a8;
+}
+.tok--number {
+  color: #d6c86b;
+}
+.tok--string {
+  color: #d6a86b;
+}
+.tok--punctuation {
+  color: var(--muted);
+}

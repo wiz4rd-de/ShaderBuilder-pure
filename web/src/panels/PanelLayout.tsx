@@ -5,6 +5,7 @@
 // inline — App now just renders <PanelLayout/>.
 import { useState } from "react";
 
+import { GeneratedCodePanel } from "../codeview/GeneratedCodePanel";
 import { ProblemsPanel } from "../compile/ProblemsPanel";
 import { InspectorPanel } from "../inspector/InspectorPanel";
 import { ParameterPanel } from "../parameters/ParameterPanel";
@@ -13,7 +14,14 @@ import { PassSettingsPanel } from "./PassSettingsPanel";
 import { SourcePanel } from "./SourcePanel";
 import { ViewportPanel } from "./ViewportPanel";
 
-type TabId = "inspector" | "params" | "pass" | "viewport" | "source" | "problems";
+type TabId =
+  | "inspector"
+  | "params"
+  | "pass"
+  | "viewport"
+  | "source"
+  | "code"
+  | "problems";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "inspector", label: "Inspector" },
@@ -21,6 +29,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "pass", label: "Pass" },
   { id: "viewport", label: "Viewport" },
   { id: "source", label: "Source" },
+  { id: "code", label: "Code" },
   { id: "problems", label: "Problems" },
 ];
 
@@ -60,6 +69,7 @@ export function PanelLayout(): React.JSX.Element {
         {active === "pass" && <PassSettingsPanel />}
         {active === "viewport" && <ViewportPanel />}
         {active === "source" && <SourcePanel />}
+        {active === "code" && <GeneratedCodePanel />}
         {active === "problems" && <ProblemsPanel />}
       </div>
     </section>
