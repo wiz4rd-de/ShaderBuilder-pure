@@ -20,6 +20,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 
 import type { Recovery } from "../bindings/Recovery";
+import { useOnboardingStore } from "../onboarding/onboardingStore";
 import { useConfirmStore } from "./confirmStore";
 import { useDocumentStore } from "../store/documentStore";
 import { useToastStore } from "../feedback/toastStore";
@@ -153,6 +154,8 @@ export function useSession(deps: SessionHookDeps = defaultDeps): void {
         }
         if (choice === "confirm") {
           await restoreRecovery(recovery.project, recovery.meta.projectPath ?? null);
+          // A restored doc skips the start screen (#66): the user has work to edit.
+          useOnboardingStore.getState().markStarted();
           useToastStore.getState().push("info", "Recovered unsaved work.");
         } else {
           // Discard / cancel: drop the recovery so we do not re-offer it.

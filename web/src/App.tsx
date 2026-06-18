@@ -5,6 +5,9 @@ import { ExportDialog } from "./export/ExportDialog";
 import { ErrorBoundary } from "./feedback/ErrorBoundary";
 import { Toasts } from "./feedback/Toasts";
 import { useEngineEvents } from "./feedback/useEngineEvents";
+import { HelpButton } from "./help/HelpButton";
+import { StartScreen } from "./onboarding/StartScreen";
+import { useOnboardingStore } from "./onboarding/onboardingStore";
 import { PanelLayout } from "./panels/PanelLayout";
 import { ConfirmDialog } from "./session/ConfirmDialog";
 import { FileMenu } from "./session/FileMenu";
@@ -20,6 +23,10 @@ export default function App() {
   const projectName = useDocumentStore((s) => s.project.name);
   const dirty = useDocumentStore((s) => s.dirty);
   const currentProjectPath = useDocumentStore((s) => s.currentProjectPath);
+
+  // First-run start screen (#66): shown until the user picks a starting point
+  // (New / Open / Import / Open example) or restores recovered work this launch.
+  const started = useOnboardingStore((s) => s.started);
 
   // The debounced live compile loop (#54): document edits → graphToIr →
   // compile_graph per pass → node-keyed diagnostics + the generated chain pushed
@@ -39,6 +46,7 @@ export default function App() {
       <header className="app__titlebar">
         ShaderBuilder <span className="app__phase">editor</span>
         <FileMenu />
+        <HelpButton />
         <span className="app__project">
           {/* `*` marks unsaved edits (#63). */}
           {dirty ? "* " : ""}
@@ -86,6 +94,12 @@ export default function App() {
 
       {/* The export-bundle dialog (#64): destination + name + validation gate. */}
       <ExportDialog />
+
+      {/* First-run START SCREEN (#66): a full-window welcome cover shown until the
+          user picks New / Open / Import / Open example (or recovers work). Rendered
+          last so it sits ABOVE the editor, which stays mounted underneath to keep
+          the compile/preview/session hooks alive. */}
+      {started ? null : <StartScreen />}
     </div>
   );
 }

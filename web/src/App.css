@@ -2058,3 +2058,244 @@
   font-size: 13px;
   color: var(--error, #e06666);
 }
+
+/* --- Help button + dialog (#66) --- */
+.helpbutton {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  padding: 2px 10px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.helpbutton:hover {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.helpdialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.helpdialog {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 22px 22px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+}
+.helpdialog__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.helpdialog__title {
+  margin: 0;
+  font-size: 18px;
+}
+.helpdialog__close {
+  font-size: 20px;
+  line-height: 1;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.helpdialog__close:hover {
+  color: var(--text);
+}
+.helpdialog__section {
+  margin-top: 14px;
+}
+.helpdialog__heading {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+.helpdialog__text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.helpdialog__text code,
+.helpdialog__note code {
+  color: var(--text);
+}
+.helpdialog__shortcut-group {
+  margin-top: 10px;
+}
+.helpdialog__shortcut-group-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.helpdialog__shortcuts {
+  width: 100%;
+  border-collapse: collapse;
+}
+.helpdialog__shortcut-label {
+  text-align: left;
+  font-weight: 400;
+  font-size: 13px;
+  padding: 3px 0;
+  width: 55%;
+}
+.helpdialog__shortcut-keys {
+  text-align: right;
+  font-size: 13px;
+}
+.helpdialog__or {
+  color: var(--muted);
+  font-size: 12px;
+}
+.helpdialog__kbd,
+.helpdialog kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  font: inherit;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.helpdialog__note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* --- First-run start screen (#66) --- */
+.startscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  overflow: auto;
+  padding: 24px;
+}
+.startscreen__panel {
+  width: min(680px, 94vw);
+}
+.startscreen__title {
+  margin: 0 0 4px;
+  font-size: 28px;
+}
+.startscreen__subtitle {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 8px;
+}
+.startscreen__lead {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.startscreen__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.startscreen__action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  color: inherit;
+}
+.startscreen__action:hover {
+  border-color: var(--accent);
+}
+.startscreen__action--primary {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.startscreen__action-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.startscreen__action-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+.startscreen__recents {
+  margin-top: 22px;
+}
+.startscreen__recents-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.startscreen__recents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.startscreen__recent {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  gap: 1px;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: inherit;
+}
+.startscreen__recent:hover {
+  background: var(--panel);
+}
+.startscreen__recent-name {
+  font-size: 13px;
+}
+.startscreen__recent-path {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.startscreen__footer {
+  margin-top: 24px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.startscreen__help-link {
+  font: inherit;
+  font-size: 13px;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+}
+.startscreen__help-link:hover {
+  text-decoration: underline;
+}
