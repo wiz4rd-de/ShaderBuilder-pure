@@ -17,6 +17,7 @@ import {
   ReactFlowProvider,
   useReactFlow,
   type Connection,
+  type IsValidConnection,
   type EdgeChange,
   type NodeChange,
   type OnSelectionChangeParams,
@@ -29,6 +30,7 @@ import { PipelineBreadcrumb } from "../pipeline/PipelineBreadcrumb";
 import { PipelineCanvas } from "../pipeline/PipelineCanvas";
 import { PipelineToolbar } from "../pipeline/PipelineToolbar";
 import { NODE_TYPES } from "../nodes/nodeTypes";
+import { judgeConnection } from "../nodes/portTypeChecking";
 import { isSubgraphNode } from "../nodes/subgraph";
 import { useDocumentStore } from "../store/documentStore";
 import { WholePassEditor } from "../wholePass/WholePassEditor";
@@ -94,19 +96,40 @@ function PassGraph() {
       if (!conn.source || !conn.target) {
         return;
       }
-      // CONNECTION VALIDITY (#54): the AUTHORITATIVE type-checking + connection
-      // validity live in the Rust `ir` crate (Phase 4) and are reported back to
-      // the editor as compile diagnostics (inline node badges + the Problems
-      // panel) by the live compile loop (compile/useCompileLoop.ts). We accept any
-      // structurally-valid edge here (the store still rejects self-loops and a
-      // double-connection into one target port) and let the checker flag a TYPE
-      // mismatch after the fact. The STRICT in-editor type-checked rule — rejecting
-      // an incompatible edge at DRAG TIME (e.g. blocking a vec4→float drop) — is
-      // DEFERRED to Phase 7; that needs port-type resolution on the React Flow
-      // handles, which is out of scope for the Phase-5 compile loop.
+      // The edge is type-checked at DRAG time by `isValidConnection` below (#65),
+      // so by the time onConnect fires the wire is already known compatible. The
+      // store's `addEdge` re-applies the SAME `judgeConnection` verdict as a
+      // belt-and-braces guard (and still rejects self-loops / dup-target ports);
+      // any residual type-mismatch the checker can only see with full operand
+      // inference still surfaces as a live compile diagnostic.
       addEdge(conn.source, conn.sourceHandle ?? "", conn.target, conn.targetHandle ?? "");
     },
     [addEdge],
+  );
+
+  // DRAG-TIME connection legality (#65): React Flow consults this on every
+  // candidate connection while dragging a wire. We resolve both endpoint port
+  // types from the live node descriptors + data and apply the SAME edge-legality
+  // predicate the IR uses (proven by the cross-language parity golden), so an
+  // incompatible drop (e.g. a vec4 sampler output into a tightened vec2 coord, or
+  // a sampler2D into a float) is REFUSED before it ever reaches compile_graph.
+  // A wire we cannot judge (unknown kind / dropped port) is permitted — the
+  // authoritative compiler still runs. Returning false also drives React Flow's
+  // per-handle `valid`/`invalid` connection-state classes (the drag affordance).
+  const isValidConnection = useCallback<IsValidConnection>(
+    (conn) => {
+      if (!conn.source || !conn.target || conn.source === conn.target) {
+        return false;
+      }
+      return judgeConnection(
+        graph,
+        conn.source,
+        conn.sourceHandle ?? "",
+        conn.target,
+        conn.targetHandle ?? "",
+      ).legal;
+    },
+    [graph],
   );
 
   // Mirror RF's selection into the store so toolbar/status/keyboard agree.
@@ -165,6 +188,7 @@ function PassGraph() {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          isValidConnection={isValidConnection}
           onSelectionChange={onSelectionChange}
           onNodeDoubleClick={onNodeDoubleClick}
           onNodeDragStart={onNodeDragStart}

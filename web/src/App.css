@@ -350,6 +350,25 @@
   opacity: 0.8;
 }
 
+/* ---- Drag-time connection affordances (#65) ---------------------------------
+ * While a wire is being dragged, React Flow tags candidate handles: the source
+ * handle gets `.connectingfrom`, a hovered target gets `.connectingto`, and a
+ * type-COMPATIBLE target (per our `isValidConnection`) additionally gets
+ * `.valid`. We highlight compatible handles and dim incompatible ones so the
+ * legal drop targets are obvious before release. */
+.react-flow__handle.connectionindicator.valid {
+  box-shadow: 0 0 0 3px rgba(127, 201, 127, 0.45);
+  transform: scale(1.25);
+}
+.react-flow__handle.connectingto:not(.valid) {
+  opacity: 0.3;
+  box-shadow: 0 0 0 2px rgba(230, 90, 90, 0.5);
+}
+/* The handle the drag started from reads as active. */
+.react-flow__handle.connectingfrom {
+  transform: scale(1.25);
+}
+
 /* ---- Pipeline view + breadcrumb (#46) ---- */
 .pipeline-breadcrumb {
   flex: 0 0 auto;

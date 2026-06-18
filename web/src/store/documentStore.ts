@@ -58,6 +58,7 @@ import {
 } from "./factories";
 import { collapseSelection, expandSubgraph } from "./collapse";
 import { SUBGRAPH_KIND } from "../nodes/subgraph";
+import { judgeConnection } from "../nodes/portTypeChecking";
 import { cloneSnapshot, deepClone, type DocSnapshot } from "./snapshot";
 import { resolveGraph, replaceGraph, subgraphAt } from "./subgraphNav";
 import { nextId } from "./ids";
@@ -665,6 +666,14 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         (e) => e.target === target && e.targetPort === targetPort,
       );
       if (dup) {
+        return null;
+      }
+      // Reject a type-incompatible wire (#65) — the SAME `judgeConnection`
+      // verdict the canvas `isValidConnection` hook uses, applied here too so
+      // programmatic adds (paste, future API) can never slip an illegal edge
+      // past the type system. An UNJUDGEABLE edge (unknown kind / dropped port)
+      // is allowed through — compile_graph remains the authority for those.
+      if (!judgeConnection(g, source, sourcePort, target, targetPort).legal) {
         return null;
       }
       const edge = makeEdge(source, sourcePort, target, targetPort);
