@@ -195,8 +195,15 @@ export async function compileProject(
     }
 
     const g = plan.graph!;
-    // graphToIr issues (a dropped/unknown node) surface as synthetic diagnostics
-    // on the offending node id, so the editor flags them inline too.
+    // graphToIr issues (a dropped/unknown node, or a sampler that references a
+    // removed pass) surface as synthetic ERROR diagnostics on the offending node
+    // id, so the editor flags them inline too. A dropped node leaves the emitted
+    // IrGraph structurally incomplete (e.g. a dangling sampler removed from a
+    // mis-wired chain), so the pass is UNRENDERABLE: we do NOT dispatch its
+    // source to the preview even if compile_graph still returns one. This keeps
+    // the FRONTEND authoritative about refusing a mis-wired chain (the Rust
+    // per-pass checker cannot see pipeline indices, so it cannot detect a
+    // dangling pass reference itself).
     const passDiags: Diagnostic[] = g.issues.map(issueToDiagnostic);
 
     const result = await invokeCompile({
@@ -214,7 +221,7 @@ export async function compileProject(
     }
     passes.push({
       passId: plan.passId,
-      source: result.source,
+      source: g.issues.length > 0 ? null : result.source,
       settings: plan.settings,
       diagnostics: passDiags,
     });

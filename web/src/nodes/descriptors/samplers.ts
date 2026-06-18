@@ -7,6 +7,7 @@
 import type { TextureSource } from "../../bindings/TextureSource";
 import { readInteger, readString, requireString } from "../data";
 import type { InspectorField, NodeData, NodeDescriptor, PortSpec } from "../types";
+import { NodeLoweringError } from "../types";
 
 /** Every sampler exposes a required vec2 coord input. */
 const SAMPLER_INPUTS: PortSpec[] = [{ name: "coord", type: "vec2", label: "UV" }];
@@ -52,10 +53,21 @@ function indexedSampler(
     outputs: () => SAMPLER_OUTPUTS,
     defaultData: () => ({ index: 0 }),
     inspector: () => inspector,
-    toNodeOp: (data: NodeData) => ({
-      kind: "sample",
-      texture: { kind, index: Math.max(0, readInteger(data, "index", 0)) },
-    }),
+    toNodeOp: (data: NodeData) => {
+      const index = readInteger(data, "index", 0);
+      // A NEGATIVE index is the dangling/out-of-range sentinel removePass writes
+      // (DANGLING_INDEX = -1) when the referenced pass was deleted — see
+      // pipeline/passOps.ts. TextureSource.index is a Rust u32, so a negative
+      // index cannot round-trip over IPC: instead of silently clamping it to 0
+      // (which would re-point the sampler at PassOutput0/PassFeedback0 and
+      // mis-wire the chain), we REFUSE to lower it. graphToIr catches this as a
+      // node-keyed lowering error so the editor flags the offending node inline
+      // and the pipeline is marked invalid (never dispatched to the preview).
+      if (index < 0) {
+        throw new NodeLoweringError(kind, "samples a removed pass — rewire it");
+      }
+      return { kind: "sample", texture: { kind, index } };
+    },
   };
 }
 

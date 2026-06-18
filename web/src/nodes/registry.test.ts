@@ -10,6 +10,7 @@ import {
   nonEmptyCategories,
   requireDescriptor,
 } from "./registry";
+import { NodeLoweringError } from "./types";
 
 describe("node-descriptor registry", () => {
   it("registers every #49 boundary node kind", () => {
@@ -164,15 +165,26 @@ describe("sampler descriptors", () => {
     });
   });
 
-  it("indexed samplers default + clamp a missing/negative index to 0", () => {
+  it("indexed samplers default a missing index to 0", () => {
     expect(requireDescriptor("passOutput").toNodeOp({})).toEqual({
       kind: "sample",
       texture: { kind: "passOutput", index: 0 },
     });
-    expect(requireDescriptor("passOutput").toNodeOp({ index: -4 })).toEqual({
-      kind: "sample",
-      texture: { kind: "passOutput", index: 0 },
-    });
+  });
+
+  it("a dangling/negative index throws rather than silently clamping to 0", () => {
+    // DANGLING_INDEX (-1) is the sentinel removePass writes when the referenced
+    // pass is deleted (pipeline/passOps.ts). TextureSource.index is a Rust u32,
+    // so a negative index must NOT round-trip — and must NOT be clamped to 0
+    // (which would re-point the sampler at PassOutput0 and mis-wire the chain).
+    for (const kind of ["passOutput", "passFeedback", "originalHistory"] as const) {
+      expect(() => requireDescriptor(kind).toNodeOp({ index: -1 })).toThrow(
+        /removed pass/,
+      );
+      expect(() => requireDescriptor(kind).toNodeOp({ index: -4 })).toThrow(
+        NodeLoweringError,
+      );
+    }
   });
 
   it("LUT lowers to a named TextureSource + reports its LUT name", () => {
