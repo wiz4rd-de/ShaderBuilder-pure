@@ -1,9 +1,12 @@
+/// <reference types="vitest/config" />
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 
 // Vite config tuned for Tauri (https://v2.tauri.app/start/frontend/vite/):
 // a fixed dev-server port Tauri's `devUrl` points at, and no terminal clearing
-// so Rust and Vite logs interleave cleanly.
+// so Rust and Vite logs interleave cleanly. The `test` block configures the
+// vitest component-test runner (#45): a jsdom DOM, global expect/describe, and
+// a setup file that wires the @testing-library/jest-dom matchers.
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
@@ -22,5 +25,13 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: true,
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
+    css: false,
+    // Component + store tests live next to their subjects as *.test.ts(x).
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 });
