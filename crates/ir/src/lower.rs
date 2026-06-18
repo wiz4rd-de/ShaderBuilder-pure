@@ -206,6 +206,13 @@ pub struct LoweredIr {
     pub stmts: Vec<SsaStmt>,
     /// The temp whose value is written to `FragColor` (the `Output.color` source).
     pub output: TempId,
+    /// The [`PortType`] of the [`output`](LoweredIr::output) temp. `FragColor` is
+    /// a `vec4`, so when this is a scalar (`Float`/`Int`) the emitter broadcasts it
+    /// with `FragColor = vec4(<temp>);` (the documented `Float→vecN` scalar-color
+    /// shorthand the type checker honors on `Output.color`); when it is already
+    /// `Vec4` the emitter writes it verbatim. Carried here so the emitter knows the
+    /// source type at the write site without re-scanning the SSA stream.
+    pub output_ty: PortType,
     /// The resource manifest (params/builtins/samplers/textures).
     pub manifest: PassManifest,
 }
@@ -287,12 +294,22 @@ pub fn lower(graph: &IrGraph, ctx: &LowerContext) -> Result<LoweredIr, LowerErro
     let output = builder
         .input_temp(output_id, "color")
         .ok_or(LowerError::NoOutput)?;
+    // The type of that source temp, so the emitter can broadcast a scalar source
+    // into the vec4 `FragColor` (the `Float→vecN` shorthand) and leave a vec4
+    // source verbatim. The producing statement is guaranteed present in `stmts`.
+    let output_ty = builder
+        .stmts
+        .iter()
+        .find(|s| s.result == output)
+        .map(|s| s.ty)
+        .unwrap_or(PortType::Vec4);
 
     let manifest = collect_manifest(&builder);
 
     Ok(LoweredIr {
         stmts: builder.stmts,
         output,
+        output_ty,
         manifest,
     })
 }

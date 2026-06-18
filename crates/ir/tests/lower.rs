@@ -533,3 +533,35 @@ fn custom_snippet_lowers_with_operand_and_result_temps() {
         unreachable!();
     }
 }
+
+// ----------------------------------------------------------------------------
+// `output_ty`: the lowered type of the FragColor source temp
+// ----------------------------------------------------------------------------
+
+#[test]
+fn output_ty_reflects_the_fragcolor_source_temp_type() {
+    // A scalar `Const(Float)` straight into `Output.color`: `output_ty` is Float,
+    // so the emitter knows to broadcast it into the vec4 `FragColor`.
+    let scalar = IrGraph {
+        nodes: vec![const_float("gray", 0.5), output("out")],
+        edges: vec![IrEdge::new("gray", "out", "out", "color")],
+    };
+    let lowered = lower(&scalar, &CheckContext::new()).expect("lowers clean");
+    assert_eq!(
+        lowered.output_ty,
+        PortType::Float,
+        "a scalar Const feeding Output.color lowers with output_ty = Float"
+    );
+    // And it is the type of the statement that produces the output temp.
+    let out_stmt = lowered
+        .stmts
+        .iter()
+        .find(|s| s.result == lowered.output)
+        .expect("output temp is produced by a statement");
+    assert_eq!(out_stmt.ty, lowered.output_ty);
+
+    // A vec4 source (the demo's vec4 mul) lowers with output_ty = Vec4 (verbatim
+    // write, no broadcast).
+    let demo = lower(&demo_graph(), &CheckContext::new()).expect("lowers clean");
+    assert_eq!(demo.output_ty, PortType::Vec4);
+}
