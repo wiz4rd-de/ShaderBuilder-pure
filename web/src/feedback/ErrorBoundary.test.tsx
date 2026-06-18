@@ -1,30 +1,28 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ErrorBoundary } from "./ErrorBoundary";
 
-/** A child that throws on first render, then renders fine after `reset` flips it. */
-function Bomb({ explode }: { explode: boolean }): React.JSX.Element {
-  if (explode) {
+/**
+ * Whether the child should throw on its next render. This lives at MODULE scope —
+ * OUTSIDE the boundary subtree — so flipping it to false before clicking "Try
+ * again" lets the boundary's `reset()` re-render the subtree to a healthy state.
+ * The boundary re-reads it on every render attempt, so recovery is genuinely
+ * proven: if `reset()` were a no-op the fallback would persist and the test fails.
+ */
+let shouldThrow = true;
+
+/** A child that throws while `shouldThrow`, then renders fine once it is flipped. */
+function Bomb(): React.JSX.Element {
+  if (shouldThrow) {
     throw new Error("kaboom");
   }
   return <div>safe content</div>;
 }
 
-/** Wraps the boundary so a test can re-render its child as non-throwing. */
-function Host(): React.JSX.Element {
-  const [explode, setExplode] = useState(true);
-  return (
-    <ErrorBoundary label="Editor">
-      <button onClick={() => setExplode(false)}>fix it</button>
-      <Bomb explode={explode} />
-    </ErrorBoundary>
-  );
-}
-
 let spy: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
+  shouldThrow = true;
   // React logs the caught error to console.error; silence it for a clean run.
   spy = vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -45,7 +43,7 @@ describe("ErrorBoundary", () => {
   it("shows a recoverable fallback (not a blank window) when a child throws", () => {
     render(
       <ErrorBoundary label="Editor">
-        <Bomb explode />
+        <Bomb />
       </ErrorBoundary>,
     );
     expect(screen.getByTestId("error-boundary")).toBeInTheDocument();
@@ -55,17 +53,23 @@ describe("ErrorBoundary", () => {
   });
 
   it("recovers when 'Try again' is clicked after the cause is fixed", () => {
-    // NOTE: the boundary resets its own error state on retry; the child must no
-    // longer throw for the recovery to stick. We can't flip the inner Bomb from
-    // outside the boundary, so assert the reset path clears the fallback and
-    // re-attempts to render the subtree.
-    render(<Host />);
+    render(
+      <ErrorBoundary label="Editor">
+        <Bomb />
+      </ErrorBoundary>,
+    );
+    // The child threw -> the fallback is shown.
     expect(screen.getByTestId("error-boundary")).toBeInTheDocument();
-    // The subtree (including the "fix it" button) is unmounted while errored, so
-    // retry alone re-throws — but the fallback's retry must at least re-render.
+    expect(screen.queryByText("safe content")).not.toBeInTheDocument();
+
+    // Fix the cause from OUTSIDE the boundary subtree, THEN retry. The boundary's
+    // `reset()` clears its error state and re-renders the (now healthy) child.
+    shouldThrow = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    // Still shows a boundary (the child throws again) — proving retry re-attempted
-    // the subtree rather than staying permanently dead.
-    expect(screen.getByTestId("error-boundary")).toBeInTheDocument();
+
+    // Recovery proven: the fallback is gone and the healthy child renders. This
+    // FAILS if `reset()` is a no-op (the fallback would persist).
+    expect(screen.queryByTestId("error-boundary")).not.toBeInTheDocument();
+    expect(screen.getByText("safe content")).toBeInTheDocument();
   });
 });
