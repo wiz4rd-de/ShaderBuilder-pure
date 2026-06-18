@@ -20,10 +20,44 @@ The *how it's built and merged* lives in
 
 ## Status
 
-**Phase 0 — Scaffolding & contracts.** An empty-but-runnable Tauri app: the Rust
-workspace, the React/React Flow frontend shell, the shared `core-model` schema
-(with generated TypeScript), and the binary frame transport are in place. No real
-shader compilation or rendering yet — that is Phase 1+.
+**v1.0.0 — Linux release.** The full slice ships: a node-based editor that
+generates slang passes, a live multi-pass **wgpu** preview, `.slangp` import and
+export-bundle writing, subgraphs + a reusable node library, and the onboarding
+start screen with a bundled **CRT Scanlines + Curvature** example. Linux-only for
+v1 (Decision Log #10); open source under the MIT license (Decision Log #13).
+
+## Install & run (Linux)
+
+v1 ships as a self-contained **AppImage** and a **.deb**, built by CI and
+attached to each [GitHub Release](https://github.com/wiz4rd-de/ShaderBuilder-pure/releases).
+No Rust/Node toolchain is needed to run the app.
+
+**AppImage** (portable, any distro):
+
+```bash
+chmod +x ShaderBuilder_1.0.0_amd64.AppImage
+./ShaderBuilder_1.0.0_amd64.AppImage
+```
+
+**.deb** (Debian/Ubuntu):
+
+```bash
+sudo apt install ./ShaderBuilder_1.0.0_amd64.deb
+shaderbuilder            # or launch "ShaderBuilder" from your app menu
+```
+
+Runtime dependencies (WebKitGTK 4.1, GTK 3) are declared by the `.deb` and are
+present in the AppImage's bundle; a stock desktop Linux with a working GPU (or
+software-GL fallback) is enough. **ffmpeg is *not* required and is *not* bundled**
+(Decision Log #13): the artifact is license-clean (no GPL/LGPL ffmpeg). PNG
+image sequences decode in-core via the `image` crate.
+
+On first launch the start screen offers **Open example** (the bundled CRT
+example), **Import preset…** (an existing `.slangp`), and in-app help. See the
+[**user guide**](./docs/user-guide.md) for a full walkthrough, the
+[**example-project reference**](./docs/example-project.md), and the
+[**import walkthrough**](./docs/import-walkthrough.md) — all three are also
+bundled with the release artifact under `docs/`.
 
 ## Repository layout
 
@@ -107,5 +141,6 @@ CI runs all of the above on Linux for every push and PR — see
 
 ## License
 
-Open source; the specific license is yet to be chosen (tracked for a later
-phase). Until then all rights are reserved by the author.
+[MIT](./LICENSE) — open source (Decision Log #13). The shipped artifact is
+license-clean: it carries no GPL/LGPL ffmpeg dependency (ffmpeg is optional and
+out-of-bundle for v1).
