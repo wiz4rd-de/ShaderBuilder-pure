@@ -23,6 +23,10 @@ tauri-build = { version = "2", features = [] }
 # `app` is the top of the dependency graph: it wires together every other crate.
 [dependencies]
 tauri = { version = "2", features = [] }
+# Native open/save file dialogs for the project save/load UX (#63). Reused by the
+# export-bundle UX (#64). Needs the dep + `.plugin()` registration + the dialog
+# capability permission to work at runtime.
+tauri-plugin-dialog = "2"
 # `#[derive(Serialize)]` for the `source-position` event payload (#31).
 serde = { workspace = true }
 core-model = { workspace = true }
