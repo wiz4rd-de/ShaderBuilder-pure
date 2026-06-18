@@ -309,6 +309,61 @@ fn manifest_sampled_texture_set_matches_sample_ops_exactly() {
     }
 }
 
+#[test]
+fn original_history_zero_collapses_to_original_in_the_manifest() {
+    // Sampling BOTH `Original` and `OriginalHistory{index:0}` references the SAME
+    // RetroArch texture (`OriginalHistory0` ≡ `Original`, §5) — both emit the slang
+    // identifier `Original`. The manifest must therefore carry ONE sampled texture /
+    // ONE sampler binding, not two, so the emitter never produces a duplicate
+    // `sampler2D Original` decl.
+    let graph = IrGraph {
+        nodes: vec![
+            const_vec2("uv"),
+            sample("sOrig", TextureSource::Original),
+            sample("sHist0", TextureSource::OriginalHistory { index: 0 }),
+            expr("add", ExprOp::Add, &["x", "y"]),
+            output("out"),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out", "sOrig", "coord"),
+            IrEdge::new("uv", "out", "sHist0", "coord"),
+            IrEdge::new("sOrig", "out", "add", "x"),
+            IrEdge::new("sHist0", "out", "add", "y"),
+            IrEdge::new("add", "out", "out", "color"),
+        ],
+    };
+    let lowered = lower(&graph, &CheckContext::new()).expect("lowers clean");
+
+    // Exactly one sampled texture (the canonical `Original`), one sampler binding.
+    assert_eq!(
+        lowered.manifest.textures,
+        vec![TextureSource::Original],
+        "OriginalHistory{{index:0}} and Original collapse to a single manifest texture"
+    );
+    assert_eq!(
+        lowered.manifest.samplers.len(),
+        1,
+        "one sampler binding for the single canonical texture, not two"
+    );
+    assert_eq!(
+        lowered.manifest.samplers[0].texture,
+        TextureSource::Original
+    );
+    assert_eq!(lowered.manifest.samplers[0].binding, 0);
+
+    // The two Sample ops must also reference the canonical `Original` (so the
+    // emitter's `texture(<name>, ...)` matches the single declared sampler).
+    for stmt in &lowered.stmts {
+        if let LoweredOp::Sample { texture } = &stmt.op {
+            assert_eq!(
+                *texture,
+                TextureSource::Original,
+                "each Sample op keys its emitted texture to the canonical `Original`"
+            );
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Manifest: params + builtins collected and ordered
 // ----------------------------------------------------------------------------

@@ -619,7 +619,12 @@ impl<'g> Lowerer<'g> {
                 });
             }
             NodeOp::Sample { texture } => {
-                if !self.seen_textures.contains(texture) {
+                // Normalize to the canonical binding identity *before* dedup and
+                // before keying the emitted Sample op, so aliases that share a
+                // sampler (e.g. OriginalHistory{0} ≡ Original) collapse to one
+                // manifest entry and the emitter emits one `sampler2D` decl.
+                let texture = canonical_texture(texture);
+                if !self.seen_textures.contains(&texture) {
                     self.seen_textures.push(texture.clone());
                 }
                 // Operand: the coord temp (must already be emitted).
@@ -629,9 +634,7 @@ impl<'g> Lowerer<'g> {
                 self.stmts.push(SsaStmt {
                     result,
                     ty: PortType::Vec4,
-                    op: LoweredOp::Sample {
-                        texture: texture.clone(),
-                    },
+                    op: LoweredOp::Sample { texture },
                     operands,
                 });
             }
@@ -692,6 +695,26 @@ impl<'g> Lowerer<'g> {
 // ----------------------------------------------------------------------------
 // Manifest collection (deterministic ordering)
 // ----------------------------------------------------------------------------
+
+/// Fold a [`TextureSource`] to its **canonical binding identity** — the single
+/// variant that names a given RetroArch sampler. Distinct `TextureSource` values
+/// can bind to the SAME sampler and emit the SAME slang identifier; this collapses
+/// those aliases so the manifest carries one entry / one binding per sampler and
+/// the emitter never produces a duplicate `sampler2D <Name>` decl.
+///
+/// The only alias today is `OriginalHistory{index:0}` ≡ `Original` (§5: history
+/// frame 0 *is* the current `Original`), which the emitter already spells as
+/// `Original` ([`texture_slang_name`](codegen_slang) maps both to `"Original"`).
+/// All other variants are their own canonical identity (distinct slang names), so
+/// they pass through unchanged. Applied both when collecting the sampled-texture
+/// set and when keying each `Sample` op's emitted texture, so lowering and the
+/// emitter agree on one binding.
+fn canonical_texture(t: &TextureSource) -> TextureSource {
+    match t {
+        TextureSource::OriginalHistory { index: 0 } => TextureSource::Original,
+        other => other.clone(),
+    }
+}
 
 /// A canonical, traversal-order-independent sort key for a [`TextureSource`].
 /// Ordering: by kind (Source, Original, OriginalHistory, PassOutput, PassFeedback,
