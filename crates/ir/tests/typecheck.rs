@@ -522,6 +522,35 @@ fn broken_graphs_emit_expected_node_mapped_diagnostics() {
         let diags = check(&graph, &CheckContext::new());
         assert_has(&diags, codes::UNKNOWN_NODE, "ghost", None);
     }
+
+    // --- CustomSnippet port-type mismatch (#43): a vec2 wired into a snippet
+    //     input port declared vec4 is not assignable, and surfaces as a
+    //     node-mapped `typeMismatch` on the snippet node + the offending port. ---
+    {
+        let graph = IrGraph {
+            nodes: vec![
+                const_vec2("uv"),
+                IrNode::new(
+                    "snip",
+                    NodeOp::CustomSnippet {
+                        body: "out_c = in_c;".to_owned(),
+                        // Declares a vec4 input port…
+                        inputs: vec![PortDecl::new("in_c", PortType::Vec4)],
+                        outputs: vec![PortDecl::new("out_c", PortType::Vec4)],
+                    },
+                ),
+                output("out"),
+            ],
+            edges: vec![
+                // …but a vec2 is wired into it (vec2 -> vec4 is neither widen
+                // nor broadcast), so the snippet's `in_c` port type-mismatches.
+                IrEdge::new("uv", "out", "snip", "in_c"),
+                IrEdge::new("snip", "out_c", "out", "color"),
+            ],
+        };
+        let diags = check(&graph, &CheckContext::new());
+        assert_has(&diags, codes::TYPE_MISMATCH, "snip", Some("in_c"));
+    }
 }
 
 // ----------------------------------------------------------------------------
