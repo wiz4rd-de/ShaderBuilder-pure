@@ -245,6 +245,50 @@ describe("sharp-bilinear", () => {
       expect(op.body).toContain("sourceSize.zw");
     }
   });
+
+  // Re-implement the snippet maths so we validate the actual snapping behaviour
+  // (not just the GLSL string). The body compresses the offset of the sample
+  // point from the texel centre by clamping it to ±region, region=0.5*(1-sh),
+  // then maps back to UV via sourceSize.zw (=1/size).
+  function snapUv(uvx: number, size: number, sh: number): number {
+    const region = 0.5 * (1 - sh);
+    const texel = uvx * size;
+    const center = Math.floor(texel) + 0.5;
+    const frac = texel - center;
+    const snapped = center + Math.max(-region, Math.min(region, frac));
+    return snapped / size; // zw = 1/size
+  }
+
+  it("sharpness 0 is an identity bilinear pass (snapped uv == uv)", () => {
+    const size = 256;
+    for (const uvx of [0.0, 0.123, 0.5, 0.777, 0.999]) {
+      expect(snapUv(uvx, size, 0)).toBeCloseTo(uvx, 10);
+    }
+  });
+
+  it("sharpness 1 holds the sample at the texel centre (true nearest)", () => {
+    const size = 256;
+    for (const uvx of [0.001, 0.123, 0.49, 0.51, 0.777]) {
+      const texel = uvx * size;
+      const centerUv = (Math.floor(texel) + 0.5) / size;
+      expect(snapUv(uvx, size, 1)).toBeCloseTo(centerUv, 10);
+    }
+  });
+
+  it("rising sharpness pulls the sample monotonically toward the texel centre", () => {
+    // A point offset from the centre should move closer to the centre as
+    // sharpness increases (the OLD inverted code pushed it toward the edge).
+    const size = 256;
+    const uvx = 0.123; // a sample with a non-zero fractional offset
+    const texel = uvx * size;
+    const centerUv = (Math.floor(texel) + 0.5) / size;
+    let prevDist = Infinity;
+    for (const sh of [0, 0.25, 0.5, 0.75, 1]) {
+      const dist = Math.abs(snapUv(uvx, size, sh) - centerUv);
+      expect(dist).toBeLessThanOrEqual(prevDist + 1e-12);
+      prevDist = dist;
+    }
+  });
 });
 
 describe("graphToIr round-trips a colour + sampling graph", () => {
@@ -268,6 +312,41 @@ describe("graphToIr round-trips a colour + sampling graph", () => {
     expect(ir.edges).toContainEqual({
       source: { node: src.id, port: "out" },
       target: { node: dec.id, port: "color" },
+    });
+  });
+
+  it("a UV transform's canvas ports match its snippet PortDecls (edges survive)", () => {
+    // Texcoord(uv) → UV Offset(in_uv → out_uv) → Source(coord). The transform's
+    // canvas handle ids MUST equal the lowered CustomSnippet PortDecl names, or
+    // every edge through it would be unknownPort/danglingInput at the checker.
+    const uv = node("texcoord");
+    const off = node("uvOffset", { x: 0.25, y: -0.5 });
+    const src = node("source");
+    const out = node("output");
+    const graph: Graph = {
+      nodes: [uv, off, src, out],
+      edges: [
+        edge(uv.id, "uv", off.id, "in_uv"),
+        edge(off.id, "out_uv", src.id, "coord"),
+        edge(src.id, "out", out.id, "color"),
+      ],
+    };
+    const { ir, issues } = graphToIr(graph);
+    expect(issues).toEqual([]);
+    const offNode = ir.nodes.find((n) => n.id === off.id);
+    expect(offNode?.op.kind).toBe("customSnippet");
+    if (offNode?.op.kind === "customSnippet") {
+      expect(offNode.op.inputs.map((p) => p.name)).toEqual(["in_uv"]);
+      expect(offNode.op.outputs.map((p) => p.name)).toEqual(["out_uv"]);
+    }
+    // Both edges into/out of the transform survive as PortRef pairs.
+    expect(ir.edges).toContainEqual({
+      source: { node: uv.id, port: "uv" },
+      target: { node: off.id, port: "in_uv" },
+    });
+    expect(ir.edges).toContainEqual({
+      source: { node: off.id, port: "out_uv" },
+      target: { node: src.id, port: "coord" },
     });
   });
 

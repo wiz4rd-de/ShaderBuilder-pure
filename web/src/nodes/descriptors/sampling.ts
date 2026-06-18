@@ -146,13 +146,18 @@ export const sharpBilinearDescriptor: NodeDescriptor = {
     let sh = readNumber(data, "sharpness", 1);
     if (sh < 0) sh = 0;
     if (sh > 1) sh = 1;
-    // texel = uv * SourceSize.xy; fractional part is snapped toward the centre by
-    // `sharpness`, then converted back to UV via SourceSize.zw (= 1/size).
+    // texel = uv * SourceSize.xy; the offset of the sample point from the texel
+    // CENTRE is compressed toward 0 as `sharpness` rises, then converted back to
+    // UV via SourceSize.zw (= 1/size). `region = 0.5 * (1 - sharpness)` is the
+    // half-width of the linear-AA ramp around the centre: at sharpness 0 the offset
+    // passes through unchanged (pure bilinear); at sharpness 1 the offset collapses
+    // to 0, so every sample is held at the texel centre (pure nearest).
+    const region = glslFloat(0.5 * (1 - sh));
     const body = [
       "vec2 texel = uv * sourceSize.xy;",
       "vec2 center = floor(texel) + vec2(0.5);",
       "vec2 frac = texel - center;",
-      `vec2 snapped = center + clamp(frac * ${glslFloat(sh === 1 ? 1e6 : 1 / (1 - sh))}, vec2(-0.5), vec2(0.5));`,
+      `vec2 snapped = center + clamp(frac, vec2(-${region}), vec2(${region}));`,
       "result = snapped * sourceSize.zw;",
     ].join("\n");
     return {
