@@ -206,6 +206,14 @@ export interface DocumentState {
    */
   engineStatus: EngineStatus | null;
   /**
+   * The id of the currently-active preview stream (#12/#13), set by the preview
+   * pane when it starts a stream. The `engine-event` listener IGNORES events whose
+   * `streamId` is not this one, so a superseded (stopped/remounted) render thread's
+   * late status/error can neither toast nor clobber the live stream. `null` before
+   * any stream starts. Editor-only.
+   */
+  activeStreamId: string | null;
+  /**
    * Render/compile errors synthesized from `engine-event`s (#62), pass-tagged when
    * the engine could map them. Kept SEPARATE from `problems` (which the compile loop
    * replaces wholesale each round) so an async render error is not clobbered by the
@@ -280,6 +288,11 @@ export interface DocumentState {
   // ---- engine status / render errors (#62; the engine-event listener owns these) ----
   /** Set the render engine's liveness state (#62) from an `engine-event`. */
   setEngineStatus: (status: EngineStatus) => void;
+  /**
+   * Mark which preview stream is active (#12/#13). The `engine-event` listener
+   * filters events to this stream so a superseded stream's late events are ignored.
+   */
+  setActiveStreamId: (streamId: string | null) => void;
   /**
    * Synthesize an engine render/compile error (#62) into the engine problems list,
    * tagged with its owning pass when known (so the panel can navigate). De-dupes by
@@ -585,6 +598,22 @@ function mergePassSources(
   return out;
 }
 
+/**
+ * The stable codes for a PIPELINE-WIDE engine problem (#14): the whole GPU/device
+ * is unavailable, not a single pass. These survive a subsequent compile (which only
+ * re-derives pass-level slangCompile errors) because the device is still dead.
+ */
+const DEVICE_LEVEL_ENGINE_CODES = new Set(["noAdapter", "deviceLost"]);
+
+/**
+ * Whether an engine problem is a pipeline-wide device-level failure (#14): a
+ * device-code problem with no owning pass. dispatchPreview can never re-derive
+ * these, so a fresh compile must NOT clear them while the engine is still stopped.
+ */
+function isDeviceLevelProblem(p: ProblemEntry): boolean {
+  return p.passId === "" && DEVICE_LEVEL_ENGINE_CODES.has(p.diagnostic.code);
+}
+
 const initialProject = makeProject();
 const initialActivePassId = initialProject.passes[0]!.id;
 
@@ -665,6 +694,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     pipelineValid: null,
     compiling: false,
     engineStatus: null,
+    activeStreamId: null,
     engineProblems: [],
     sourcesByPassId: {},
     past: [],
@@ -819,13 +849,19 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         // marker) when this round produced no source for that pass.
         sourcesByPassId: mergePassSources(s.sourcesByPassId, status.sourcesByPassId),
         // A fresh compile round supersedes any async render error from the prior
-        // chain (#62): clear engine problems so a now-fixed pass stops showing one.
-        engineProblems: [],
+        // chain (#62): clear the pass-level slangCompile problems the next dispatch
+        // re-establishes, but PRESERVE pipeline-wide device-level problems
+        // (no passId; codes noAdapter/deviceLost) — the GPU is still dead, so they
+        // must not vanish on an unrelated edit (#14). dispatchPreview only re-emits
+        // slangCompile, so it cannot re-derive a device problem.
+        engineProblems: s.engineProblems.filter((p) => isDeviceLevelProblem(p)),
       })),
 
     setCompiling: (compiling) => set({ compiling }),
 
     setEngineStatus: (status) => set({ engineStatus: status }),
+
+    setActiveStreamId: (streamId) => set({ activeStreamId: streamId }),
 
     pushEngineProblem: (error) =>
       set((s) => {
