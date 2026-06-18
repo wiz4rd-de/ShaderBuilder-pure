@@ -11,11 +11,13 @@
 // (#56). `resolveGraph` reads the addressed graph; `replaceGraph` writes a new
 // project with that graph replaced, rebuilding the `data` chain back up to the
 // pass so React/zustand see fresh references the whole way. Both are PURE.
+import type { BoundaryPort } from "../bindings/BoundaryPort";
 import type { Edge } from "../bindings/Edge";
 import type { Graph } from "../bindings/Graph";
 import type { Node } from "../bindings/Node";
 import type { Project } from "../bindings/Project";
 import type { Subgraph } from "../bindings/Subgraph";
+import { getDescriptor } from "../nodes/registry";
 import { isSubgraphNode, readSubgraph, SUBGRAPH_KIND } from "../nodes/subgraph";
 
 /** An empty graph (avoids importing factories into this pure helper). */
@@ -62,7 +64,8 @@ export function resolveGraph(
  * Return a NEW project with the graph addressed by `path` replaced by `next`.
  * The pass (and every subgraph node along `path`) is cloned so references are
  * fresh; the subgraph node's `data` is rewritten to carry the edited interior
- * (its `boundaryPorts`/`id`/`name` are preserved). Untouched siblings are shared.
+ * (its `id`/`name` are preserved; `boundaryPorts` are RECONCILED against the new
+ * interior — see `replaceInGraph`). Untouched siblings are shared.
  */
 export function replaceGraph(
   project: Project,
@@ -85,26 +88,104 @@ export function replaceGraph(
   };
 }
 
+/**
+ * Whether `(interiorNode, interiorPort)` is still a live endpoint in `interior`:
+ * the node must exist AND expose `interiorPort` on the side the boundary uses (an
+ * `in` boundary feeds an interior INPUT, an `out` boundary carries an interior
+ * OUTPUT). A deleted node, or a port the node no longer declares, fails.
+ */
+function boundaryEndpointLives(bp: BoundaryPort, interior: Graph): boolean {
+  const node = interior.nodes.find((n) => n.id === bp.interiorNode);
+  if (!node) {
+    return false;
+  }
+  const descriptor = getDescriptor(node.kind);
+  if (!descriptor) {
+    return false;
+  }
+  const ports =
+    bp.direction === "in" ? descriptor.inputs(node.data) : descriptor.outputs(node.data);
+  return ports.some((p) => p.name === bp.interiorPort);
+}
+
+/**
+ * Reconcile a subgraph's `boundaryPorts` against an edited `interior` (#57 fix):
+ * keep only the ports whose interior endpoint still exists, and report the names
+ * of the ports pruned so the caller can drop the now-dangling EXTERIOR edges in
+ * the SAME mutation. Without this, an exterior edge stays attached to a port the
+ * inlining step can't resolve and `graphToIr` SILENTLY DROPS it at compile time.
+ */
+function reconcileBoundaryPorts(
+  boundaryPorts: BoundaryPort[],
+  interior: Graph,
+): { kept: BoundaryPort[]; prunedNames: Set<string> } {
+  const kept: BoundaryPort[] = [];
+  const prunedNames = new Set<string>();
+  for (const bp of boundaryPorts) {
+    if (boundaryEndpointLives(bp, interior)) {
+      kept.push(bp);
+    } else {
+      prunedNames.add(bp.name);
+    }
+  }
+  return { kept, prunedNames };
+}
+
+/**
+ * Drop the exterior edges in `graph` that connect to `subgraphNodeId` on a port
+ * name in `prunedNames` (an `in` boundary is an edge whose TARGET is that port;
+ * an `out` boundary an edge whose SOURCE is). Returns `graph` unchanged when no
+ * edge is affected (so untouched levels keep their reference identity).
+ */
+function pruneExteriorEdges(
+  graph: Graph,
+  subgraphNodeId: string,
+  prunedNames: Set<string>,
+): Graph {
+  if (prunedNames.size === 0) {
+    return graph;
+  }
+  const edges = graph.edges.filter((e) => {
+    const intoPruned =
+      e.target === subgraphNodeId && prunedNames.has(e.targetPort);
+    const outOfPruned =
+      e.source === subgraphNodeId && prunedNames.has(e.sourcePort);
+    return !intoPruned && !outOfPruned;
+  });
+  return edges.length === graph.edges.length ? graph : { ...graph, edges };
+}
+
 /** Recursively rebuild `graph` with the subgraph addressed by `path` set to `next`. */
 function replaceInGraph(graph: Graph, path: string[], next: Graph): Graph {
   const [head, ...rest] = path;
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => {
-      if (node.id !== head || !isSubgraphNode(node)) {
-        return node;
-      }
-      const sub = readSubgraph(node);
-      const newBody =
-        rest.length === 0 ? next : replaceInGraph(subgraphBody(sub), rest, next);
-      const nextSub: Subgraph = {
-        ...sub,
-        nodes: newBody.nodes,
-        edges: newBody.edges,
-      };
-      return { ...node, kind: SUBGRAPH_KIND, data: nextSub as unknown as Record<string, unknown> };
-    }),
-  };
+  // Names of boundary ports pruned on `head` so we can drop the matching exterior
+  // edges (the parent edges live in THIS graph) in the same mutation.
+  let prunedNames = new Set<string>();
+  const nodes = graph.nodes.map((node) => {
+    if (node.id !== head || !isSubgraphNode(node)) {
+      return node;
+    }
+    const sub = readSubgraph(node);
+    const newBody =
+      rest.length === 0 ? next : replaceInGraph(subgraphBody(sub), rest, next);
+    // Reconcile boundary ports against the edited interior: prune any port whose
+    // interior endpoint no longer exists so no boundary dangles. (When editing a
+    // DEEPER interior, `replaceInGraph` already pruned that level's exterior edges
+    // — which live in `sub`'s body — so `newBody` is internally consistent here.)
+    const { kept, prunedNames: pruned } = reconcileBoundaryPorts(
+      sub.boundaryPorts,
+      newBody,
+    );
+    prunedNames = pruned;
+    const nextSub: Subgraph = {
+      ...sub,
+      nodes: newBody.nodes,
+      edges: newBody.edges,
+      boundaryPorts: kept,
+    };
+    return { ...node, kind: SUBGRAPH_KIND, data: nextSub as unknown as Record<string, unknown> };
+  });
+  return pruneExteriorEdges({ ...graph, nodes }, head, prunedNames);
 }
 
 /** Read a subgraph node's typed body from a graph, or null if absent/not one. */
