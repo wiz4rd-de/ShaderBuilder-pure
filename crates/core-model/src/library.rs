@@ -14,8 +14,11 @@
 //! Each item is one JSON file `<dir>/<item.id>.json`. The id is the stable,
 //! app-generated UUID-like string the store assigned ([`LibraryItem::id`]); those
 //! ids are filename-safe (hex/`-`), so they map straight onto a filename with no
-//! escaping. One-file-per-item means a corrupt file can be skipped without
-//! losing the rest, and saving/deleting one item never rewrites the others.
+//! escaping. The store **enforces** this with [`validate_id`] on every id→path
+//! conversion ([`save_item`]/[`delete_item`]), rejecting anything that is not
+//! `[A-Za-z0-9_-]` so a webview-supplied id can never traverse outside `dir`
+//! (#58). One-file-per-item means a corrupt file can be skipped without losing
+//! the rest, and saving/deleting one item never rewrites the others.
 //!
 //! ## Atomicity
 //!
@@ -66,6 +69,14 @@ pub enum LibraryError {
         /// The id that was not found.
         id: String,
     },
+    /// An id that is **not filename-safe** was supplied to [`save_item`] /
+    /// [`delete_item`] (e.g. one containing path separators, `..`, or other
+    /// non-`[A-Za-z0-9_-]` characters). Rejecting it before it ever reaches the
+    /// filesystem prevents a path-traversal write/delete outside the library dir.
+    InvalidId {
+        /// The rejected id.
+        id: String,
+    },
 }
 
 impl std::fmt::Display for LibraryError {
@@ -81,6 +92,9 @@ impl std::fmt::Display for LibraryError {
             LibraryError::NotFound { id } => {
                 write!(f, "library item not found: {id}")
             }
+            LibraryError::InvalidId { id } => {
+                write!(f, "invalid library item id (not filename-safe): {id}")
+            }
         }
     }
 }
@@ -95,9 +109,34 @@ fn io_err(e: std::io::Error) -> LibraryError {
     }
 }
 
+/// Reject any id that is not **filename-safe**, so it can never escape the
+/// library dir when turned into a path (path-traversal guard, #58).
+///
+/// Policy: an id must be non-empty and composed **entirely** of
+/// `[A-Za-z0-9_-]`. This rejects path separators (`/`, `\`), `.` (and therefore
+/// `.` / `..`), whitespace, and absolute paths — anything `Path::join` could
+/// otherwise resolve outside `dir`. The app-generated `crypto.randomUUID()` ids
+/// (hex + `-`, e.g. `"550e8400-e29b-41d4-a716-446655440000"`) all pass.
+fn validate_id(id: &str) -> Result<(), LibraryError> {
+    let safe = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if safe {
+        Ok(())
+    } else {
+        Err(LibraryError::InvalidId { id: id.to_owned() })
+    }
+}
+
 /// The on-disk path of `id` inside `dir`: `<dir>/<id>.json`.
-fn item_path(dir: &Path, id: &str) -> std::path::PathBuf {
-    dir.join(format!("{id}.json"))
+///
+/// `id` is validated by [`validate_id`] first, so the returned path is always a
+/// direct child of `dir` (no traversal). Callers that already validated may rely
+/// on this redundant check as defense-in-depth.
+fn item_path(dir: &Path, id: &str) -> Result<std::path::PathBuf, LibraryError> {
+    validate_id(id)?;
+    Ok(dir.join(format!("{id}.json")))
 }
 
 /// Save `item` to `<dir>/<item.id>.json`, **atomically** (#58).
@@ -109,6 +148,10 @@ fn item_path(dir: &Path, id: &str) -> std::path::PathBuf {
 /// Returns a typed [`LibraryError`] (a serialize failure or an IO failure) instead
 /// of panicking.
 pub fn save_item(dir: &Path, item: &LibraryItem) -> Result<(), LibraryError> {
+    // Reject a path-traversal id *before* touching the filesystem so a malicious
+    // id can never create the dir, write a temp file, or rename outside `dir`.
+    let final_path = item_path(dir, &item.id)?;
+
     std::fs::create_dir_all(dir).map_err(io_err)?;
 
     let mut json = serde_json::to_string_pretty(item).map_err(|e| LibraryError::Malformed {
@@ -116,7 +159,6 @@ pub fn save_item(dir: &Path, item: &LibraryItem) -> Result<(), LibraryError> {
     })?;
     json.push('\n');
 
-    let final_path = item_path(dir, &item.id);
     let tmp_path = dir.join(format!("{}.json.tmp", item.id));
     std::fs::write(&tmp_path, json).map_err(io_err)?;
     std::fs::rename(&tmp_path, &final_path).map_err(io_err)
@@ -145,6 +187,12 @@ pub fn list_items(dir: &Path) -> Result<Vec<LibraryItem>, LibraryError> {
         // save and any non-JSON files).
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
+        }
+        // Skip any file whose stem is not a valid id — the store only ever
+        // writes `<valid-id>.json`, so anything else is foreign/hand-placed.
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if validate_id(stem).is_ok() => {}
+            _ => continue,
         }
 
         let json = match std::fs::read_to_string(&path) {
@@ -178,7 +226,9 @@ pub fn list_items(dir: &Path) -> Result<Vec<LibraryItem>, LibraryError> {
 /// exists (so the caller can tell "deleted" from "wasn't there"), and any other
 /// removal failure as [`LibraryError::Io`].
 pub fn delete_item(dir: &Path, id: &str) -> Result<(), LibraryError> {
-    let path = item_path(dir, id);
+    // Reject a path-traversal id before it can resolve a `remove_file` target
+    // outside `dir`.
+    let path = item_path(dir, id)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -292,6 +342,70 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    /// Count entries in a dir (files + subdirs), 0 if the dir does not exist.
+    fn entry_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn save_rejects_traversal_id_and_writes_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A neighbor dir that a traversal id would escape into; it must stay empty.
+        let victim_dir = dir.path().parent().expect("parent").join("library-victim");
+        std::fs::create_dir_all(&victim_dir).expect("victim dir");
+
+        for bad in ["../escape", "/etc/passwd", "..", ".", "a/b", "a\\b", ""] {
+            let item = sample_item(bad, "Evil");
+            match save_item(dir.path(), &item) {
+                Err(LibraryError::InvalidId { id }) => assert_eq!(id, bad),
+                other => panic!("expected InvalidId for {bad:?}, got {other:?}"),
+            }
+        }
+
+        // Nothing was written: neither inside the library dir nor in the neighbor.
+        assert_eq!(entry_count(dir.path()), 0, "library dir must stay empty");
+        assert_eq!(entry_count(&victim_dir), 0, "victim dir must stay empty");
+    }
+
+    #[test]
+    fn delete_rejects_traversal_id_and_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A real file we can prove a traversal delete does NOT remove.
+        let keep = sample_item("keep-1", "Keep");
+        save_item(dir.path(), &keep).expect("save keep");
+
+        // A file outside the library dir that "../" would target.
+        let victim = dir.path().parent().expect("parent").join("victim.json");
+        std::fs::write(&victim, b"do not delete me").expect("write victim");
+
+        for bad in ["../victim", "../../victim", "..", "/victim", ""] {
+            match delete_item(dir.path(), bad) {
+                Err(LibraryError::InvalidId { id }) => assert_eq!(id, bad),
+                other => panic!("expected InvalidId for {bad:?}, got {other:?}"),
+            }
+        }
+
+        assert!(victim.exists(), "victim file outside dir must survive");
+        assert_eq!(
+            list_items(dir.path()).expect("list_items"),
+            vec![keep],
+            "kept item must still be present"
+        );
+    }
+
+    #[test]
+    fn uuid_like_id_saves_lists_and_deletes_fine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let item = sample_item(id, "Uuid Item");
+
+        save_item(dir.path(), &item).expect("save_item with uuid id");
+        assert_eq!(list_items(dir.path()).expect("list_items"), vec![item]);
+
+        delete_item(dir.path(), id).expect("delete_item with uuid id");
+        assert!(list_items(dir.path()).expect("list_items").is_empty());
     }
 
     #[test]
