@@ -102,11 +102,16 @@ export function useCompileLoop(options: CompileLoopOptions = {}): void {
       if (disposed || seq !== latestDispatched) {
         return;
       }
-      // Apply diagnostics + problems + validity in one update (clears stale ones).
+      // Apply diagnostics + problems + validity + per-pass generated source in one
+      // update (clears stale ones). The per-pass source feeds the read-only
+      // generated-code viewer (#55) — the SAME source the preview ran below.
       cbRef.current.setCompileStatus({
         diagnosticsByNode: result.diagnosticsByNode,
         problems: result.problems,
         valid: result.valid,
+        sourcesByPassId: Object.fromEntries(
+          result.passes.map((p) => [p.passId, p.source]),
+        ),
       });
       cbRef.current.onResult?.(result);
       // Push the renderable chain to the engine (no-op when not globally valid).

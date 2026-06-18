@@ -99,6 +99,26 @@ export interface CompileLoopStatus {
   problems: ProblemEntry[];
   /** Whether the whole pipeline is renderable. */
   valid: boolean;
+  /**
+   * The generated slang each pass emitted this compile (#55), keyed by pass id —
+   * `null` when the pass currently does not compile (a graph pass with blocking
+   * errors). This is the SAME source the live preview ran and the exporter would
+   * embed; the read-only generated-code viewer reads it.
+   */
+  sourcesByPassId: Record<string, string | null>;
+}
+
+/**
+ * The generated-code state for one pass (#55): the source from the LATEST compile
+ * (`null` when the pass currently fails) plus the last source that DID compile, so
+ * the read-only viewer can show last-good output with a "stale" marker instead of
+ * a misleading blank when the graph is momentarily invalid.
+ */
+export interface PassSourceState {
+  /** The latest compile's generated slang, or `null` if it failed this round. */
+  current: string | null;
+  /** The most recent NON-null generated slang for this pass (last-good). */
+  lastGood: string | null;
 }
 
 export interface DocumentState {
@@ -148,6 +168,13 @@ export interface DocumentState {
   pipelineValid: boolean | null;
   /** Whether a compile is in flight (#54) — the preview may lag the document. */
   compiling: boolean;
+  /**
+   * The generated slang per pass (#55), keyed by pass id, with last-good tracking.
+   * Populated by the live compile loop's `setCompileStatus`; read by the read-only
+   * generated-code viewer. A pass absent from this map has never compiled. This is
+   * editor-only output state — never part of an undo snapshot.
+   */
+  sourcesByPassId: Record<string, PassSourceState>;
 
   // ---- history ----
   past: DocSnapshot[];
@@ -411,6 +438,24 @@ function mergeSettings(
   return changed ? next : settings;
 }
 
+/**
+ * Fold a compile's per-pass sources into the store's last-good-tracking map (#55).
+ * Every pass present in `next` records its `current` source; its `lastGood` is the
+ * new source when non-null, else the previously remembered last-good. Passes absent
+ * from `next` (e.g. removed) are dropped, so the map never leaks stale pass ids.
+ */
+function mergePassSources(
+  prev: Record<string, PassSourceState>,
+  next: Record<string, string | null>,
+): Record<string, PassSourceState> {
+  const out: Record<string, PassSourceState> = {};
+  for (const [passId, current] of Object.entries(next)) {
+    const lastGood = current ?? prev[passId]?.lastGood ?? null;
+    out[passId] = { current, lastGood };
+  }
+  return out;
+}
+
 const initialProject = makeProject();
 const initialActivePassId = initialProject.passes[0]!.id;
 
@@ -471,6 +516,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     problems: [],
     pipelineValid: null,
     compiling: false,
+    sourcesByPassId: {},
     past: [],
     future: [],
     pendingBaseline: null,
@@ -604,12 +650,16 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     setDiagnosticsByNode: (byNode) => set({ diagnosticsByNode: byNode }),
 
     setCompileStatus: (status) =>
-      set({
+      set((s) => ({
         diagnosticsByNode: status.diagnosticsByNode,
         problems: status.problems,
         pipelineValid: status.valid,
         compiling: false,
-      }),
+        // Merge the new per-pass sources, carrying forward each pass's last-good
+        // source so the read-only viewer (#55) can fall back to it (with a stale
+        // marker) when this round produced no source for that pass.
+        sourcesByPassId: mergePassSources(s.sourcesByPassId, status.sourcesByPassId),
+      })),
 
     setCompiling: (compiling) => set({ compiling }),
 
@@ -987,6 +1037,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        sourcesByPassId: {},
         past: [],
         future: [],
         pendingBaseline: null,
@@ -1008,6 +1059,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        sourcesByPassId: {},
         past: [],
         future: [],
         pendingBaseline: null,

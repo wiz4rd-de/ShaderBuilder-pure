@@ -24,7 +24,7 @@ describe("EditorStatusBar — compile indicator (#54)", () => {
 
   it("shows Valid when the pipeline is renderable", () => {
     act(() =>
-      store().setCompileStatus({ diagnosticsByNode: {}, problems: [], valid: true }),
+      store().setCompileStatus({ diagnosticsByNode: {}, problems: [], valid: true, sourcesByPassId: {} }),
     );
     render(<EditorStatusBar />);
     const compile = screen.getByTestId("status-compile");
@@ -44,6 +44,7 @@ describe("EditorStatusBar — compile indicator (#54)", () => {
           },
         ],
         valid: false,
+        sourcesByPassId: {},
       }),
     );
     render(<EditorStatusBar />);

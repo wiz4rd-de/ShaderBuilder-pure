@@ -25,7 +25,7 @@ beforeEach(() => {
 
 describe("ProblemsPanel", () => {
   it("shows the empty state with a Pipeline OK status when valid + no problems", () => {
-    store().setCompileStatus({ diagnosticsByNode: {}, problems: [], valid: true });
+    store().setCompileStatus({ diagnosticsByNode: {}, problems: [], valid: true, sourcesByPassId: {} });
     render(<ProblemsPanel />);
     expect(screen.getByText("Pipeline OK")).toBeInTheDocument();
     expect(screen.getByText("No problems.")).toBeInTheDocument();
@@ -36,6 +36,7 @@ describe("ProblemsPanel", () => {
       diagnosticsByNode: { n1: [problem("g", "n1", "error").diagnostic] },
       problems: [problem("g", "n1", "error"), problem("g", "n2", "warning")],
       valid: false,
+      sourcesByPassId: {},
     });
     render(<ProblemsPanel />);
     expect(screen.getByText("Pipeline not renderable")).toBeInTheDocument();
@@ -50,6 +51,7 @@ describe("ProblemsPanel", () => {
       diagnosticsByNode: { theNode: [problem(passId, "theNode", "error").diagnostic] },
       problems: [problem(passId, "theNode", "error")],
       valid: false,
+      sourcesByPassId: {},
     });
     render(<ProblemsPanel />);
     fireEvent.click(screen.getByText("bad theNode"));
