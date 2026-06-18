@@ -137,16 +137,20 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      # Golden-image regression harness (#32): the corpus fuzzer over the local
-      # fixtures + the self-oracle goldens + the determinism gate. Run explicitly
-      # with `--test-threads=1` (concurrent wgpu device creation can SIGSEGV on
-      # multi-adapter boxes; serialized here to be safe). The `testing` crate's
-      # tests also run under the workspace `Test` step above; this dedicated step
-      # makes the fidelity-gate machinery visible as its own check and is where the
-      # diff-artifact upload below attaches. See docs/golden-image-harness.md —
+      # Golden-image regression harness (#32) + graph->slang->preview PARITY suite
+      # (#44, the Phase-4 exit gate): the corpus fuzzer over the local fixtures, the
+      # self-oracle goldens, the determinism gate, AND the parity suite that renders
+      # a hand-built graph's generated slang vs a hand-written-equivalent `.slang`
+      # and diffs them. Run explicitly with `--test-threads=1` (concurrent wgpu
+      # device creation can SIGSEGV on multi-adapter boxes; serialized here to be
+      # safe). The `testing` crate's tests also run under the workspace `Test` step
+      # above; this dedicated step makes the gate machinery visible as its own check
+      # and is where the diff-artifact uploads below attach. The parity suite renders
+      # both sides on the same adapter (lavapipe in CI), so adapter noise cancels —
+      # it behaves exactly like the golden suite. See docs/golden-image-harness.md —
       # the RetroArch *reference* comparison remains a documented MANUAL gate (no
       # RetroArch capture is possible on the headless runner).
-      - name: Golden-image harness (testing crate)
+      - name: Golden-image + graph-parity harness (testing crate)
         run: cargo test -p testing --locked -- --test-threads=1
 
       # On a golden divergence the harness writes the rendered output + an
@@ -157,6 +161,17 @@ jobs:
         with:
           name: golden-diff-artifacts
           path: target/golden-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # On a #44 parity divergence the harness writes the generated + hand-written
+      # renders and an amplified diff so a codegen regression is inspectable.
+      - name: Upload graph-parity diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-parity-diff-artifacts
+          path: target/graph-parity-artifacts/
           if-no-files-found: ignore
           retention-days: 7
 

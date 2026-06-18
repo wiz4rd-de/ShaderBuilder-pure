@@ -412,7 +412,10 @@ dependencies = [
 name = "codegen-slang"
 version = "0.1.0"
 dependencies = [
+ "core-model",
  "ir",
+ "preset-io",
+ "slang-compile",
 ]
 
 [[package]]
@@ -3763,8 +3766,10 @@ dependencies = [
 name = "testing"
 version = "0.1.0"
 dependencies = [
+ "codegen-slang",
  "core-model",
  "image",
+ "ir",
  "preset-io",
  "preview-engine",
  "slang-compile",

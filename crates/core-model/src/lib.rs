@@ -34,6 +34,8 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub mod ir;
+
 /// Crate identity marker. Kept from the Phase 0 scaffold so the inter-crate
 /// dependency edges stay referenced; see the workspace stub crates.
 pub const NAME: &str = "core-model";

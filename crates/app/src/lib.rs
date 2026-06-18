@@ -9,6 +9,7 @@
 //! touching this transport**.
 
 mod export;
+mod graph;
 mod preview;
 mod project;
 
@@ -60,6 +61,7 @@ pub fn run() {
             export::export_preset,
             project::save_project,
             project::load_project,
+            graph::compile_graph,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");

@@ -41,14 +41,24 @@
 //!   the lossless import → export → re-import harness (#37, Phase-3 EXIT gate),
 //!   with a canonicalized structural [`roundtrip::ProjectDiff`] and a readable
 //!   diff report on any divergence.
+//! * [`graph_render`] — [`graph_render::render_graph_to_image`]: the Phase-4 exit
+//!   gate's parity harness (#44). Type-checks + lowers + emits slang from a
+//!   hand-built [`core_model::ir::IrGraph`] and renders the generated slang
+//!   through [`render::render_preset_to_image`], so a generated graph can be
+//!   golden-image-diffed against a hand-written-equivalent `.slang`.
 
 pub mod diff;
 pub mod fuzz;
+pub mod graph_render;
 pub mod render;
 pub mod roundtrip;
 
 pub use diff::{diff_image, diff_images, DiffReport};
 pub use fuzz::{fuzz_presets, PresetResult};
+pub use graph_render::{
+    parity_fixtures_dir, render_graph_to_image, render_handwritten_slang, screen_uv_node,
+    GraphRenderError, ParamOverride,
+};
 pub use render::{render_preset_to_image, HarnessError};
 pub use roundtrip::{compare_projects, round_trip, ProjectDiff, RoundTrip, RoundTripError};
 
@@ -68,5 +78,8 @@ mod tests {
         assert_eq!(preset_io::NAME, "preset-io");
         assert_eq!(source::NAME, "source");
         assert_eq!(slang_compile::NAME, "slang-compile");
+        // The #44 parity-harness edges to the Phase-4 codegen crates are real.
+        assert_eq!(ir::NAME, "ir");
+        assert_eq!(codegen_slang::NAME, "codegen-slang");
     }
 }
