@@ -159,6 +159,43 @@ pub struct PositionUpdate {
     pub len: usize,
 }
 
+/// The render engine's liveness state (#62), reported from the render thread so
+/// the preview pane can distinguish a fresh render from a held last-good frame
+/// from a stopped engine. The app maps this to `core_model::EngineStatus` at the
+/// IPC boundary (the engine deliberately has no dependency on `core-model`, like
+/// [`crate::ViewportConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStatus {
+    /// A fresh frame was rendered this tick — the preview is live.
+    Live,
+    /// The latest render could not produce a fresh frame; the pane holds the last
+    /// good output (or the neutral waiting frame before the first render).
+    LastGood,
+    /// The render thread has stopped — no further frames will arrive.
+    Stopped,
+}
+
+/// A structured engine event reported from the render thread (#62): either a
+/// liveness-status transition or a render error. Carried over an optional channel
+/// (like [`PositionUpdate`]) so the render thread never blocks and never touches
+/// the `AppHandle`; the app forwards it to the webview as the `engine-event` Tauri
+/// event, mapping it to the `core_model` wire types at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineEvent {
+    /// A liveness-status transition (live / last-good / stopped).
+    Status(EngineStatus),
+    /// A render error: a short stable `code` + a human-readable `message`. Engine
+    /// errors are not pass-tagged here (the engine renders a chain it was given);
+    /// pass/node tagging for slang-compile failures is added by the app, which
+    /// owns the pass→source mapping.
+    Error {
+        /// A short, stable, machine-readable category tag (e.g. `"deviceLost"`).
+        code: String,
+        /// The human-readable explanation of the problem.
+        message: String,
+    },
+}
+
 /// A [`FrameSource`] that renders a source image through a compiled slang shader
 /// on wgpu and reads the result back as a pane-sized binary frame.
 pub struct RenderSource {
@@ -189,6 +226,14 @@ pub struct RenderSource {
     position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
     /// The last position reported on `position_tx`, to suppress duplicate emits.
     last_reported_position: Option<usize>,
+    /// Optional sink for engine status/error events (#62). When set, each
+    /// `render_into` reports a live/last-good status *transition* (duplicates
+    /// suppressed) and render failures send an [`EngineEvent::Error`]. The app
+    /// forwards these as the `engine-event` Tauri event. `None` in headless tests.
+    event_tx: Option<std::sync::mpsc::Sender<EngineEvent>>,
+    /// The last status reported on `event_tx`, to suppress duplicate emits (so a
+    /// steadily-live or steadily-last-good stream sends one transition, not 60/s).
+    last_reported_status: Option<EngineStatus>,
 }
 
 impl RenderSource {
@@ -214,6 +259,20 @@ impl RenderSource {
         commands: Receiver<RenderCommand>,
         position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
     ) -> Result<Self, RendererError> {
+        Self::with_sinks(width, height, commands, position_tx, None)
+    }
+
+    /// Like [`RenderSource::with_position_sink`] but also wiring an engine
+    /// status/error sink (#62): live/last-good status transitions and render
+    /// failures are reported on `event_tx` for the app to forward as the
+    /// `engine-event` Tauri event. Either sink may be `None` (headless tests).
+    pub fn with_sinks(
+        width: u32,
+        height: u32,
+        commands: Receiver<RenderCommand>,
+        position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
+        event_tx: Option<std::sync::mpsc::Sender<EngineEvent>>,
+    ) -> Result<Self, RendererError> {
         Ok(Self {
             renderer: Renderer::new(width, height)?,
             commands,
@@ -224,19 +283,35 @@ impl RenderSource {
             fps: DEFAULT_PUMP_FPS,
             tick_accum: 0,
             pump_primed: false,
-            position_tx: None,
+            position_tx,
             last_reported_position: None,
-        }
-        .with_pos_sink(position_tx))
+            event_tx,
+            last_reported_status: None,
+        })
     }
 
-    /// Attach the position sink (small helper so the struct literal stays readable).
-    fn with_pos_sink(
-        mut self,
-        position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
-    ) -> Self {
-        self.position_tx = position_tx;
-        self
+    /// Report an engine status TRANSITION on the event sink (#62), suppressing
+    /// duplicates so a steady stream sends one event per change, not per frame. A
+    /// `None` sink (headless tests) is a no-op.
+    fn report_status(&mut self, status: EngineStatus) {
+        if self.last_reported_status == Some(status) {
+            return;
+        }
+        self.last_reported_status = Some(status);
+        if let Some(tx) = &self.event_tx {
+            // A closed receiver (app torn down) is harmless — drop the event.
+            let _ = tx.send(EngineEvent::Status(status));
+        }
+    }
+
+    /// Report a render error on the event sink (#62). A `None` sink is a no-op.
+    fn report_error(&self, code: &str, message: String) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(EngineEvent::Error {
+                code: code.to_string(),
+                message,
+            });
+        }
     }
 
     /// Drain and apply every queued command. Loads are applied in arrival order;
@@ -442,17 +517,30 @@ impl FrameSource for RenderSource {
         buf.clear();
 
         // Render one frame and read it back; on any failure fall through to the
-        // waiting frame so the stream keeps a valid, pane-sized output.
-        if self.ready() && self.renderer.render().is_ok() {
-            if let Ok(frame) = self.renderer.read_back() {
-                let header = FrameHeader::rgba8(frame.width, frame.height, index);
-                buf.reserve(FRAME_HEADER_LEN + header.payload_len());
-                header.write_to(buf);
-                buf.extend_from_slice(&frame.rgba);
-                return;
+        // waiting frame so the stream keeps a valid, pane-sized output. A fresh
+        // frame reports `Live`; a not-ready or failed render holds the last-good
+        // frame and reports `LastGood` (NOT an error — the §F "waiting" frame is a
+        // valid rendering state, #62). A hard render/readback FAILURE (distinct
+        // from "not ready yet") additionally reports a structured error event.
+        if self.ready() {
+            match self.renderer.render() {
+                Ok(()) => match self.renderer.read_back() {
+                    Ok(frame) => {
+                        let header = FrameHeader::rgba8(frame.width, frame.height, index);
+                        buf.reserve(FRAME_HEADER_LEN + header.payload_len());
+                        header.write_to(buf);
+                        buf.extend_from_slice(&frame.rgba);
+                        self.report_status(EngineStatus::Live);
+                        return;
+                    }
+                    Err(err) => self.report_error("readback", err.to_string()),
+                },
+                Err(err) => self.report_error("renderFailed", err.to_string()),
             }
         }
 
+        // Not ready yet, or a render/readback failure: hold the last-good frame.
+        self.report_status(EngineStatus::LastGood);
         write_solid_frame(buf, width, height, index, WAITING_RGBA);
     }
 }
@@ -780,6 +868,40 @@ void main() { FragColor = vec4(params.X, 0.0, 0.0, 1.0); }
         assert!(
             after_seek.iter().any(|u| u.index == 2 && u.len == 3),
             "seek must report position 2 of len 3, got {after_seek:?}"
+        );
+    }
+
+    #[test]
+    fn engine_status_reports_last_good_before_ready_then_live() {
+        // #62: before a shader+source are loaded the engine holds the waiting frame
+        // and reports `LastGood` (NOT an error — the waiting frame is a valid
+        // rendering state); once both are set it renders and reports `Live`. The
+        // status is a TRANSITION, deduped, so a steady stream emits one per change.
+        let (tx, rx) = mpsc::channel();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let mut src = RenderSource::with_sinks(8, 8, rx, None, Some(ev_tx)).expect("wgpu device");
+
+        let mut buf = Vec::new();
+        // No shader/source yet: two renders, but only ONE LastGood transition.
+        src.render_into(0, &mut buf);
+        src.render_into(1, &mut buf);
+
+        let shader = compile_slang(DEFAULT_SHADER, None).expect("compile");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(8, 8)))
+            .unwrap();
+        // Now ready: two renders, only ONE Live transition.
+        src.render_into(2, &mut buf);
+        src.render_into(3, &mut buf);
+
+        let events: Vec<EngineEvent> = ev_rx.try_iter().collect();
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::Status(EngineStatus::LastGood),
+                EngineEvent::Status(EngineStatus::Live),
+            ],
+            "expected exactly one LastGood then one Live transition, got {events:?}"
         );
     }
 

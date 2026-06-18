@@ -21,7 +21,10 @@ pub mod viewport;
 pub use bindtable::{PlaceholderResolver, TextureClass, TextureResolver};
 pub use frame::{FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, PIXEL_FORMAT_RGBA8};
 pub use pass::{AxisScale, Pass, ScaleConfig, ScaleType, WrapMode};
-pub use render_source::{PositionUpdate, RenderCommand, RenderSource, SourceSpec, DEFAULT_SHADER};
+pub use render_source::{
+    EngineEvent, EngineStatus, PositionUpdate, RenderCommand, RenderSource, SourceSpec,
+    DEFAULT_SHADER,
+};
 // Re-export `source`'s `TestPattern` so the app can build a `SourceSpec` without
 // a direct `source` import for that one type (it already depends on `source`).
 pub use renderer::{LutSpec, Renderer, RendererError, OFFSCREEN_FORMAT};
