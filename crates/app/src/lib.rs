@@ -50,6 +50,8 @@ pub fn run() {
             preview::load_test_pattern,
             preview::load_source_sequence,
             preview::load_shader,
+            preview::load_shader_source,
+            preview::load_chain_sources,
             preview::load_preset,
             preview::set_viewport,
             preview::set_simulated_viewport,
