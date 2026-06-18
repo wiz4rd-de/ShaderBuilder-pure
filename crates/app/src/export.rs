@@ -30,7 +30,7 @@
 
 use std::collections::BTreeMap;
 
-use core_model::{ExportError, ExportResult};
+use core_model::{ExportError, ExportResult, ExportValidation};
 
 /// Map the crate-internal [`preset_io::ExportError`] into the webview-facing,
 /// TS-exported [`core_model::ExportError`] (Fix C1). The two failure modes stay
@@ -60,6 +60,16 @@ pub fn export_preset(
     project: core_model::Project,
     dest_dir: String,
 ) -> Result<ExportResult, ExportError> {
+    // Fail-closed gate (#64, Spec §8 item 4): an invalid project is NEVER silently
+    // exported. The frontend runs `validate_export` first and disables the button,
+    // but the command re-checks as defense-in-depth so the writer is never invoked
+    // on a project it cannot represent. A blocker maps to the matching typed
+    // `ExportError` (a graph pass → `GraphPassUnsupported`, the very error the
+    // writer would otherwise raise — surfaced HERE before any bytes are written).
+    let validation = preset_io::validate_for_export(&project);
+    if let Some(err) = blocker_to_error(&validation) {
+        return Err(err);
+    }
     // The editable project carries no preserved unknown keys, so extras is empty
     // here (see the module docs).
     let report =
@@ -69,6 +79,35 @@ pub fn export_preset(
         pass_files: report.pass_files,
         texture_files: report.texture_files,
         warnings: report.warnings,
+    })
+}
+
+/// Validate a project for export (#64), returning the structured blockers the
+/// export dialog lists. The frontend calls this to disable "Export" while the
+/// project is not exportable and show the exact reasons (links into the Problems
+/// panel). Never fails — an exportable project returns an empty blocker list
+/// ([`ExportValidation::ok`]).
+#[tauri::command]
+pub fn validate_export(project: core_model::Project) -> ExportValidation {
+    preset_io::validate_for_export(&project)
+}
+
+/// Map a non-`ok` [`ExportValidation`] onto the matching typed [`ExportError`] for
+/// the fail-closed gate inside [`export_preset`]. Returns `None` when the project
+/// is exportable. The first blocker decides the error: a graph pass becomes
+/// `GraphPassUnsupported` (the writer's own error, raised before any write), and
+/// the other structural blockers (no passes / empty source) become an `Io`-shaped
+/// message — they are pre-write refusals, not OS errors, but reuse the existing
+/// typed surface rather than widening the IPC error enum.
+fn blocker_to_error(validation: &ExportValidation) -> Option<ExportError> {
+    use core_model::ExportBlocker;
+    validation.blockers.first().map(|b| match b {
+        ExportBlocker::UncompiledGraphPass { pass_id, .. } => ExportError::GraphPassUnsupported {
+            pass_id: pass_id.clone(),
+        },
+        other => ExportError::Io {
+            message: format!("refusing to export: {other}"),
+        },
     })
 }
 
@@ -164,5 +203,50 @@ mod tests {
             ExportError::GraphPassUnsupported { pass_id } => assert_eq!(pass_id, "graph-pass"),
             other => panic!("expected GraphPassUnsupported, got {other:?}"),
         }
+    }
+
+    /// The fail-closed gate (#64): a project with a graph pass is refused BEFORE
+    /// the writer runs, so NO bundle files (not even `preset.slangp`) are written.
+    #[test]
+    fn export_gate_writes_nothing_for_an_invalid_project() {
+        use core_model::{Graph, Pass, PassSettings, PassSource, Project};
+
+        let project = Project {
+            passes: vec![Pass {
+                id: "graph-pass".to_owned(),
+                name: "Graph".to_owned(),
+                source: PassSource::Graph {
+                    graph: Graph::default(),
+                },
+                parameters: vec![],
+                references: vec![],
+                settings: PassSettings::default(),
+            }],
+            ..Project::empty("Invalid Export")
+        };
+
+        let out = tempfile::tempdir().unwrap();
+        let err = export_preset(project, out.path().to_string_lossy().into_owned())
+            .expect_err("invalid project must be refused");
+        assert!(matches!(err, ExportError::GraphPassUnsupported { .. }));
+
+        // The gate refused before invoking the writer: the destination is empty.
+        let entries: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "no files must be written when the export gate refuses, found {} entries",
+            entries.len()
+        );
+    }
+
+    /// `validate_export` surfaces the structured blockers the dialog lists (#64).
+    #[test]
+    fn validate_export_reports_blockers() {
+        use core_model::{ExportBlocker, Project};
+
+        // An empty project has no passes to export.
+        let v = validate_export(Project::empty("empty"));
+        assert!(!v.ok());
+        assert!(matches!(v.blockers.as_slice(), [ExportBlocker::NoPasses]));
     }
 }

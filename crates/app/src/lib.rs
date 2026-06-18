@@ -93,6 +93,7 @@ pub fn run() {
             preview::seek,
             preview::set_fps,
             export::export_preset,
+            export::validate_export,
             project::save_project,
             project::load_project,
             graph::compile_graph,
