@@ -108,6 +108,34 @@ export interface NodeDescriptor<D extends NodeData = NodeData> {
    * unknown LUT otherwise). Most descriptors omit this.
    */
   toLutName?: (data: D) => string | null;
+  /**
+   * If present, this node's input/output ports are USER-EDITABLE (only the
+   * custom-snippet node, #52, is). The inspector (#47) renders generic
+   * add/remove/rename/retype controls and writes the result back into `data`
+   * through `setPorts`, which returns a `data` patch. When absent, the node's
+   * ports are fixed by the descriptor and the inspector shows them read-only.
+   */
+  editablePorts?: EditablePorts<D>;
+}
+
+/** A node's full editable port signature (custom-snippet, #52). */
+export interface PortSignature {
+  inputs: PortSpec[];
+  outputs: PortSpec[];
+}
+
+/**
+ * The capability that makes a node's ports user-editable. Keeps the storage
+ * shape (which `data` keys hold the port lists) descriptor-private: the generic
+ * inspector port editor reads the current signature via `inputs`/`outputs`,
+ * and writes an edited signature back as a `data` patch via `setPorts`.
+ */
+export interface EditablePorts<D extends NodeData = NodeData> {
+  /** Build the `data` patch that records the edited port signature. */
+  setPorts: (data: D, signature: PortSignature) => Partial<D>;
+  /** Whether a given side may be edited (both default true). */
+  allowInputs?: boolean;
+  allowOutputs?: boolean;
 }
 
 /** Thrown by a descriptor's `toNodeOp` when `node.data` is structurally invalid. */

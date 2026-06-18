@@ -1,5 +1,6 @@
 import "./App.css";
 import { EditorCanvas } from "./editor/EditorCanvas";
+import { InspectorPanel } from "./inspector/InspectorPanel";
 import { useDocumentStore } from "./store/documentStore";
 import { PreviewCanvas } from "./preview/PreviewCanvas";
 
@@ -22,13 +23,19 @@ export default function App() {
           <EditorCanvas />
         </main>
 
-        {/* Preview region — the wgpu frame stream blits into a <canvas> here. */}
-        <aside className="preview" aria-label="Preview">
-          <div className="preview__header">Preview</div>
-          <div className="preview__pane">
-            <PreviewCanvas />
-          </div>
-        </aside>
+        {/* Right region — a simple rail (#47) the inspector + preview stack in.
+            #48 replaces this with the dockable/tabbed panel layout. */}
+        <div className="app__right" aria-label="Panels">
+          <InspectorPanel />
+
+          {/* Preview region — the wgpu frame stream blits into a <canvas> here. */}
+          <aside className="preview" aria-label="Preview">
+            <div className="preview__header">Preview</div>
+            <div className="preview__pane">
+              <PreviewCanvas />
+            </div>
+          </aside>
+        </div>
       </div>
     </div>
   );
