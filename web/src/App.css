@@ -1079,6 +1079,15 @@
   min-height: 0;
 }
 
+/* The canvas + split-divider overlay share one positioning context (#60) so the
+   divider can be absolutely placed over the rendered frame. */
+.preview__viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
 .preview__canvas {
   flex: 1 1 auto;
   min-height: 0;
@@ -1089,6 +1098,88 @@
   background: #000;
   /* Retro content is low-res by nature — keep pixels crisp when upscaled. */
   image-rendering: pixelated;
+}
+
+/* ---- A/B compare + split-view (#60) ---- */
+.preview__compare {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.preview__compare button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.preview__compare button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.preview__compare button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.preview__compare-modes {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.preview__compare-modes button {
+  border: none;
+  border-radius: 0;
+  border-right: 1px solid var(--border);
+}
+.preview__compare-modes button:last-child {
+  border-right: none;
+}
+.preview__compare-mode--active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.preview__compare-shown {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The split divider line + grab handle laid over the rendered frame. */
+.preview__divider {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+.preview__divider--vertical {
+  cursor: ew-resize;
+  /* A zero-width line; the visible bar is a centered pseudo via the handle. */
+  border-left: 2px solid var(--accent);
+  transform: translateX(-1px);
+}
+.preview__divider--horizontal {
+  cursor: ns-resize;
+  border-top: 2px solid var(--accent);
+  transform: translateY(-1px);
+}
+
+.preview__divider-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
 }
 
 .preview__stats {
