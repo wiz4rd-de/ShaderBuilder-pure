@@ -937,8 +937,10 @@ fn check_componentwise_operands(
     }
 }
 
-/// `construct { ty }`: the operands' component counts must sum exactly to the
-/// target vector's component count, and every operand must be numeric.
+/// `construct { ty }`: every operand must be numeric, and the operands' component
+/// counts must either **sum exactly** to the target vector's component count
+/// (e.g. `vec4(vec3, float)`) **or** be a single scalar that broadcasts to fill
+/// every component (GLSL `vec4(x)`).
 fn check_construct_operands(
     node_id: &str,
     ty: PortType,
@@ -966,11 +968,19 @@ fn check_construct_operands(
         }
         sum += t.component_count().unwrap_or(0);
     }
-    if sum != target {
+    // A single scalar operand broadcasts to fill all components (GLSL `vec4(x)`).
+    let single_scalar_broadcast = resolved.len() == 1
+        && resolved
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(PortType::is_scalar);
+    if sum != target && !single_scalar_broadcast {
         diags.push(Diagnostic::error(
             codes::OPERAND_TYPE,
             format!(
-                "`construct` of {ty:?} needs operands summing to {target} components, got {sum}"
+                "`construct` of {ty:?} needs operands summing to {target} components (or a single \
+                 broadcast scalar), got {sum}"
             ),
             node_id,
         ));
