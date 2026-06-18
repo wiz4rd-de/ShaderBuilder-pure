@@ -175,4 +175,35 @@ describe("compileProject", () => {
     expect(result.diagnosticsByNode["bad"]?.[0]?.code).toBe("unknownKind");
     expect(result.problems.some((p) => p.diagnostic.node === "bad")).toBe(true);
   });
+
+  it("refuses to dispatch a pass whose sampler references a removed pass (#2/#3)", async () => {
+    // removePass writes DANGLING_INDEX (-1) into a sampler whose pass was deleted
+    // (pipeline/passOps.ts). The bridge/compile layer must SURFACE this as a
+    // node-level error and NOT dispatch a mis-wired chain to the preview — even
+    // though the (fake here, real in prod) compile_graph still returns a source.
+    const graph: Graph = {
+      nodes: [
+        { id: "coord", kind: "texcoord", position: { x: 0, y: 0 }, data: {} },
+        // index -1 = DANGLING_INDEX: would clamp to PassOutput0 under the old bug.
+        { id: "samp", kind: "passOutput", position: { x: 0, y: 0 }, data: { index: -1 } },
+        { id: "out", kind: "output", position: { x: 0, y: 0 }, data: {} },
+      ],
+      edges: [
+        { id: "e1", source: "coord", sourcePort: "uv", target: "samp", targetPort: "coord" },
+        { id: "e2", source: "samp", sourcePort: "out", target: "out", targetPort: "color" },
+      ],
+    };
+    // cleanCompile would return a source for the (incomplete) graph; the refusal
+    // must come from the FRONTEND, not from compile_graph.
+    const compile = cleanCompile("// would-be-mis-wired");
+    const result = await compileProject(project([graphPass("g", graph)]), compile);
+    // The offending sampler node carries an error diagnostic.
+    const diag = result.diagnosticsByNode["samp"]?.[0];
+    expect(diag?.severity).toBe("error");
+    expect(diag?.message).toMatch(/removed pass/);
+    expect(result.problems.some((p) => p.diagnostic.node === "samp")).toBe(true);
+    // The mis-wired chain is NOT renderable / NOT dispatched to the preview.
+    expect(result.passes[0]!.source).toBeNull();
+    expect(result.valid).toBe(false);
+  });
 });

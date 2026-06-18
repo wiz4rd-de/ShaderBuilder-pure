@@ -1,8 +1,11 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { CompileGraphResult } from "../bindings/CompileGraphResult";
 import type { Node } from "../bindings/Node";
 import type { Pass } from "../bindings/Pass";
 import type { Project } from "../bindings/Project";
+import { compileProject, type InvokeCompile } from "../compile/compileLoop";
+import { getDescriptor } from "../nodes/registry";
 import { emptyPassSettings, makeProject } from "../store/factories";
 import { resetIdsForTest } from "../store/ids";
 import {
@@ -124,6 +127,64 @@ describe("passOps — removePass remaps + dangles", () => {
     const next = removePass(project, "p0");
     const p1 = next.passes.find((p) => p.id === "p1")!;
     expect(sampledIndex(p1, "s1")).toBe(DANGLING_INDEX);
+  });
+
+  it("the dangling sentinel SURFACES as a compile refusal, not a silent index 0 (#3)", async () => {
+    // The data-layer test above only proves removePass STORES the sentinel; this
+    // proves the policy promised in passOps.ts — the downstream compile surfaces
+    // it as an error rather than silently re-pointing the chain at PassOutput0.
+    //
+    // A 2-pass chain: p0, and p1 whose graph samples PassOutput0 (= p0).
+    const base = makeProject();
+    const samplerGraph = (index: number): Pass => ({
+      id: "p1",
+      name: "P1",
+      source: {
+        kind: "graph",
+        graph: {
+          nodes: [
+            { id: "coord", kind: "texcoord", position: { x: 0, y: 0 }, data: {} },
+            { id: "s1", kind: "passOutput", position: { x: 0, y: 0 }, data: { index } },
+            { id: "out", kind: "output", position: { x: 0, y: 0 }, data: {} },
+          ],
+          edges: [
+            { id: "e1", source: "coord", sourcePort: "uv", target: "s1", targetPort: "coord" },
+            { id: "e2", source: "s1", sourcePort: "out", target: "out", targetPort: "color" },
+          ],
+        },
+      },
+      parameters: [],
+      settings: emptyPassSettings(),
+      references: [],
+    });
+    const project: Project = {
+      ...base,
+      passes: [graphPass("p0", "P0", []), samplerGraph(0)],
+    };
+    // Removing p0 dangles p1's sampler (PassOutput0 → DANGLING_INDEX).
+    const dangled = removePass(project, "p0");
+    const p1 = dangled.passes.find((p) => p.id === "p1")!;
+    expect(sampledIndex(p1, "s1")).toBe(DANGLING_INDEX);
+
+    // toNodeOp must NOT silently yield texture index 0 for the dangling sampler —
+    // it must throw so the bridge can surface a node diagnostic instead.
+    expect(() =>
+      getDescriptor("passOutput")!.toNodeOp({ index: DANGLING_INDEX }),
+    ).toThrow(/removed pass/);
+
+    // A compile_graph that would happily return a (mis-wired) source: the refusal
+    // must come from the FRONTEND, not from compile_graph.
+    const compile: InvokeCompile = vi.fn(
+      async () => ({ source: "// would-be-mis-wired", diagnostics: { items: [] } }) as CompileGraphResult,
+    );
+    const result = await compileProject(dangled, compile);
+    // The offending sampler node carries an inline error diagnostic.
+    expect(result.diagnosticsByNode["s1"]?.[0]?.severity).toBe("error");
+    expect(result.diagnosticsByNode["s1"]?.[0]?.message).toMatch(/removed pass/);
+    // The mis-wired chain is invalid and never dispatched to the preview.
+    expect(result.valid).toBe(false);
+    const p1Result = result.passes.find((p) => p.passId === "p1")!;
+    expect(p1Result.source).toBeNull();
   });
 
   it("refuses to remove the last remaining pass", () => {
