@@ -179,6 +179,54 @@ describe("LibraryPanel", () => {
     expect(sub1.nodes[0]!.id).not.toBe(sub2.nodes[0]!.id);
   });
 
+  it("mints a durable-unique item id per save (survives a counter reset across sessions)", async () => {
+    // Fix B: the persisted item id must be durable-unique. `nextId` resets to 0
+    // each launch, so two sessions' first saves would both mint `lib-1` and the
+    // backend would overwrite the prior item. `crypto.randomUUID` is durable.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_library_node") return Promise.resolve([]);
+      return Promise.resolve();
+    });
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValue("Name") // every prompt (name/description/tags)
+      .mockReturnValueOnce("First");
+
+    // --- session 1 ---
+    openPass();
+    const n1 = store().addNode("texcoord", { x: 0, y: 0 });
+    store().setSelection({ nodeIds: [n1], edgeIds: [] });
+    const { unmount } = renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((c) => c[0] === "save_library_node")).toBe(true),
+    );
+    const firstId = (invoke.mock.calls.find((c) => c[0] === "save_library_node")![1] as {
+      item: LibraryItem;
+    }).item.id;
+    unmount();
+
+    // --- session 2: a fresh launch resets the per-process id counter to 0 ---
+    invoke.mockClear();
+    resetIdsForTest();
+    store().reset();
+    openPass();
+    const n2 = store().addNode("texcoord", { x: 0, y: 0 });
+    store().setSelection({ nodeIds: [n2], edgeIds: [] });
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((c) => c[0] === "save_library_node")).toBe(true),
+    );
+    const secondId = (invoke.mock.calls.find((c) => c[0] === "save_library_node")![1] as {
+      item: LibraryItem;
+    }).item.id;
+
+    // Distinct ids despite the counter reset — no cross-session overwrite.
+    expect(secondId).not.toBe(firstId);
+    promptSpy.mockRestore();
+  });
+
   it("deletes an item behind a confirm and refreshes", async () => {
     let listed: LibraryItem[] = [nodeItem()];
     invoke.mockImplementation((cmd: string, args?: unknown) => {

@@ -117,7 +117,13 @@ export function LibraryPanel(): React.JSX.Element {
       .map((t) => t.trim())
       .filter((t) => t.length > 0);
     const item: LibraryItem = {
-      id: nextId("lib"),
+      // The persisted library item id is an on-disk primary key (save_item names
+      // <id>.json), so it MUST be durable-unique ACROSS sessions. `nextId` is a
+      // per-process counter that resets to 0 every launch (fine for in-document
+      // node/edge ids, NOT for a persistent key) — a second session would reuse
+      // `lib-1` and silently overwrite a prior item. `crypto.randomUUID` is
+      // durable + collision-free (available in jsdom/Node + the Tauri webview).
+      id: crypto.randomUUID(),
       name: trimmed,
       description: description.trim().length > 0 ? description.trim() : null,
       tags,
