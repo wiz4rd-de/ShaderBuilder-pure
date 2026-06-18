@@ -1,14 +1,20 @@
 import "./App.css";
+import { useCompileLoop } from "./compile/useCompileLoop";
 import { EditorCanvas } from "./editor/EditorCanvas";
 import { PanelLayout } from "./panels/PanelLayout";
 import { useDocumentStore } from "./store/documentStore";
 import { PreviewCanvas } from "./preview/PreviewCanvas";
 
 // Phase 5: the node-editor shell. The React Flow canvas (with palette, toolbar,
-// status bar, undo/redo, copy/paste) is driven by the document store; the node
-// taxonomy, inspectors, pipeline view, and live compile arrive in later issues.
+// status bar, undo/redo, copy/paste) is driven by the document store; #54 closes
+// the live edit → compile → preview loop via useCompileLoop.
 export default function App() {
   const projectName = useDocumentStore((s) => s.project.name);
+
+  // The debounced live compile loop (#54): document edits → graphToIr →
+  // compile_graph per pass → node-keyed diagnostics + the generated chain pushed
+  // to the engine preview. Runs for the app's lifetime.
+  useCompileLoop();
 
   return (
     <div className="app">
