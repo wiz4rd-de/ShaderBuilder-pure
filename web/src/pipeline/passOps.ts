@@ -20,7 +20,9 @@
 //
 // Alias-based references (TextureSource carries no alias variant in the frozen
 // IR, so graph passes reference earlier passes only by index) need no remap.
+import type { Graph } from "../bindings/Graph";
 import type { Pass } from "../bindings/Pass";
+import type { PassSource } from "../bindings/PassSource";
 import type { Project } from "../bindings/Project";
 
 /** Sentinel stored for an index reference whose target pass was removed. */
@@ -140,4 +142,57 @@ export function reorderPass(project: Project, from: number, to: number): Project
     oldToNew.set(oldIndex, idToNew.get(p.id)!);
   });
   return applyPermutation(project, nextPasses, oldToNew);
+}
+
+// ---- Pass-source kind switching (#52) -------------------------------------
+//
+// A PASS is authored EITHER as a node `Graph` OR as opaque `WholePassCode`
+// (PassSource is the discriminated union). #52 lets the author switch a pass
+// between the two representations, and edit the whole-pass source string. These
+// are PURE transforms over a single Pass; the store wraps them as one undo entry.
+
+/**
+ * Convert a pass to a WHOLE-PASS CODE pass holding `source` verbatim (opaque —
+ * never decomposed into node-IR). A no-op (same reference) when the pass already
+ * is whole-pass code with the same source. Its graph (if any) is DISCARDED — the
+ * caller (store) keeps an undo entry so the switch is reversible.
+ */
+export function passToWholePassCode(pass: Pass, source: string): Pass {
+  if (
+    pass.source.kind === "wholePassCode" &&
+    pass.source.source === source
+  ) {
+    return pass;
+  }
+  const next: PassSource = {
+    kind: "wholePassCode",
+    source,
+    // Authored-in-editor source has no originating file; import sets a filename.
+    filename: pass.source.kind === "wholePassCode" ? pass.source.filename : null,
+    opaque: true,
+  };
+  return { ...pass, source: next };
+}
+
+/**
+ * Convert a pass to a GRAPH pass carrying `graph` (defaulting to an empty graph).
+ * A no-op when the pass already is a graph pass. Its whole-pass source (if any)
+ * is DISCARDED; the store keeps an undo entry so the switch is reversible.
+ */
+export function passToGraph(pass: Pass, graph: Graph = { nodes: [], edges: [] }): Pass {
+  if (pass.source.kind === "graph") {
+    return pass;
+  }
+  return { ...pass, source: { kind: "graph", graph } };
+}
+
+/**
+ * Replace the verbatim source of a whole-pass code pass. A no-op (same reference)
+ * when the pass is not whole-pass code or the source is unchanged.
+ */
+export function setWholePassSource(pass: Pass, source: string): Pass {
+  if (pass.source.kind !== "wholePassCode" || pass.source.source === source) {
+    return pass;
+  }
+  return { ...pass, source: { ...pass.source, source } };
 }

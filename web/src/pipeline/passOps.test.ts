@@ -5,7 +5,15 @@ import type { Pass } from "../bindings/Pass";
 import type { Project } from "../bindings/Project";
 import { emptyPassSettings, makeProject } from "../store/factories";
 import { resetIdsForTest } from "../store/ids";
-import { addPass, DANGLING_INDEX, removePass, reorderPass } from "./passOps";
+import {
+  addPass,
+  DANGLING_INDEX,
+  passToGraph,
+  passToWholePassCode,
+  removePass,
+  reorderPass,
+  setWholePassSource,
+} from "./passOps";
 
 // A sampler node binding an earlier pass BY INDEX (PassOutputN / PassFeedbackN).
 function indexSampler(id: string, kind: "passOutput" | "passFeedback", index: number): Node {
@@ -121,5 +129,65 @@ describe("passOps — removePass remaps + dangles", () => {
   it("refuses to remove the last remaining pass", () => {
     const base = makeProject();
     expect(removePass(base, base.passes[0]!.id)).toBe(base);
+  });
+});
+
+describe("passOps — pass-source kind switching (#52)", () => {
+  const SRC = "#version 450\n#pragma stage fragment\nvoid main() {}\n";
+
+  it("passToWholePassCode replaces a graph pass with opaque code", () => {
+    const pass = graphPass("p", "Pass 1", [indexSampler("s", "passOutput", 0)]);
+    const next = passToWholePassCode(pass, SRC);
+    expect(next.source.kind).toBe("wholePassCode");
+    if (next.source.kind === "wholePassCode") {
+      expect(next.source.source).toBe(SRC);
+      expect(next.source.opaque).toBe(true);
+      expect(next.source.filename).toBeNull();
+    }
+  });
+
+  it("passToWholePassCode is a no-op when source already matches", () => {
+    const pass = passToWholePassCode(graphPass("p", "Pass 1", []), SRC);
+    expect(passToWholePassCode(pass, SRC)).toBe(pass);
+  });
+
+  it("passToWholePassCode preserves an existing filename", () => {
+    const imported: Pass = {
+      id: "p",
+      name: "Imported",
+      source: { kind: "wholePassCode", source: "old", filename: "crt.slang", opaque: true },
+      parameters: [],
+      settings: emptyPassSettings(),
+      references: [],
+    };
+    const next = passToWholePassCode(imported, SRC);
+    if (next.source.kind === "wholePassCode") {
+      expect(next.source.filename).toBe("crt.slang");
+    }
+  });
+
+  it("passToGraph converts a whole-pass code pass back to an empty graph", () => {
+    const code = passToWholePassCode(graphPass("p", "Pass 1", []), SRC);
+    const next = passToGraph(code);
+    expect(next.source.kind).toBe("graph");
+    if (next.source.kind === "graph") {
+      expect(next.source.graph).toEqual({ nodes: [], edges: [] });
+    }
+  });
+
+  it("passToGraph is a no-op for a pass that already is a graph", () => {
+    const pass = graphPass("p", "Pass 1", []);
+    expect(passToGraph(pass)).toBe(pass);
+  });
+
+  it("setWholePassSource edits the verbatim source, no-op when unchanged or a graph", () => {
+    const code = passToWholePassCode(graphPass("p", "Pass 1", []), SRC);
+    const edited = setWholePassSource(code, "changed");
+    if (edited.source.kind === "wholePassCode") {
+      expect(edited.source.source).toBe("changed");
+    }
+    expect(setWholePassSource(code, SRC)).toBe(code);
+    const graph = graphPass("g", "Pass 2", []);
+    expect(setWholePassSource(graph, "x")).toBe(graph);
   });
 });

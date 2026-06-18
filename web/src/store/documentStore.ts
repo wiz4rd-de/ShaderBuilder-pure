@@ -32,7 +32,14 @@ import type { Node } from "../bindings/Node";
 import type { PassSettings } from "../bindings/PassSettings";
 import type { Project } from "../bindings/Project";
 import type { Vec2 } from "../bindings/Vec2";
-import { addPass, removePass, reorderPass } from "../pipeline/passOps";
+import {
+  addPass,
+  passToGraph,
+  passToWholePassCode,
+  removePass,
+  reorderPass,
+  setWholePassSource,
+} from "../pipeline/passOps";
 import {
   captureClipboard,
   instantiateClipboard,
@@ -188,6 +195,26 @@ export interface DocumentState {
    * `null` to clear it. One undo entry; no-op when unchanged.
    */
   setFeedbackPass: (index: number | null) => void;
+
+  // ---- pass-source kind switching (#52) ----
+  /**
+   * Switch a pass to a WHOLE-PASS CODE pass holding `source` verbatim (opaque,
+   * never decomposed into node-IR). Its node graph (if any) is discarded. One
+   * undo entry; no-op when already whole-pass code with the same source.
+   */
+  setPassToWholePassCode: (passId: string, source: string) => void;
+  /**
+   * Switch a pass back to a GRAPH pass (carrying `graph`, default empty). Its
+   * whole-pass source is discarded. One undo entry; no-op when already a graph.
+   */
+  setPassToGraph: (passId: string, graph?: Graph) => void;
+  /**
+   * LIVE, non-committing replace of a whole-pass code pass's verbatim source
+   * (the code-editor's per-keystroke path) — pair with `beginInteraction()` +
+   * `commit()` to coalesce a typing burst into one undo entry. No-op when the
+   * pass is not whole-pass code.
+   */
+  patchWholePassSource: (passId: string, source: string) => void;
 
   /** Set (or clear) the selected pass in the pipeline view. */
   setPipelineSelection: (passId: string | null) => void;
@@ -628,6 +655,73 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         past: pushPast(before),
         future: [],
         dirty: true,
+      });
+    },
+
+    setPassToWholePassCode: (passId, source) => {
+      const { project } = get();
+      const pass = project.passes.find((p) => p.id === passId);
+      if (!pass) {
+        return;
+      }
+      const next = passToWholePassCode(pass, source);
+      if (next === pass) {
+        return;
+      }
+      const before = snapshot();
+      set({
+        project: {
+          ...project,
+          passes: project.passes.map((p) => (p.id === passId ? next : p)),
+        },
+        // The pass no longer has a node graph — clear any node selection in it.
+        selection:
+          get().activePassId === passId ? { nodeIds: [], edgeIds: [] } : get().selection,
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    setPassToGraph: (passId, graph) => {
+      const { project } = get();
+      const pass = project.passes.find((p) => p.id === passId);
+      if (!pass) {
+        return;
+      }
+      const next = passToGraph(pass, graph);
+      if (next === pass) {
+        return;
+      }
+      const before = snapshot();
+      set({
+        project: {
+          ...project,
+          passes: project.passes.map((p) => (p.id === passId ? next : p)),
+        },
+        past: pushPast(before),
+        future: [],
+        dirty: true,
+      });
+    },
+
+    patchWholePassSource: (passId, source) => {
+      set((s) => {
+        const pass = s.project.passes.find((p) => p.id === passId);
+        if (!pass) {
+          return {};
+        }
+        const next = setWholePassSource(pass, source);
+        if (next === pass) {
+          return {};
+        }
+        return {
+          project: {
+            ...s.project,
+            passes: s.project.passes.map((p) => (p.id === passId ? next : p)),
+          },
+          dirty: true,
+        };
       });
     },
 
