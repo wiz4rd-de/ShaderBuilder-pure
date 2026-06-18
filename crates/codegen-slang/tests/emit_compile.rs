@@ -505,6 +505,62 @@ fn fixture_int_scalar_arithmetic() -> Fixture {
     }
 }
 
+/// Samples BOTH `Original` and `OriginalHistory{index:0}`. These reference the
+/// SAME RetroArch texture (`OriginalHistory0` ≡ `Original`, §5) and emit the same
+/// slang identifier `Original`. Lowering must collapse them to ONE manifest
+/// sampler so the emitter declares a single `sampler2D Original` — two decls would
+/// be a GLSL redefinition that fails to compile. Proves the dedup keeps the
+/// clean-checks ⇒ compiles invariant.
+fn fixture_original_history_zero_alias() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::Const {
+                    value: ConstValue::Vec2 { value: [0.5, 0.5] },
+                },
+            ),
+            IrNode::new(
+                "orig",
+                NodeOp::Sample {
+                    texture: TextureSource::Original,
+                },
+            ),
+            IrNode::new(
+                "hist0",
+                NodeOp::Sample {
+                    texture: TextureSource::OriginalHistory { index: 0 },
+                },
+            ),
+            IrNode::new(
+                "add",
+                NodeOp::Expr {
+                    op: ExprOp::Add,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out", "orig", "coord"),
+            IrEdge::new("uv", "out", "hist0", "coord"),
+            IrEdge::new("orig", "out", "add", "a"),
+            IrEdge::new("hist0", "out", "add", "b"),
+            IrEdge::new("add", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "original_history_zero_alias",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("orig_hist0".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    }
+}
+
 fn all_fixtures() -> Vec<Fixture> {
     vec![
         fixture_passthrough_brightness(),
@@ -515,6 +571,7 @@ fn all_fixtures() -> Vec<Fixture> {
         fixture_builtins(),
         fixture_scalar_to_output_broadcast(),
         fixture_int_scalar_arithmetic(),
+        fixture_original_history_zero_alias(),
     ]
 }
 
@@ -576,6 +633,32 @@ fn fixtures_emit_compile_and_match_snapshots() {
             fx.name
         );
     }
+}
+
+/// Dedup acceptance: a graph sampling both `Original` and `OriginalHistory{0}`
+/// (the same RetroArch texture) must emit a SINGLE `sampler2D Original` decl — two
+/// would be a GLSL redefinition. Proves the lowering canonicalization reaches the
+/// emitter (no duplicate-decl compile failure).
+#[test]
+fn original_history_zero_alias_emits_a_single_sampler_decl() {
+    let fx = fixture_original_history_zero_alias();
+
+    assert!(!check(&fx.graph, &fx.ctx).has_errors());
+    let lowered = lower(&fx.graph, &fx.ctx).expect("lowers clean");
+    let slang = emit_pass(&lowered, &fx.opts);
+
+    // Compiles through the real path: a duplicate `sampler2D Original` would be a
+    // redefinition error here.
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("orig/hist0 slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+
+    // Exactly one `sampler2D Original;` decl is emitted, not two.
+    assert_eq!(
+        slang.matches("uniform sampler2D Original;").count(),
+        1,
+        "Original + OriginalHistory0 must collapse to a single sampler decl:\n{slang}"
+    );
 }
 
 /// The #43 collision acceptance test: two CustomSnippet nodes that each declare a
