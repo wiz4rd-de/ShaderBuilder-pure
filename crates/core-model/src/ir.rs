@@ -235,6 +235,58 @@ const fn port_type_eq(a: PortType, b: PortType) -> bool {
     a as u8 == b as u8
 }
 
+/// The **kind of sink** an edge is dropped onto, abstracting the one detail the
+/// edge-legality rule turns on: the sink input port's *expected* type and the
+/// special tightening some ports apply (Spec §8.2 + #65).
+///
+/// This is the editor-facing distillation of the type checker's
+/// `input_port_type` + `edge_assignable` logic (`ir::typecheck`): the in-editor
+/// connection guard (#65) resolves a drop target's [`NodeOp`] from its descriptor
+/// and classifies the targeted input port into one of these cases, then calls
+/// [`connection_legal`] — guaranteeing the editor's drag-time verdict AGREES with
+/// what `compile_graph` would later decide for the same wire (proven by a parity
+/// test that drives this same enum from real `NodeOp`s through the full checker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTarget {
+    /// A fixed-typed sink port that follows the documented
+    /// [`assignable_to`](PortType::assignable_to) rule (exact, `Int→Float`
+    /// widen, or `Float→vecN` broadcast). Carries the port's declared type —
+    /// e.g. an [`Output`](NodeOp::Output) `color` (`Vec4`) or a
+    /// [`CustomSnippet`](NodeOp::CustomSnippet) declared input port.
+    Assignable(PortType),
+    /// The **tightened** `vec2` coord sink of a [`Sample`](NodeOp::Sample): the
+    /// source must already be a real `vec2` — no `Float→vec2` scalar broadcast
+    /// into a UV coordinate (which the emitter cannot lower). See
+    /// `ir::typecheck::edge_assignable`.
+    SampleCoord,
+    /// A **polymorphic** [`Expr`](NodeOp::Expr) operand. The operator is
+    /// type-polymorphic, so the *structural* edge assignment is reflexive (always
+    /// legal); the real operand-type constraints (numeric/arity/swizzle-mask) are
+    /// validated separately by `compile_graph` operand inference, NOT at drag
+    /// time. Mirrors `input_port_type`'s reflexive return for `Expr` operands.
+    ExprOperand,
+}
+
+/// Whether a value of type `src_ty` may legally feed a sink described by
+/// `target` — the **single source of truth** for edge legality, shared between
+/// the type checker (`ir::typecheck::edge_assignable`, which delegates here) and
+/// the in-editor connection guard (#65, a TS port proven equivalent by a parity
+/// golden).
+///
+/// - [`ConnectionTarget::Assignable(ty)`](ConnectionTarget::Assignable): the
+///   documented [`assignable_to`](PortType::assignable_to) rule.
+/// - [`ConnectionTarget::SampleCoord`](ConnectionTarget::SampleCoord): exact
+///   match only (no scalar broadcast into a UV).
+/// - [`ConnectionTarget::ExprOperand`](ConnectionTarget::ExprOperand): always
+///   legal structurally (operand-type checks are deferred to `compile_graph`).
+pub fn connection_legal(src_ty: PortType, target: ConnectionTarget) -> bool {
+    match target {
+        ConnectionTarget::Assignable(tgt_ty) => src_ty.assignable_to(tgt_ty),
+        ConnectionTarget::SampleCoord => port_type_eq(src_ty, PortType::Vec2),
+        ConnectionTarget::ExprOperand => true,
+    }
+}
+
 /// A concrete RetroArch texture a [`NodeOp::Sample`] reads from (Spec §7 binding
 /// table). This is the **typed, resolved** reference (it carries its index/name),
 /// distinct from the import-scan's coarse [`TextureRefKind`](crate::TextureRefKind)

@@ -35,7 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use core_model::ir::{
-    Diagnostic, Diagnostics, ExprOp, IrEdge, IrGraph, IrNode, NodeOp, PortType, TextureSource,
+    connection_legal, ConnectionTarget, Diagnostic, Diagnostics, ExprOp, IrEdge, IrGraph, IrNode,
+    NodeOp, PortType, TextureSource,
 };
 
 /// Stable machine-readable [`Diagnostic::code`] tags the checker emits. Grouped
@@ -814,11 +815,26 @@ fn input_port_type(
 /// feed it. Keeping the edge rule aligned with what the emitter produces upholds
 /// the clean-checks ⇒ compiles invariant.
 fn edge_assignable(op: &NodeOp, port: &str, src_ty: PortType, tgt_ty: PortType) -> bool {
-    if matches!(op, NodeOp::Sample { .. }) && port == "coord" {
-        // The coord must already be a vec2 — no scalar broadcast into a UV.
-        return src_ty == tgt_ty;
+    // Delegate to the shared `connection_legal` predicate (core-model) — the ONE
+    // source of truth the in-editor connection guard (#65) also consults via its
+    // TS port, so the editor's drag-time verdict provably agrees with this check.
+    connection_legal(src_ty, connection_target(op, port, tgt_ty))
+}
+
+/// Classify a sink input port into the [`ConnectionTarget`] case `connection_legal`
+/// turns on — the same classification the in-editor connection guard (#65) derives
+/// from a node's descriptor (`NodeOp` kind + targeted port).
+fn connection_target(op: &NodeOp, port: &str, tgt_ty: PortType) -> ConnectionTarget {
+    match op {
+        // A Sample `coord` is the tightened vec2 sink (no scalar broadcast).
+        NodeOp::Sample { .. } if port == "coord" => ConnectionTarget::SampleCoord,
+        // Expr operands are polymorphic; the structural assignment is reflexive
+        // (the operand-type constraints are validated by check_expr_operand_types).
+        NodeOp::Expr { .. } => ConnectionTarget::ExprOperand,
+        // Every other typed sink (Output.color, a CustomSnippet port, …) follows
+        // the documented assignable_to rule against its declared type.
+        _ => ConnectionTarget::Assignable(tgt_ty),
     }
-    src_ty.assignable_to(tgt_ty)
 }
 
 /// Validate per-[`ExprOp`] operand **type** constraints that the structural edge
