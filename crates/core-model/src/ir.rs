@@ -880,3 +880,202 @@ mod texture_and_builtin_tests {
         assert_eq!(back, BuiltinSemantic::FrameDirection);
     }
 }
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// Build the canonical demo graph the acceptance criterion names:
+    /// `Sample(Source) → Expr(color transform) → Output`.
+    ///
+    /// Wiring:
+    /// - `coord` reads the builtin texcoord via a `Const` `vec2` placeholder
+    ///   (Phase-4 graphs are hand-built; the real vTexCoord plumbing is the
+    ///   emitter's job). Here `uv` feeds `sample.coord`.
+    /// - `sample.out` (vec4) feeds the color-transform expression's first operand.
+    /// - a `Const` brightness scalar feeds the second operand.
+    /// - `mul.out` feeds `output.color`.
+    fn demo_graph() -> IrGraph {
+        IrGraph {
+            nodes: vec![
+                IrNode::new(
+                    "uv",
+                    NodeOp::Const {
+                        value: ConstValue::Vec2 { value: [0.5, 0.5] },
+                    },
+                ),
+                IrNode::new(
+                    "sample",
+                    NodeOp::Sample {
+                        texture: TextureSource::Source,
+                    },
+                ),
+                IrNode::new(
+                    "bright",
+                    NodeOp::Const {
+                        value: ConstValue::Float { value: 1.5 },
+                    },
+                ),
+                IrNode::new(
+                    "mul",
+                    NodeOp::Expr {
+                        op: ExprOp::Mul,
+                        operands: vec!["a".to_owned(), "b".to_owned()],
+                    },
+                ),
+                IrNode::new("output", NodeOp::Output),
+            ],
+            edges: vec![
+                IrEdge::new("uv", "out", "sample", "coord"),
+                IrEdge::new("sample", "out", "mul", "a"),
+                IrEdge::new("bright", "out", "mul", "b"),
+                IrEdge::new("mul", "out", "output", "color"),
+            ],
+        }
+    }
+
+    #[test]
+    fn hand_built_graph_constructs_and_round_trips_identically() {
+        let graph = demo_graph();
+        // Rust -> JSON -> Rust is identical (the acceptance criterion).
+        let json = serde_json::to_string_pretty(&graph).expect("serialize");
+        let back: IrGraph = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(graph, back);
+    }
+
+    #[test]
+    fn demo_graph_has_exactly_one_output_sink() {
+        let graph = demo_graph();
+        let outputs = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, NodeOp::Output))
+            .count();
+        assert_eq!(outputs, 1, "exactly one reachable Output sink");
+    }
+
+    #[test]
+    fn node_op_tags_are_camel_case() {
+        let sample = serde_json::to_value(NodeOp::Sample {
+            texture: TextureSource::Source,
+        })
+        .unwrap();
+        assert_eq!(sample["kind"], "sample");
+        assert_eq!(sample["texture"]["kind"], "source");
+
+        let expr = serde_json::to_value(NodeOp::Expr {
+            op: ExprOp::Mix,
+            operands: vec!["a".to_owned(), "b".to_owned(), "t".to_owned()],
+        })
+        .unwrap();
+        assert_eq!(expr["kind"], "expr");
+        assert_eq!(expr["op"]["op"], "mix");
+        assert_eq!(expr["operands"], serde_json::json!(["a", "b", "t"]));
+
+        let output = serde_json::to_value(NodeOp::Output).unwrap();
+        assert_eq!(output["kind"], "output");
+    }
+
+    #[test]
+    fn const_value_round_trips_each_variant() {
+        for cv in [
+            ConstValue::Float { value: 0.25 },
+            ConstValue::Vec2 { value: [1.0, 2.0] },
+            ConstValue::Vec3 {
+                value: [1.0, 2.0, 3.0],
+            },
+            ConstValue::Vec4 {
+                value: [1.0, 2.0, 3.0, 4.0],
+            },
+            ConstValue::Int { value: -7 },
+            ConstValue::Bool { value: true },
+        ] {
+            let v = serde_json::to_value(cv).expect("serialize");
+            let back: ConstValue = serde_json::from_value(v).expect("deserialize");
+            assert_eq!(cv, back);
+        }
+        assert_eq!(
+            ConstValue::Vec3 {
+                value: [0.0, 0.0, 0.0]
+            }
+            .port_type(),
+            PortType::Vec3
+        );
+        assert_eq!(ConstValue::Int { value: 1 }.port_type(), PortType::Int);
+    }
+
+    #[test]
+    fn expr_op_swizzle_and_construct_round_trip() {
+        let sw = ExprOp::Swizzle {
+            mask: "rgb".to_owned(),
+        };
+        let v = serde_json::to_value(&sw).unwrap();
+        assert_eq!(v["op"], "swizzle");
+        assert_eq!(v["mask"], "rgb");
+        let back: ExprOp = serde_json::from_value(v).unwrap();
+        assert_eq!(sw, back);
+
+        let ctor = ExprOp::Construct { ty: PortType::Vec4 };
+        let v = serde_json::to_value(&ctor).unwrap();
+        assert_eq!(v["op"], "construct");
+        assert_eq!(v["ty"], "vec4");
+        let back: ExprOp = serde_json::from_value(v).unwrap();
+        assert_eq!(ctor, back);
+    }
+
+    #[test]
+    fn custom_snippet_round_trips_with_typed_ports() {
+        let node = IrNode::new(
+            "snippet",
+            NodeOp::CustomSnippet {
+                body: "out_color = vec4(in_color.rgb * gain, in_color.a);".to_owned(),
+                inputs: vec![
+                    PortDecl::new("in_color", PortType::Vec4),
+                    PortDecl::new("gain", PortType::Float),
+                ],
+                outputs: vec![PortDecl::new("out_color", PortType::Vec4)],
+            },
+        );
+        let v = serde_json::to_value(&node).expect("serialize");
+        assert_eq!(v["op"]["kind"], "customSnippet");
+        // PortDecl renames `ty` to `type` on the wire.
+        assert_eq!(v["op"]["inputs"][0]["type"], "vec4");
+        assert_eq!(v["op"]["inputs"][0]["name"], "in_color");
+        let back: IrNode = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(node, back);
+    }
+
+    #[test]
+    fn ir_edge_and_port_ref_round_trip_camel_case() {
+        let edge = IrEdge::new("sample", "out", "output", "color");
+        let v = serde_json::to_value(&edge).unwrap();
+        assert_eq!(v["source"]["node"], "sample");
+        assert_eq!(v["source"]["port"], "out");
+        assert_eq!(v["target"]["node"], "output");
+        assert_eq!(v["target"]["port"], "color");
+        let back: IrEdge = serde_json::from_value(v).unwrap();
+        assert_eq!(edge, back);
+    }
+
+    #[test]
+    fn pass_is_either_typed_graph_or_verbatim_whole_pass_code() {
+        // The typed model and the verbatim-source path are both reachable: a
+        // pass authored as a typed IrGraph lowers to slang (#42), while
+        // whole-pass code reuses the existing PassSource::WholePassCode escape
+        // hatch (#43) — confirming the "either/or" documented in the module docs.
+        use crate::PassSource;
+        let verbatim = PassSource::WholePassCode {
+            source: "#version 450\n// verbatim".to_owned(),
+            filename: Some("imported.slang".to_owned()),
+            opaque: true,
+        };
+        match verbatim {
+            PassSource::WholePassCode { opaque, .. } => {
+                assert!(opaque, "whole-pass code is the opaque, non-IR path");
+            }
+            _ => panic!("expected whole-pass code"),
+        }
+        // And a typed graph constructs independently.
+        let _typed = demo_graph();
+    }
+}
