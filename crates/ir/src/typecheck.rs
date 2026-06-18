@@ -756,7 +756,7 @@ fn check_edge_types(
         ) else {
             continue;
         };
-        if !src_ty.assignable_to(tgt_ty) {
+        if !edge_assignable(&tgt.op, &edge.target.port, src_ty, tgt_ty) {
             diags.push(
                 Diagnostic::error(
                     codes::TYPE_MISMATCH,
@@ -800,6 +800,25 @@ fn input_port_type(
         NodeOp::Expr { .. } => inferer.input_type(node_id, port),
         _ => None,
     }
+}
+
+/// Whether `src_ty` may feed the input `port` of type `tgt_ty` on `op`.
+///
+/// Most ports use the documented [`assignable_to`](PortType::assignable_to) rule
+/// (exact, `Int→Float` widen, or `Float→vecN` broadcast). The exception is the
+/// **fixed `vec2` coord port of [`Sample`](NodeOp::Sample)**: broadcasting a scalar
+/// into a UV coordinate is almost always a user error and the lowering/emitter do
+/// not broadcast it (they would emit `texture(s, <float>)`, illegal GLSL), so the
+/// coord sink is **tightened** to forbid the `Float→vec2` broadcast — only a real
+/// `vec2` (or a same-typed widen, of which there is none narrower than `vec2`) may
+/// feed it. Keeping the edge rule aligned with what the emitter produces upholds
+/// the clean-checks ⇒ compiles invariant.
+fn edge_assignable(op: &NodeOp, port: &str, src_ty: PortType, tgt_ty: PortType) -> bool {
+    if matches!(op, NodeOp::Sample { .. }) && port == "coord" {
+        // The coord must already be a vec2 — no scalar broadcast into a UV.
+        return src_ty == tgt_ty;
+    }
+    src_ty.assignable_to(tgt_ty)
 }
 
 /// Validate per-[`ExprOp`] operand **type** constraints that the structural edge
@@ -869,10 +888,13 @@ fn check_expr_operand_types(
             }
             ExprOp::Sin | ExprOp::Cos | ExprOp::Abs | ExprOp::Floor | ExprOp::Fract => {
                 if let Some(t) = resolved.first().copied().flatten() {
-                    if !t.is_numeric() {
+                    if !t.is_float_family() {
                         diags.push(Diagnostic::error(
                             codes::OPERAND_TYPE,
-                            format!("`{}` requires a numeric operand, got {t:?}", expr_name(op)),
+                            format!(
+                                "`{}` requires a float or float-vector operand, got {t:?}",
+                                expr_name(op)
+                            ),
                             &node.id,
                         ));
                     }
@@ -896,10 +918,20 @@ fn check_expr_operand_types(
     }
 }
 
-/// Component-wise arithmetic: every operand must be numeric, and each must
-/// broadcast to (or already match the component count of) the widest operand —
-/// i.e. either a scalar or the same vector width. A `vec2` mixed with a `vec3` is
-/// illegal (no implicit vector widening).
+/// Component-wise arithmetic operand typing. The rule mirrors exactly what
+/// lowering types and the emitter writes (GLSL operators / intrinsics), so any
+/// graph that checks clean here emits compiling slang:
+///
+/// - A [`Bool`](PortType::Bool) operand is **always rejected** — GLSL has no
+///   `bool + bool` / `bool * vec4`, and lowering would emit exactly that.
+/// - An [`Int`](PortType::Int) operand is allowed **only among scalars** (with
+///   other `Int`/`Float`s): GLSL promotes `int → float` for scalar arithmetic
+///   (`float + int`, `int + int` are legal), but `vector op int` is **not** legal
+///   GLSL (a vector may only combine with a `float` scalar), so an `Int` operand
+///   mixed with any *vector* operand is rejected.
+/// - `Float`/`vecN` operands follow the broadcast rule: a scalar `Float` broadcasts
+///   to the widest vector, but two *different* vector widths (`vec2` with `vec3`)
+///   are illegal (no implicit vector widening — that needs an explicit construct).
 fn check_componentwise_operands(
     node_id: &str,
     name: &str,
@@ -907,11 +939,29 @@ fn check_componentwise_operands(
     diags: &mut Diagnostics,
 ) {
     let present: Vec<PortType> = resolved.iter().filter_map(|t| *t).collect();
-    // Non-numeric operand?
-    if let Some(bad) = present.iter().find(|t| !t.is_numeric()) {
+    // A Bool (or sampler) operand is never legal in component-wise arithmetic.
+    if let Some(bad) = present
+        .iter()
+        .find(|t| !t.is_float_family() && !matches!(t, PortType::Int))
+    {
         diags.push(Diagnostic::error(
             codes::OPERAND_TYPE,
-            format!("`{name}` operands must be numeric, got {bad:?}"),
+            format!("`{name}` operands must be float, a float vector, or int, got {bad:?}"),
+            node_id,
+        ));
+        return;
+    }
+    let has_vector = present.iter().any(|t| t.is_vector());
+    let has_int = present.iter().any(|t| matches!(t, PortType::Int));
+    // `vector op int` is not legal GLSL (only `vector op float` is) — reject an
+    // Int operand combined with any vector operand.
+    if has_vector && has_int {
+        diags.push(Diagnostic::error(
+            codes::OPERAND_TYPE,
+            format!(
+                "`{name}` cannot combine an int operand with a vector operand; GLSL only \
+                 broadcasts a float scalar into a vector — widen the int to float first"
+            ),
             node_id,
         ));
         return;
@@ -937,10 +987,15 @@ fn check_componentwise_operands(
     }
 }
 
-/// `construct { ty }`: every operand must be numeric, and the operands' component
-/// counts must either **sum exactly** to the target vector's component count
-/// (e.g. `vec4(vec3, float)`) **or** be a single scalar that broadcasts to fill
-/// every component (GLSL `vec4(x)`).
+/// `construct { ty }`: every operand must be **float-family** (a `Float` or
+/// `vecN`), and the operands' component counts must either **sum exactly** to the
+/// target vector's component count (e.g. `vec4(vec3, float)`) **or** be a single
+/// scalar that broadcasts to fill every component (GLSL `vec4(x)`).
+///
+/// Operands are gated on [`is_float_family`](PortType::is_float_family) (not merely
+/// [`is_numeric`](PortType::is_numeric)) so the operand class matches what lowering
+/// types and the emitter writes (the constructed value's components are floats);
+/// an `Int`/`Bool` operand is rejected, keeping clean-checks ⇒ compiles consistent.
 fn check_construct_operands(
     node_id: &str,
     ty: PortType,
@@ -958,10 +1013,10 @@ fn check_construct_operands(
     }
     let mut sum = 0u8;
     for t in resolved.iter().flatten() {
-        if !t.is_numeric() {
+        if !t.is_float_family() {
             diags.push(Diagnostic::error(
                 codes::OPERAND_TYPE,
-                format!("`construct` operands must be numeric, got {t:?}"),
+                format!("`construct` operands must be float or a float vector, got {t:?}"),
                 node_id,
             ));
             return;

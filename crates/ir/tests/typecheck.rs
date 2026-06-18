@@ -221,6 +221,28 @@ fn valid_graphs_produce_zero_diagnostics() {
             ctx: CheckContext::new(),
         },
         Case {
+            // Int among scalars: `add(float, int)` is legal GLSL (int promotes to
+            // float for scalar arithmetic) and lowers to a Float result, so it
+            // must type-check CLEAN. (Only `vector op int` is rejected.)
+            name: "add(float, int) scalar promotion is clean",
+            graph: IrGraph {
+                nodes: vec![
+                    const_float("f", 0.5),
+                    konst("i", ConstValue::Int { value: 2 }),
+                    expr("add", ExprOp::Add, &["x", "y"]),
+                    expr("ctor", ExprOp::Construct { ty: PortType::Vec4 }, &["s"]),
+                    output("out"),
+                ],
+                edges: vec![
+                    IrEdge::new("f", "out", "add", "x"),
+                    IrEdge::new("i", "out", "add", "y"),
+                    IrEdge::new("add", "out", "ctor", "s"),
+                    IrEdge::new("ctor", "out", "out", "color"),
+                ],
+            },
+            ctx: CheckContext::new(),
+        },
+        Case {
             // Int builtin (FrameCount) -> float param-style math is fine via widen.
             name: "dot(vec3, vec3) -> float used in scalar math",
             graph: IrGraph {
@@ -463,6 +485,73 @@ fn broken_graphs_emit_expected_node_mapped_diagnostics() {
         };
         let diags = check(&graph, &CheckContext::new());
         assert_has(&diags, codes::DANGLING_INPUT, "samp", Some("coord"));
+    }
+
+    // --- operand type: add(bool, bool) — Bool is not a float-family arith
+    //     operand. The checker must reject it (Float/vecN required) because
+    //     lowering+emitter would otherwise produce illegal `bool + bool` GLSL;
+    //     a Const(Bool)+Const(Bool)->Output graph type-checks clean today. The
+    //     offending OPERAND_TYPE diagnostic must land on the `add` node. ------
+    {
+        let graph = IrGraph {
+            nodes: vec![
+                konst("a", ConstValue::Bool { value: true }),
+                konst("b", ConstValue::Bool { value: false }),
+                expr("add", ExprOp::Add, &["x", "y"]),
+                expr("ctor", ExprOp::Construct { ty: PortType::Vec4 }, &["s"]),
+                output("out"),
+            ],
+            edges: vec![
+                IrEdge::new("a", "out", "add", "x"),
+                IrEdge::new("b", "out", "add", "y"),
+                IrEdge::new("add", "out", "ctor", "s"),
+                IrEdge::new("ctor", "out", "out", "color"),
+            ],
+        };
+        let diags = check(&graph, &CheckContext::new());
+        assert_has(&diags, codes::OPERAND_TYPE, "add", None);
+    }
+
+    // --- operand type: mul(vec4, int) — `vector op int` is not legal GLSL
+    //     (only `vector op float` broadcasts), so the checker rejects an Int
+    //     operand combined with a vector. The OPERAND_TYPE lands on `mul`. ----
+    {
+        let graph = IrGraph {
+            nodes: vec![
+                const_vec4("c"),
+                konst("i", ConstValue::Int { value: 3 }),
+                expr("mul", ExprOp::Mul, &["x", "y"]),
+                output("out"),
+            ],
+            edges: vec![
+                IrEdge::new("c", "out", "mul", "x"),
+                IrEdge::new("i", "out", "mul", "y"),
+                IrEdge::new("mul", "out", "out", "color"),
+            ],
+        };
+        let diags = check(&graph, &CheckContext::new());
+        assert_has(&diags, codes::OPERAND_TYPE, "mul", None);
+    }
+
+    // --- operand type: a scalar Float wired into the fixed-vec2 Sample.coord
+    //     port. Broadcasting a scalar into a UV coordinate is almost always a
+    //     user error and the lowering/emitter do NOT broadcast it (they emit
+    //     `texture(s, <float>)`, illegal GLSL), so the checker tightens the
+    //     coord sink to require vec2 — a node-mapped typeMismatch on `samp`. ---
+    {
+        let graph = IrGraph {
+            nodes: vec![
+                const_float("uv", 0.5),
+                sample("samp", TextureSource::Source),
+                output("out"),
+            ],
+            edges: vec![
+                IrEdge::new("uv", "out", "samp", "coord"),
+                IrEdge::new("samp", "out", "out", "color"),
+            ],
+        };
+        let diags = check(&graph, &CheckContext::new());
+        assert_has(&diags, codes::TYPE_MISMATCH, "samp", Some("coord"));
     }
 
     // --- operand type: add(vec2, vec3) incompatible vector widths ----------
