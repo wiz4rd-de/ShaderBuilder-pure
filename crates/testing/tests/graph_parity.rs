@@ -141,12 +141,13 @@ fn assert_parity(fx: &Fixture) {
     )
     .unwrap_or_else(|e| panic!("fixture `{}` generated-slang render: {e}", fx.name));
 
-    let hand_src = std::fs::read_to_string(fixtures_dir().join(fx.handwritten)).unwrap_or_else(|e| {
-        panic!(
-            "fixture `{}` missing hand-written equivalent {}: {e}",
-            fx.name, fx.handwritten
-        )
-    });
+    let hand_src =
+        std::fs::read_to_string(fixtures_dir().join(fx.handwritten)).unwrap_or_else(|e| {
+            panic!(
+                "fixture `{}` missing hand-written equivalent {}: {e}",
+                fx.name, fx.handwritten
+            )
+        });
     let handwritten =
         render_handwritten_slang(&hand_src, &fx.overrides, &src, VIEWPORT, FRAME_INDEX)
             .unwrap_or_else(|e| panic!("fixture `{}` hand-written render: {e}", fx.name));
