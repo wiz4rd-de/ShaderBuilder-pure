@@ -637,6 +637,144 @@ pub struct IrGraph {
     pub edges: Vec<IrEdge>,
 }
 
+/// The severity of a [`Diagnostic`] emitted by the type checker (#40).
+///
+/// An [`Error`](DiagnosticSeverity::Error) means the graph is **not** lowerable /
+/// emittable (it would produce invalid slang or has no defined meaning); a
+/// [`Warning`](DiagnosticSeverity::Warning) is advisory and does not block
+/// lowering. [`Diagnostics::has_errors`] keys off this distinction so callers
+/// (lowering #41, `compile_graph` #42) can cleanly tell "clean" from "broken".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DiagnosticSeverity {
+    /// A blocking problem — the graph cannot be lowered or emitted.
+    Error,
+    /// An advisory problem — does not block lowering.
+    Warning,
+}
+
+/// A single structured diagnostic produced when type-checking an [`IrGraph`]
+/// (#40). Every diagnostic carries the **offending node id** (and, where it
+/// applies, the offending **port id** on that node) so the Phase-5 editor can map
+/// it to an inline highlight on the exact node/port. It is `serde` +
+/// `#[ts(export)]` because the future `compile_graph` IPC command returns these
+/// to the webview (module doc §A).
+///
+/// The `code` is a short stable machine-readable tag (e.g. `"typeMismatch"`,
+/// `"cycle"`, `"missingOutput"`) the UI can switch on without parsing `message`;
+/// `message` is the human-readable explanation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Diagnostic {
+    /// Whether this blocks lowering ([`Error`](DiagnosticSeverity::Error)) or is
+    /// advisory ([`Warning`](DiagnosticSeverity::Warning)).
+    pub severity: DiagnosticSeverity,
+    /// A short, stable, machine-readable category tag (e.g. `"typeMismatch"`).
+    pub code: String,
+    /// The human-readable explanation of the problem.
+    pub message: String,
+    /// The id of the offending [`IrNode`] — always present so the editor can map
+    /// the diagnostic to a node.
+    pub node: String,
+    /// The offending port name on [`node`](Diagnostic::node), when the diagnostic
+    /// is about a specific port (e.g. a type mismatch on an input port); `None`
+    /// for node-level problems (e.g. a cycle, an unknown parameter).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub port: Option<String>,
+}
+
+impl Diagnostic {
+    /// Build an [`Error`](DiagnosticSeverity::Error)-severity diagnostic on a node.
+    pub fn error(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        node: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Error,
+            code: code.into(),
+            message: message.into(),
+            node: node.into(),
+            port: None,
+        }
+    }
+
+    /// Build a [`Warning`](DiagnosticSeverity::Warning)-severity diagnostic on a node.
+    pub fn warning(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        node: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Warning,
+            code: code.into(),
+            message: message.into(),
+            node: node.into(),
+            port: None,
+        }
+    }
+
+    /// Attach an offending port name to this diagnostic (builder style).
+    #[must_use]
+    pub fn with_port(mut self, port: impl Into<String>) -> Self {
+        self.port = Some(port.into());
+        self
+    }
+}
+
+/// The result of type-checking an [`IrGraph`] (#40): the ordered list of
+/// [`Diagnostic`]s found. A clean graph yields an empty collection.
+///
+/// This is the value lowering (#41) and the `compile_graph` command (#42) consume
+/// to decide whether to proceed: [`has_errors`](Diagnostics::has_errors)
+/// distinguishes "clean" (lowerable) from "has blocking errors" cleanly, without
+/// the caller re-scanning severities. It is `serde` + `#[ts(export)]` so the
+/// whole collection round-trips over IPC to the editor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Diagnostics {
+    /// The diagnostics found, in the order the checker emitted them.
+    pub items: Vec<Diagnostic>,
+}
+
+impl Diagnostics {
+    /// An empty collection (no diagnostics).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a diagnostic.
+    pub fn push(&mut self, diagnostic: Diagnostic) {
+        self.items.push(diagnostic);
+    }
+
+    /// Whether any diagnostic is an [`Error`](DiagnosticSeverity::Error). When
+    /// this is `false`, the graph type-checked clean enough to lower (#41).
+    pub fn has_errors(&self) -> bool {
+        self.items
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Error)
+    }
+
+    /// Whether the collection is empty (no diagnostics at all — fully clean).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The number of diagnostics.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Iterate over the diagnostics.
+    pub fn iter(&self) -> std::slice::Iter<'_, Diagnostic> {
+        self.items.iter()
+    }
+}
+
 #[cfg(test)]
 mod port_type_tests {
     use super::*;
@@ -1055,6 +1193,55 @@ mod graph_tests {
         assert_eq!(v["target"]["port"], "color");
         let back: IrEdge = serde_json::from_value(v).unwrap();
         assert_eq!(edge, back);
+    }
+
+    #[test]
+    fn diagnostic_round_trips_and_serializes_camel_case() {
+        let d = Diagnostic::error("typeMismatch", "vec3 is not assignable to vec4", "mul")
+            .with_port("color");
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["severity"], "error");
+        assert_eq!(v["code"], "typeMismatch");
+        assert_eq!(v["node"], "mul");
+        assert_eq!(v["port"], "color");
+        let back: Diagnostic = serde_json::from_value(v).unwrap();
+        assert_eq!(d, back);
+
+        // A node-level (no-port) diagnostic omits `port` on the wire (skip-if-none).
+        let warn = Diagnostic::warning("unusedNode", "node has no path to Output", "stray");
+        let v = serde_json::to_value(&warn).unwrap();
+        assert_eq!(v["severity"], "warning");
+        assert!(
+            v.get("port").is_none(),
+            "no-port diagnostic omits `port`: {v}"
+        );
+        // ...and a payload that omitted `port` still deserializes (serde default).
+        let back: Diagnostic = serde_json::from_value(v).unwrap();
+        assert_eq!(warn, back);
+        assert_eq!(back.port, None);
+    }
+
+    #[test]
+    fn diagnostics_collection_distinguishes_clean_from_errors() {
+        let mut diags = Diagnostics::new();
+        assert!(diags.is_empty());
+        assert!(!diags.has_errors());
+
+        diags.push(Diagnostic::warning("w", "advisory", "n1"));
+        assert!(!diags.is_empty());
+        assert!(
+            !diags.has_errors(),
+            "a warning alone is not a blocking error"
+        );
+        assert_eq!(diags.len(), 1);
+
+        diags.push(Diagnostic::error("e", "blocking", "n2"));
+        assert!(diags.has_errors());
+
+        // Round-trips as an IPC payload.
+        let v = serde_json::to_value(&diags).unwrap();
+        let back: Diagnostics = serde_json::from_value(v).unwrap();
+        assert_eq!(diags, back);
     }
 
     #[test]
