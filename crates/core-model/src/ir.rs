@@ -775,6 +775,30 @@ impl Diagnostics {
     }
 }
 
+/// The result of compiling a typed [`IrGraph`] to slang — the payload the
+/// `compile_graph` IPC command (#42) returns to the webview.
+///
+/// It bundles the two things the Phase-5 editor's debounced edit loop needs after
+/// every graph change: the [`Diagnostics`] to surface inline (always present —
+/// empty when the graph is clean) and the emitted slang `source` (present only
+/// when the graph type-checked clean and lowered + emitted successfully, `None`
+/// otherwise). A caller renders the diagnostics regardless, and previews/compiles
+/// the `source` only when it is `Some`.
+///
+/// `serde` + `#[ts(export)]` so it round-trips over IPC as a single typed shape.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CompileGraphResult {
+    /// The emitted `.slang` source, or `None` when the graph had blocking errors
+    /// (and so was never lowered/emitted).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
+    /// The type-checker diagnostics (empty when the graph is fully clean). Always
+    /// present so the editor can render them whether or not `source` was produced.
+    pub diagnostics: Diagnostics,
+}
+
 #[cfg(test)]
 mod port_type_tests {
     use super::*;
@@ -1242,6 +1266,36 @@ mod graph_tests {
         let v = serde_json::to_value(&diags).unwrap();
         let back: Diagnostics = serde_json::from_value(v).unwrap();
         assert_eq!(diags, back);
+    }
+
+    #[test]
+    fn compile_graph_result_round_trips_clean_and_errored() {
+        // Clean: a source and no diagnostics — `diagnostics` is always present,
+        // `source` is omitted on the wire only when it is `None`.
+        let ok = CompileGraphResult {
+            source: Some("#version 450\n".to_owned()),
+            diagnostics: Diagnostics::new(),
+        };
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["source"], "#version 450\n");
+        assert!(
+            v.get("diagnostics").is_some(),
+            "diagnostics always present: {v}"
+        );
+        let back: CompileGraphResult = serde_json::from_value(v).unwrap();
+        assert_eq!(ok, back);
+
+        // Errored: no source, carries diagnostics.
+        let mut diags = Diagnostics::new();
+        diags.push(Diagnostic::error("cycle", "graph has a cycle", "n1"));
+        let err = CompileGraphResult {
+            source: None,
+            diagnostics: diags,
+        };
+        let v = serde_json::to_value(&err).unwrap();
+        assert!(v.get("source").is_none(), "no source on error: {v}");
+        let back: CompileGraphResult = serde_json::from_value(v).unwrap();
+        assert_eq!(err, back);
     }
 
     #[test]
