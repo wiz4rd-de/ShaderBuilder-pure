@@ -10,6 +10,7 @@
 
 mod export;
 mod graph;
+mod import;
 mod library;
 mod preview;
 mod project;
@@ -94,6 +95,7 @@ pub fn run() {
             preview::set_fps,
             export::export_preset,
             export::validate_export,
+            import::import_preset,
             project::save_project,
             project::load_project,
             graph::compile_graph,
