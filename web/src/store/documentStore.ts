@@ -27,6 +27,8 @@ import {
 import { create } from "zustand";
 
 import type { Diagnostic } from "../bindings/Diagnostic";
+import type { EngineErrorEvent } from "../bindings/EngineErrorEvent";
+import type { EngineStatus } from "../bindings/EngineStatus";
 import type { Graph } from "../bindings/Graph";
 import type { LibraryPayload } from "../bindings/LibraryPayload";
 import type { Node } from "../bindings/Node";
@@ -94,6 +96,13 @@ export interface ProblemEntry {
   passName: string;
   /** The diagnostic itself (carries the offending node id + message). */
   diagnostic: Diagnostic;
+  /**
+   * Where this problem came from (#62): `"compile"` is the per-pass `compile_graph`
+   * type-checker; `"engine"` is a render-thread / slang-compile failure synthesized
+   * from an `engine-event`. The panel can badge engine problems and skip node
+   * navigation when there is no node to jump to.
+   */
+  origin?: "compile" | "engine";
 }
 
 /** The live compile-loop status the editor surfaces (#54). */
@@ -182,6 +191,21 @@ export interface DocumentState {
   /** Whether a compile is in flight (#54) — the preview may lag the document. */
   compiling: boolean;
   /**
+   * The render engine's liveness state (#62): `"live"` (fresh frames), `"lastGood"`
+   * (holding the last good / waiting frame), or `"stopped"` (no adapter / device
+   * lost / stream ended). `null` before the first status event. Editor-only; driven
+   * by the `engine-event` listener (useEngineEvents). The preview pane badges it.
+   */
+  engineStatus: EngineStatus | null;
+  /**
+   * Render/compile errors synthesized from `engine-event`s (#62), pass-tagged when
+   * the engine could map them. Kept SEPARATE from `problems` (which the compile loop
+   * replaces wholesale each round) so an async render error is not clobbered by the
+   * next compile; cleared whenever a fresh compile completes (`setCompileStatus`).
+   * The problems panel renders both lists.
+   */
+  engineProblems: ProblemEntry[];
+  /**
    * The generated slang per pass (#55), keyed by pass id, with last-good tracking.
    * Populated by the live compile loop's `setCompileStatus`; read by the read-only
    * generated-code viewer. A pass absent from this map has never compiled. This is
@@ -244,6 +268,18 @@ export interface DocumentState {
   setCompileStatus: (status: CompileLoopStatus) => void;
   /** Mark a compile as in flight / settled (#54) — drives the "compiling" hint. */
   setCompiling: (compiling: boolean) => void;
+
+  // ---- engine status / render errors (#62; the engine-event listener owns these) ----
+  /** Set the render engine's liveness state (#62) from an `engine-event`. */
+  setEngineStatus: (status: EngineStatus) => void;
+  /**
+   * Synthesize an engine render/compile error (#62) into the engine problems list,
+   * tagged with its owning pass when known (so the panel can navigate). De-dupes by
+   * (passId, code, message) so a per-frame repeat does not pile up.
+   */
+  pushEngineProblem: (error: EngineErrorEvent) => void;
+  /** Clear all synthesized engine problems (#62) — e.g. when a fresh compile lands. */
+  clearEngineProblems: () => void;
 
   // ---- pipeline / navigation (#46) ----
   /**
@@ -604,6 +640,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     problems: [],
     pipelineValid: null,
     compiling: false,
+    engineStatus: null,
+    engineProblems: [],
     sourcesByPassId: {},
     past: [],
     future: [],
@@ -748,9 +786,44 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         // source so the read-only viewer (#55) can fall back to it (with a stale
         // marker) when this round produced no source for that pass.
         sourcesByPassId: mergePassSources(s.sourcesByPassId, status.sourcesByPassId),
+        // A fresh compile round supersedes any async render error from the prior
+        // chain (#62): clear engine problems so a now-fixed pass stops showing one.
+        engineProblems: [],
       })),
 
     setCompiling: (compiling) => set({ compiling }),
+
+    setEngineStatus: (status) => set({ engineStatus: status }),
+
+    pushEngineProblem: (error) =>
+      set((s) => {
+        const passName =
+          (error.passId && s.project.passes.find((p) => p.id === error.passId)?.name) ||
+          error.passId ||
+          "Engine";
+        const entry: ProblemEntry = {
+          passId: error.passId ?? "",
+          passName,
+          diagnostic: {
+            severity: error.severity,
+            code: error.code,
+            message: error.message,
+            node: error.nodeId ?? "",
+            port: null,
+          },
+          origin: "engine",
+        };
+        // De-dupe an identical repeat (a per-frame render error must not pile up).
+        const isDup = s.engineProblems.some(
+          (p) =>
+            p.passId === entry.passId &&
+            p.diagnostic.code === entry.diagnostic.code &&
+            p.diagnostic.message === entry.diagnostic.message,
+        );
+        return isDup ? {} : { engineProblems: [...s.engineProblems, entry] };
+      }),
+
+    clearEngineProblems: () => set({ engineProblems: [] }),
 
     addPass: (name) => {
       const before = snapshot();
@@ -1282,6 +1355,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        engineStatus: null,
+        engineProblems: [],
         sourcesByPassId: {},
         past: [],
         future: [],
@@ -1305,6 +1380,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        engineStatus: null,
+        engineProblems: [],
         sourcesByPassId: {},
         past: [],
         future: [],

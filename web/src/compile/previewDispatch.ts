@@ -22,6 +22,12 @@ import type { ProjectCompileResult } from "./compileLoop";
 export interface ChainPassInput {
   source: string;
   settings: PassSettings;
+  /**
+   * The owning pipeline pass id (#62) so a slang-compile failure on THIS pass
+   * maps to a pass-tagged engine error the editor can surface against the right
+   * pass (the whole-pass-code path has no node-IR to catch it earlier).
+   */
+  passId: string;
 }
 
 /** The injected IPC caller (the hook passes the real Tauri `invoke`). */
@@ -51,6 +57,7 @@ export async function dispatchPreview(
   const passes: ChainPassInput[] = result.passes.map((p) => ({
     source: p.source!,
     settings: p.settings,
+    passId: p.passId,
   }));
   await invokeIpc("load_chain_sources", { passes });
   return true;
