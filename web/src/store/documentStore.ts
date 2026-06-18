@@ -81,6 +81,26 @@ export interface Selection {
   edgeIds: string[];
 }
 
+/** One row of the aggregate PROBLEMS list (#54): a diagnostic + its origin pass. */
+export interface ProblemEntry {
+  /** The pass this diagnostic came from (so the list can group + navigate). */
+  passId: string;
+  /** The pass's display name (for the problems list). */
+  passName: string;
+  /** The diagnostic itself (carries the offending node id + message). */
+  diagnostic: Diagnostic;
+}
+
+/** The live compile-loop status the editor surfaces (#54). */
+export interface CompileLoopStatus {
+  /** The per-node diagnostics (the inspector + node badges read these by id). */
+  diagnosticsByNode: Record<string, Diagnostic[]>;
+  /** The aggregate problems list, in pipeline order. */
+  problems: ProblemEntry[];
+  /** Whether the whole pipeline is renderable. */
+  valid: boolean;
+}
+
 export interface DocumentState {
   // ---- document ----
   project: Project;
@@ -113,6 +133,21 @@ export interface DocumentState {
    * to surface per-node problems; it is editor-only, never part of a snapshot.
    */
   diagnosticsByNode: Record<string, Diagnostic[]>;
+  /**
+   * The aggregate PROBLEMS list (#54): every compile diagnostic, tagged with the
+   * pass it came from, in pipeline order. Drives the problems panel + a count
+   * badge. Editor-only, replaced wholesale on each compile.
+   */
+  problems: ProblemEntry[];
+  /**
+   * Whether the whole pipeline is currently renderable (#54): `false` when any
+   * pass failed to compile (cycle / type error → no source) so the editor can
+   * flag that the preview is NOT reflecting the document. `null` before the first
+   * compile completes. Editor-only.
+   */
+  pipelineValid: boolean | null;
+  /** Whether a compile is in flight (#54) — the preview may lag the document. */
+  compiling: boolean;
 
   // ---- history ----
   past: DocSnapshot[];
@@ -157,9 +192,18 @@ export interface DocumentState {
   setSelection: (selection: Selection) => void;
   clearSelection: () => void;
 
-  // ---- diagnostics (read-only hook for #54) ----
+  // ---- diagnostics + compile status (the live compile loop, #54, owns these) ----
   /** Replace the per-node diagnostics map (the live compile loop, #54, owns this). */
   setDiagnosticsByNode: (byNode: Record<string, Diagnostic[]>) => void;
+  /**
+   * Apply a completed compile's status in ONE update (#54): the per-node
+   * diagnostics, the aggregate problems list, and the global validity flag — so
+   * the inspector, the problems panel, and the status indicator stay consistent.
+   * Clears `compiling`.
+   */
+  setCompileStatus: (status: CompileLoopStatus) => void;
+  /** Mark a compile as in flight / settled (#54) — drives the "compiling" hint. */
+  setCompiling: (compiling: boolean) => void;
 
   // ---- pipeline / navigation (#46) ----
   /**
@@ -424,6 +468,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     clipboard: null,
     dirty: false,
     diagnosticsByNode: {},
+    problems: [],
+    pipelineValid: null,
+    compiling: false,
     past: [],
     future: [],
     pendingBaseline: null,
@@ -555,6 +602,16 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     clearSelection: () => set({ selection: { nodeIds: [], edgeIds: [] } }),
 
     setDiagnosticsByNode: (byNode) => set({ diagnosticsByNode: byNode }),
+
+    setCompileStatus: (status) =>
+      set({
+        diagnosticsByNode: status.diagnosticsByNode,
+        problems: status.problems,
+        pipelineValid: status.valid,
+        compiling: false,
+      }),
+
+    setCompiling: (compiling) => set({ compiling }),
 
     addPass: (name) => {
       const before = snapshot();
@@ -927,6 +984,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
         diagnosticsByNode: {},
+        problems: [],
+        pipelineValid: null,
+        compiling: false,
         past: [],
         future: [],
         pendingBaseline: null,
@@ -945,6 +1005,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
         diagnosticsByNode: {},
+        problems: [],
+        pipelineValid: null,
+        compiling: false,
         past: [],
         future: [],
         pendingBaseline: null,
