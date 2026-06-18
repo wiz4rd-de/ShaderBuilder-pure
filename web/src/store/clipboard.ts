@@ -23,9 +23,14 @@ export function captureClipboard(
   const ids = new Set(nodeIds);
   const pickedNodes = nodes.filter((n) => ids.has(n.id));
   const pickedEdges = edges.filter((e) => ids.has(e.source) && ids.has(e.target));
-  // Structurally clone so later document edits can't mutate the clipboard.
+  // Deep-clone so later document edits can't mutate the clipboard. `data` can hold
+  // nested arrays (e.g. customSnippet ports), so a shallow spread would share them.
   return {
-    nodes: pickedNodes.map((n) => ({ ...n, position: { ...n.position }, data: { ...n.data } })),
+    nodes: pickedNodes.map((n) => ({
+      ...n,
+      position: { ...n.position },
+      data: structuredClone(n.data),
+    })),
     edges: pickedEdges.map((e) => ({ ...e })),
   };
 }
@@ -46,7 +51,9 @@ export function instantiateClipboard(
     const fresh = makeNode(
       src.kind,
       { x: src.position.x + offset.x, y: src.position.y + offset.y },
-      { ...src.data },
+      // Deep-clone so each paste owns fully independent data (nested arrays like
+      // customSnippet ports must not be shared with the clipboard or other pastes).
+      structuredClone(src.data),
     );
     remap.set(src.id, fresh);
     return fresh;

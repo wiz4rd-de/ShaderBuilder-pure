@@ -36,6 +36,27 @@ describe("clipboard", () => {
     expect(nodes[0]!.data["tag"]).toBe("a");
   });
 
+  it("deep-clones nested arrays in node data on capture", () => {
+    const ports = [{ name: "color", type: "vec4" }];
+    const n: Node = { id: "s", kind: "customSnippet", position: { x: 0, y: 0 }, data: { inputs: ports } };
+    const clip = captureClipboard([n], [], ["s"]);
+    // Mutate the clipboard's nested port array — the original must be untouched.
+    (clip.nodes[0]!.data.inputs as { name: string }[])[0]!.name = "rgb";
+    expect((n.data.inputs as { name: string }[])[0]!.name).toBe("color");
+  });
+
+  it("paste owns independent nested data — mutating a paste leaves the original", () => {
+    const ports = [{ name: "color", type: "vec4" }];
+    const n: Node = { id: "s", kind: "customSnippet", position: { x: 0, y: 0 }, data: { inputs: ports } };
+    const clip = captureClipboard([n], [], ["s"]);
+    const { nodes } = instantiateClipboard(clip, { x: 1, y: 1 });
+    // Mutate the pasted node's nested port array.
+    (nodes[0]!.data.inputs as { name: string }[])[0]!.name = "rgb";
+    // Neither the original node nor the clipboard is affected.
+    expect((n.data.inputs as { name: string }[])[0]!.name).toBe("color");
+    expect((clip.nodes[0]!.data.inputs as { name: string }[])[0]!.name).toBe("color");
+  });
+
   it("instantiates with FRESH node ids and re-points internal edges", () => {
     const nodes = [node("a", 10, 20), node("b", 30, 40)];
     const edges = [edge("e1", "a", "b")];
