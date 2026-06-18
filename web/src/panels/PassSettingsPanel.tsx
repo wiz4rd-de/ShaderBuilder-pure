@@ -15,6 +15,40 @@ import type { ScaleType } from "../bindings/ScaleType";
 import type { WrapMode } from "../bindings/WrapMode";
 import { useDocumentStore } from "../store/documentStore";
 
+/**
+ * The starter source a freshly-switched whole-pass code pass (#52) carries: a
+ * minimal RetroArch slang pass that samples Source and passes it through. The
+ * author edits it in the pass-level code editor; it compiles + previews as-is.
+ */
+const WHOLE_PASS_TEMPLATE = `#version 450
+
+layout(push_constant) uniform Push {
+    vec4 SourceSize;
+    vec4 OriginalSize;
+    vec4 OutputSize;
+    uint FrameCount;
+} params;
+
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+layout(location = 0) out vec2 vTexCoord;
+
+void main() {
+    gl_Position = Position;
+    vTexCoord = TexCoord;
+}
+
+#pragma stage fragment
+layout(location = 0) in vec2 vTexCoord;
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 2) uniform sampler2D Source;
+
+void main() {
+    FragColor = texture(Source, vTexCoord);
+}
+`;
+
 /** The synthetic FBO-format choices the two boolean flags collapse into. */
 type FboFormat = "rgba8" | "float16" | "srgb";
 
@@ -39,6 +73,8 @@ export function PassSettingsPanel(): React.JSX.Element {
   const feedbackPass = useDocumentStore((s) => s.project.feedbackPass);
   const updatePassSettings = useDocumentStore((s) => s.updatePassSettings);
   const setFeedbackPass = useDocumentStore((s) => s.setFeedbackPass);
+  const setPassToWholePassCode = useDocumentStore((s) => s.setPassToWholePassCode);
+  const setPassToGraph = useDocumentStore((s) => s.setPassToGraph);
 
   const passIndex = passes.findIndex((p) => p.id === activePassId);
   const pass = passIndex >= 0 ? passes[passIndex]! : null;
@@ -80,9 +116,39 @@ export function PassSettingsPanel(): React.JSX.Element {
   const triParse = (raw: string): boolean | null =>
     raw === "" ? null : raw === "on";
 
+  const onSourceKind = (kind: string) => {
+    if (kind === "wholePassCode" && pass.source.kind !== "wholePassCode") {
+      setPassToWholePassCode(pass.id, WHOLE_PASS_TEMPLATE);
+    } else if (kind === "graph" && pass.source.kind !== "graph") {
+      setPassToGraph(pass.id);
+    }
+  };
+
   return (
     <div className="panel__body" aria-label="Pass settings">
       <div className="panel__pass-name">{pass.name}</div>
+
+      {/* ---- Source kind (#52): node graph vs opaque whole-pass code ---- */}
+      <fieldset className="panel__group">
+        <legend>Source</legend>
+        <label className="panel__field">
+          <span className="panel__field-label">Authoring</span>
+          <select
+            className="panel__input"
+            aria-label="Pass source kind"
+            value={pass.source.kind}
+            onChange={(e) => onSourceKind(e.target.value)}
+          >
+            <option value="graph">Node graph</option>
+            <option value="wholePassCode">Whole-pass code</option>
+          </select>
+        </label>
+        {pass.source.kind === "wholePassCode" ? (
+          <div className="panel__hint">
+            Opaque .slang source — edit it in the pass canvas.
+          </div>
+        ) : null}
+      </fieldset>
 
       {/* ---- Scale ---- */}
       <fieldset className="panel__group">

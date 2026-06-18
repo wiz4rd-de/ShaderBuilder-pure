@@ -30,6 +30,7 @@ import { PipelineCanvas } from "../pipeline/PipelineCanvas";
 import { PipelineToolbar } from "../pipeline/PipelineToolbar";
 import { NODE_TYPES } from "../nodes/nodeTypes";
 import { useDocumentStore } from "../store/documentStore";
+import { WholePassEditor } from "../wholePass/WholePassEditor";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorToolbar } from "./EditorToolbar";
 import { toRfGraph } from "./graphAdapter";
@@ -166,6 +167,12 @@ function PassGraph() {
 function CanvasInner() {
   useEditorShortcuts();
   const level = useDocumentStore((s) => s.level);
+  // An opaque whole-pass code pass (#52) has no node graph — it shows the
+  // pass-level code editor at the pass level instead of the React Flow canvas.
+  const activeIsWholePass = useDocumentStore((s) => {
+    const pass = s.project.passes.find((p) => p.id === s.activePassId);
+    return pass?.source.kind === "wholePassCode";
+  });
 
   return (
     <div className="editor__canvas-host">
@@ -177,6 +184,8 @@ function CanvasInner() {
             <PipelineCanvas />
           </div>
         </>
+      ) : activeIsWholePass ? (
+        <WholePassEditor />
       ) : (
         <PassGraph />
       )}

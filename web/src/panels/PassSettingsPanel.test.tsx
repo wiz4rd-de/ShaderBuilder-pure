@@ -71,4 +71,24 @@ describe("PassSettingsPanel", () => {
     render(<PassSettingsPanel />);
     expect(screen.getByText(/No active pass/i)).toBeInTheDocument();
   });
+
+  it("switches the active pass between node graph and whole-pass code (#52)", () => {
+    render(<PassSettingsPanel />);
+    const kind = screen.getByLabelText("Pass source kind");
+    // Default is a graph pass.
+    expect(store().project.passes[0]!.source.kind).toBe("graph");
+    fireEvent.change(kind, { target: { value: "wholePassCode" } });
+    const opaque = store().project.passes[0]!;
+    expect(opaque.source.kind).toBe("wholePassCode");
+    if (opaque.source.kind === "wholePassCode") {
+      // The starter template is a compilable Source pass-through.
+      expect(opaque.source.source).toContain("#pragma stage fragment");
+      expect(opaque.source.source).toContain("sampler2D Source");
+    }
+    // Switching back to a node graph is reversible (one undo entry each way).
+    fireEvent.change(screen.getByLabelText("Pass source kind"), {
+      target: { value: "graph" },
+    });
+    expect(store().project.passes[0]!.source.kind).toBe("graph");
+  });
 });
