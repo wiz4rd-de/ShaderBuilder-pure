@@ -87,6 +87,16 @@ function PassGraph() {
       if (!conn.source || !conn.target) {
         return;
       }
+      // CONNECTION VALIDITY (#54): the AUTHORITATIVE type-checking + connection
+      // validity live in the Rust `ir` crate (Phase 4) and are reported back to
+      // the editor as compile diagnostics (inline node badges + the Problems
+      // panel) by the live compile loop (compile/useCompileLoop.ts). We accept any
+      // structurally-valid edge here (the store still rejects self-loops and a
+      // double-connection into one target port) and let the checker flag a TYPE
+      // mismatch after the fact. The STRICT in-editor type-checked rule — rejecting
+      // an incompatible edge at DRAG TIME (e.g. blocking a vec4→float drop) — is
+      // DEFERRED to Phase 7; that needs port-type resolution on the React Flow
+      // handles, which is out of scope for the Phase-5 compile loop.
       addEdge(conn.source, conn.sourceHandle ?? "", conn.target, conn.targetHandle ?? "");
     },
     [addEdge],
