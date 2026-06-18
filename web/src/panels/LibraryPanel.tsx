@@ -21,7 +21,7 @@ import type { Vec2 } from "../bindings/Vec2";
 import { collapseSelection as collapse } from "../store/collapse";
 import { useDocumentStore } from "../store/documentStore";
 import { nextId } from "../store/ids";
-import { readSubgraph } from "../nodes/subgraph";
+import { isSubgraphNode, readSubgraph } from "../nodes/subgraph";
 import {
   deleteLibraryNode,
   listLibraryNode,
@@ -54,6 +54,13 @@ function payloadFromSelection(name: string): LibraryPayload | null {
     const node = graph.nodes.find((n) => n.id === nodeIds[0]);
     if (!node) {
       return null;
+    }
+    // A single COLLAPSED subgraph node must be saved as a `subgraph` payload, not
+    // a `node` one: its `data` is a full Subgraph, and only instantiate's subgraph
+    // branch re-ids the whole interior (node/edge ids + Subgraph.id). Saved as a
+    // `node` payload, two inserts would share interior ids (freshness violation).
+    if (isSubgraphNode(node)) {
+      return { kind: "subgraph", subgraph: readSubgraph(node) };
     }
     return { kind: "node", node };
   }

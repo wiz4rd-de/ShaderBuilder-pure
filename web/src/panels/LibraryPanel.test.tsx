@@ -11,9 +11,10 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
 }));
 
+import { instantiateLibraryItem } from "../library/instantiate";
 import { isSubgraphNode, readSubgraph } from "../nodes/subgraph";
 import { useDocumentStore } from "../store/documentStore";
-import { resetIdsForTest } from "../store/ids";
+import { nextId, resetIdsForTest } from "../store/ids";
 import { LibraryPanel } from "./LibraryPanel";
 
 function store() {
@@ -268,6 +269,53 @@ describe("LibraryPanel", () => {
     expect(sub.nodes.map((n) => n.kind).sort()).toEqual(["source", "texcoord"]);
     // A's id is nowhere in the saved interior.
     expect(sub.nodes.some((n) => n.id === aId)).toBe(false);
+    promptSpy.mockRestore();
+  });
+
+  it("single selected subgraph node is saved as a subgraph payload (re-id'd on insert)", async () => {
+    // Fix E: a single collapsed subgraph node saved as a `node` payload would NOT
+    // re-id its interior on insert, so two inserts collide. Saving it as a
+    // `subgraph` payload lets instantiate re-mint the whole interior.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_library_node") return Promise.resolve([]);
+      return Promise.resolve();
+    });
+    openPass();
+    const src = store().addNode("source", { x: 0, y: 0 });
+    store().setSelection({ nodeIds: [src], edgeIds: [] });
+    store().collapseSelection("Solo");
+    const sgId = store().activeGraph().nodes.find(isSubgraphNode)!.id;
+    store().setSelection({ nodeIds: [sgId], edgeIds: [] });
+
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValueOnce("Solo") // name
+      .mockReturnValueOnce("") // description
+      .mockReturnValueOnce(""); // tags
+
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
+    await waitFor(() =>
+      expect(invoke.mock.calls.some((call) => call[0] === "save_library_node")).toBe(true),
+    );
+    const item = (invoke.mock.calls.find((call) => call[0] === "save_library_node")![1] as {
+      item: LibraryItem;
+    }).item;
+    expect(item.payload.kind).toBe("subgraph");
+
+    // Two instantiations of the saved item share NO ids (interior node/edge ids +
+    // Subgraph.id all distinct) — the freshness invariant the subgraph path enforces.
+    const first = instantiateLibraryItem(item, nextId);
+    const second = instantiateLibraryItem(item, nextId);
+    if (first.kind !== "subgraph" || second.kind !== "subgraph") throw new Error("kind");
+    const idsOf = (p: typeof first) =>
+      p.kind === "subgraph"
+        ? [p.subgraph.id, ...p.subgraph.nodes.map((n) => n.id), ...p.subgraph.edges.map((e) => e.id)]
+        : [];
+    const firstIds = new Set(idsOf(first));
+    for (const id of idsOf(second)) {
+      expect(firstIds.has(id)).toBe(false);
+    }
     promptSpy.mockRestore();
   });
 
