@@ -26,7 +26,9 @@ import {
 } from "@xyflow/react";
 import { create } from "zustand";
 
+import type { Diagnostic } from "../bindings/Diagnostic";
 import type { Graph } from "../bindings/Graph";
+import type { Node } from "../bindings/Node";
 import type { Project } from "../bindings/Project";
 import type { Vec2 } from "../bindings/Vec2";
 import { addPass, removePass, reorderPass } from "../pipeline/passOps";
@@ -97,6 +99,12 @@ export interface DocumentState {
   clipboard: Clipboard | null;
   /** Whether the document has unsaved edits since the last load/save/reset. */
   dirty: boolean;
+  /**
+   * Compile diagnostics keyed by the offending node id (#54 populates this from
+   * each pass's `compile_graph` result). The inspector (#47) reads it read-only
+   * to surface per-node problems; it is editor-only, never part of a snapshot.
+   */
+  diagnosticsByNode: Record<string, Diagnostic[]>;
 
   // ---- history ----
   past: DocSnapshot[];
@@ -114,6 +122,21 @@ export interface DocumentState {
   // ---- mutations (each pushes exactly one history entry) ----
   addNode: (kind: string, position: Vec2, data?: Record<string, unknown>) => string;
   addEdge: (source: string, sourcePort: string, target: string, targetPort: string) => string | null;
+  /**
+   * Discrete edit of a node's free-form `data`: shallow-merges `patch` into the
+   * node's `data` (a `null`/`undefined` patch VALUE deletes that key) and pushes
+   * exactly one history entry. Used by the inspector for atomic edits (a select,
+   * a checkbox) where one click = one undo entry. For coalesced text typing,
+   * pair `beginNodeDataEdit()` + live `patchNodeData()` + `commit()` instead.
+   */
+  updateNodeData: (nodeId: string, patch: Record<string, unknown>) => void;
+  /**
+   * LIVE, non-committing merge of `patch` into a node's `data` (same merge rules
+   * as `updateNodeData`) WITHOUT touching history — the inspector's per-keystroke
+   * path during a coalesced text edit opened by `beginInteraction()` and closed
+   * by `commit()`.
+   */
+  patchNodeData: (nodeId: string, patch: Record<string, unknown>) => void;
   moveNodes: (moves: Array<{ id: string; position: Vec2 }>) => void;
   removeSelection: () => void;
   paste: () => void;
@@ -125,6 +148,10 @@ export interface DocumentState {
   // ---- selection ----
   setSelection: (selection: Selection) => void;
   clearSelection: () => void;
+
+  // ---- diagnostics (read-only hook for #54) ----
+  /** Replace the per-node diagnostics map (the live compile loop, #54, owns this). */
+  setDiagnosticsByNode: (byNode: Record<string, Diagnostic[]>) => void;
 
   // ---- pipeline / navigation (#46) ----
   /**
@@ -217,6 +244,49 @@ function withGraph(project: Project, activePassId: string, next: Graph): Project
   };
 }
 
+/**
+ * Apply a shallow `patch` to a node's `data`, returning a NEW node (and a new
+ * `data` object). A patch value of `undefined` deletes that key (so the inspector
+ * can drop a now-irrelevant field, e.g. when a Const switches variant). The node
+ * is left untouched (same reference) when `data` does not actually change.
+ */
+function patchNode(node: Node, patch: Record<string, unknown>): Node {
+  const next: Record<string, unknown> = { ...node.data };
+  let changed = false;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) {
+      if (key in next) {
+        delete next[key];
+        changed = true;
+      }
+    } else if (next[key] !== value) {
+      next[key] = value;
+      changed = true;
+    }
+  }
+  return changed ? { ...node, data: next } : node;
+}
+
+/** Replace one node's `data` (via `patchNode`) inside a graph, sharing the rest. */
+function withNodeData(
+  graph: Graph,
+  nodeId: string,
+  patch: Record<string, unknown>,
+): Graph {
+  let touched = false;
+  const nodes = graph.nodes.map((n) => {
+    if (n.id !== nodeId) {
+      return n;
+    }
+    const next = patchNode(n, patch);
+    if (next !== n) {
+      touched = true;
+    }
+    return next;
+  });
+  return touched ? { ...graph, nodes } : graph;
+}
+
 const initialProject = makeProject();
 const initialActivePassId = initialProject.passes[0]!.id;
 
@@ -273,6 +343,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     selection: { nodeIds: [], edgeIds: [] },
     clipboard: null,
     dirty: false,
+    diagnosticsByNode: {},
     past: [],
     future: [],
     pendingBaseline: null,
@@ -300,6 +371,26 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       const edge = makeEdge(source, sourcePort, target, targetPort);
       mutateGraph((graph) => ({ ...graph, edges: [...graph.edges, edge] }));
       return edge.id;
+    },
+
+    updateNodeData: (nodeId, patch) => {
+      const g = get().activeGraph();
+      // Skip the snapshot + history churn when the patch is a no-op.
+      if (withNodeData(g, nodeId, patch) === g) {
+        return;
+      }
+      mutateGraph((graph) => withNodeData(graph, nodeId, patch));
+    },
+
+    patchNodeData: (nodeId, patch) => {
+      set((s) => ({
+        project: withGraph(
+          s.project,
+          s.activePassId,
+          withNodeData(graphOf(s.project, s.activePassId), nodeId, patch),
+        ),
+        dirty: true,
+      }));
     },
 
     moveNodes: (moves) => {
@@ -382,6 +473,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
 
     setSelection: (selection) => set({ selection }),
     clearSelection: () => set({ selection: { nodeIds: [], edgeIds: [] } }),
+
+    setDiagnosticsByNode: (byNode) => set({ diagnosticsByNode: byNode }),
 
     addPass: (name) => {
       const before = snapshot();
@@ -648,6 +741,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
+        diagnosticsByNode: {},
         past: [],
         future: [],
         pendingBaseline: null,
@@ -665,6 +759,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         selections: { pipeline: null, passes: {} },
         selection: { nodeIds: [], edgeIds: [] },
         clipboard: null,
+        diagnosticsByNode: {},
         past: [],
         future: [],
         pendingBaseline: null,
