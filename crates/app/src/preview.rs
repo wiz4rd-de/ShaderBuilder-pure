@@ -316,6 +316,142 @@ pub fn load_preset(state: State<'_, PreviewState>, preset_path: String) -> Resul
     Ok(())
 }
 
+/// Compile a single **in-memory** slang source string and set it as the live
+/// shader (#54). This is the live-preview twin of [`load_shader`]: where that
+/// reads a `.slang` file then compiles, this takes the source the editor just
+/// generated (via `compile_graph`) directly — closing the edit → compile →
+/// preview loop for a SINGLE-PASS graph project without writing to disk. A
+/// compile error is returned to the caller and the previous shader keeps running.
+#[tauri::command]
+pub fn load_shader_source(state: State<'_, PreviewState>, source: String) -> Result<(), String> {
+    // No base dir: generated graph source is self-contained (no `#include`s).
+    let compiled = slang_compile::compile_slang(&source, None).map_err(|e| e.to_string())?;
+    state.send(RenderCommand::SetShader(compiled))
+}
+
+/// One pass of an in-memory live-preview chain (#54): the generated slang `source`
+/// plus the editor-owned [`core_model::PassSettings`] that size/format it. Mirrors
+/// a `.slangp` `shaderN` line + its scale/format keys, but with the source carried
+/// inline instead of as a file path.
+#[derive(serde::Deserialize)]
+pub struct ChainPassInput {
+    /// The pass's generated (or verbatim whole-pass) slang source.
+    source: String,
+    /// The pass's RetroArch render settings (scale/filter/wrap/format/alias).
+    settings: core_model::PassSettings,
+}
+
+/// Build a multi-pass live-preview **chain** from in-memory generated sources
+/// (#54). This is the live-preview twin of [`load_preset`]: where that parses a
+/// `.slangp`, loads each `shaderN` file, and compiles it, this takes the per-pass
+/// generated slang the editor just produced (a graph pass via `compile_graph`, or
+/// a whole-pass pass verbatim) plus its editor [`core_model::PassSettings`], and
+/// builds the engine chain — reusing the SAME scale/format/wrap mapping helpers as
+/// the file path. A compile error is returned to the caller and the previous chain
+/// keeps running.
+#[tauri::command]
+pub fn load_chain_sources(
+    state: State<'_, PreviewState>,
+    passes: Vec<ChainPassInput>,
+) -> Result<(), String> {
+    let mut chain = Vec::with_capacity(passes.len());
+    for p in &passes {
+        let compiled = slang_compile::compile_slang(&p.source, None).map_err(|e| e.to_string())?;
+        chain.push(pass_from_settings(compiled, &p.settings));
+    }
+    state.send(RenderCommand::SetChain(chain))
+}
+
+/// Build one engine [`preview_engine::Pass`] from a compiled shader + the editor's
+/// [`core_model::PassSettings`] (#54). Reuses the same per-axis scale resolution
+/// and wrap-mode mapping as the `.slangp` path ([`compile_preset_chain`]); a
+/// `None` settings key leaves the engine default (so the §2/§3 position defaults
+/// apply).
+fn pass_from_settings(
+    compiled: slang_compile::CompiledShader,
+    settings: &core_model::PassSettings,
+) -> preview_engine::Pass {
+    let mut pass = preview_engine::Pass::new(compiled);
+    if let Some(scale) = model_scale_config(settings) {
+        pass = pass.with_scale(scale);
+    }
+    pass.alias = settings.alias.clone();
+    if let Some(v) = settings.srgb_framebuffer {
+        pass.srgb_framebuffer = v;
+    }
+    if let Some(v) = settings.float_framebuffer {
+        pass.float_framebuffer = v;
+    }
+    if let Some(v) = settings.filter_linear {
+        pass.filter_linear = v;
+    }
+    if let Some(v) = settings.wrap_mode {
+        pass.wrap_mode = map_model_wrap_mode(v);
+    }
+    if let Some(v) = settings.mipmap_input {
+        pass.mipmap_input = v;
+    }
+    if let Some(v) = settings.frame_count_mod {
+        pass.frame_count_mod = v;
+    }
+    pass
+}
+
+/// Map the editor's [`core_model::PassSettings`] per-axis scale to the engine's
+/// [`preview_engine::ScaleConfig`], or `None` when the pass declares no scale keys
+/// (engine applies the §2 default). Mirrors [`scale_config`] for the file path.
+fn model_scale_config(settings: &core_model::PassSettings) -> Option<preview_engine::ScaleConfig> {
+    let x = &settings.scale_x;
+    let y = &settings.scale_y;
+    if x.scale_type.is_none() && x.scale.is_none() && y.scale_type.is_none() && y.scale.is_none() {
+        return None;
+    }
+    Some(preview_engine::ScaleConfig {
+        x: model_axis_scale(x),
+        y: model_axis_scale(y),
+    })
+}
+
+/// Build one engine axis-scale from an editor [`core_model::ScaleAxis`]. A missing
+/// type or factor defaults the missing half (factor 1.0, or type source) exactly
+/// as [`axis_scale`] does for the parsed preset.
+fn model_axis_scale(axis: &core_model::ScaleAxis) -> preview_engine::AxisScale {
+    match (axis.scale_type, axis.scale) {
+        (Some(ty), Some(factor)) => preview_engine::AxisScale {
+            ty: map_model_scale_type(ty),
+            factor,
+        },
+        (Some(ty), None) => preview_engine::AxisScale {
+            ty: map_model_scale_type(ty),
+            factor: 1.0,
+        },
+        (None, Some(factor)) => preview_engine::AxisScale {
+            ty: preview_engine::ScaleType::Source,
+            factor,
+        },
+        (None, None) => preview_engine::AxisScale::SOURCE_1X,
+    }
+}
+
+/// Convert the editor model's scale-type enum to the engine's.
+fn map_model_scale_type(ty: core_model::ScaleType) -> preview_engine::ScaleType {
+    match ty {
+        core_model::ScaleType::Source => preview_engine::ScaleType::Source,
+        core_model::ScaleType::Viewport => preview_engine::ScaleType::Viewport,
+        core_model::ScaleType::Absolute => preview_engine::ScaleType::Absolute,
+    }
+}
+
+/// Convert the editor model's wrap-mode enum to the engine's (#54).
+fn map_model_wrap_mode(wrap: core_model::WrapMode) -> preview_engine::WrapMode {
+    match wrap {
+        core_model::WrapMode::ClampToBorder => preview_engine::WrapMode::ClampToBorder,
+        core_model::WrapMode::ClampToEdge => preview_engine::WrapMode::ClampToEdge,
+        core_model::WrapMode::Repeat => preview_engine::WrapMode::Repeat,
+        core_model::WrapMode::MirroredRepeat => preview_engine::WrapMode::MirroredRepeat,
+    }
+}
+
 /// Decode a parsed preset's LUTs (#27, §7) into engine [`preview_engine::LutSpec`]s:
 /// load each PNG (paths already resolved relative to the preset dir by the parser)
 /// and carry its per-LUT sampler settings, defaulting an absent key to the §7 LUT
@@ -583,6 +719,76 @@ mod tests {
         assert_eq!(s.x.ty, EngineScaleType::Viewport);
         assert_eq!(s.y.ty, EngineScaleType::Source);
         assert_eq!(s.y.factor, 1.0);
+    }
+
+    // ---- Editor PassSettings → engine scale/format mapping (#54; no GPU). ----
+
+    #[test]
+    fn model_settings_no_scale_keys_map_to_none() {
+        // An all-`None` ScaleAxis pair means "no scale keys" → engine §2 default.
+        let settings = core_model::PassSettings::default();
+        assert!(model_scale_config(&settings).is_none());
+    }
+
+    #[test]
+    fn model_settings_per_axis_scale_maps_independently() {
+        let settings = core_model::PassSettings {
+            scale_x: core_model::ScaleAxis {
+                scale_type: Some(core_model::ScaleType::Absolute),
+                scale: Some(320.0),
+            },
+            scale_y: core_model::ScaleAxis {
+                scale_type: Some(core_model::ScaleType::Viewport),
+                scale: Some(1.0),
+            },
+            ..Default::default()
+        };
+        let s = model_scale_config(&settings).expect("has scale");
+        assert_eq!(s.x.ty, EngineScaleType::Absolute);
+        assert_eq!(s.x.factor, 320.0);
+        assert_eq!(s.y.ty, EngineScaleType::Viewport);
+        assert_eq!(s.y.factor, 1.0);
+    }
+
+    #[test]
+    fn model_settings_one_axis_defaults_the_other_to_source_1x() {
+        // Only X has scale keys → Y defaults to source × 1.0 (§2), as the file path.
+        let settings = core_model::PassSettings {
+            scale_x: core_model::ScaleAxis {
+                scale_type: Some(core_model::ScaleType::Viewport),
+                scale: Some(1.0),
+            },
+            ..Default::default()
+        };
+        let s = model_scale_config(&settings).expect("has scale");
+        assert_eq!(s.x.ty, EngineScaleType::Viewport);
+        assert_eq!(s.y.ty, EngineScaleType::Source);
+        assert_eq!(s.y.factor, 1.0);
+    }
+
+    #[test]
+    fn model_settings_carry_format_and_alias_onto_pass() {
+        // The format/filter/wrap/alias keys land verbatim on the engine descriptor.
+        let shader = slang_compile::compile_slang(preview_engine::DEFAULT_SHADER, None)
+            .expect("compile default shader");
+        let settings = core_model::PassSettings {
+            alias: Some("crtPass".to_owned()),
+            float_framebuffer: Some(true),
+            filter_linear: Some(false),
+            wrap_mode: Some(core_model::WrapMode::Repeat),
+            mipmap_input: Some(true),
+            frame_count_mod: Some(60),
+            ..Default::default()
+        };
+        let pass = pass_from_settings(shader, &settings);
+        assert_eq!(pass.alias.as_deref(), Some("crtPass"));
+        assert!(pass.float_framebuffer);
+        assert!(!pass.filter_linear);
+        assert_eq!(pass.wrap_mode, preview_engine::WrapMode::Repeat);
+        assert!(pass.mipmap_input);
+        assert_eq!(pass.frame_count_mod, 60);
+        // No scale keys → the §2 position default applies (scale stays None).
+        assert!(pass.scale.is_none());
     }
 
     /// End-to-end transport check, no Tauri runtime: a `Channel` built from a

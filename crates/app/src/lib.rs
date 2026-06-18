@@ -12,6 +12,7 @@ mod export;
 mod graph;
 mod preview;
 mod project;
+mod scan;
 
 /// The workspace engine crates wired into the app. Phase 0 keeps the
 /// `app` → all dependency edges (Architecture §B) live and referenced until
@@ -49,6 +50,8 @@ pub fn run() {
             preview::load_test_pattern,
             preview::load_source_sequence,
             preview::load_shader,
+            preview::load_shader_source,
+            preview::load_chain_sources,
             preview::load_preset,
             preview::set_viewport,
             preview::set_simulated_viewport,
@@ -62,6 +65,7 @@ pub fn run() {
             project::save_project,
             project::load_project,
             graph::compile_graph,
+            scan::scan_pass_source,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShaderBuilder");

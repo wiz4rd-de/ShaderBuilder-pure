@@ -635,6 +635,79 @@ fn fixtures_emit_compile_and_match_snapshots() {
     }
 }
 
+/// Phase-5 graph→IR bridge acceptance (#49): the minimal editor graph
+/// `Texcoord → Sample(Source) → Output` must type-check, lower, emit, and COMPILE.
+///
+/// The frontend `graphToIr` bridge lowers a `Texcoord` node to a `CustomSnippet`
+/// with **no inputs** and one `vec2 uv` output whose body reads `vTexCoord` (the
+/// raw fragment UV — there is no Builtin texcoord semantic and the IR is frozen).
+/// This test pins that design: it reconstructs the EXACT `IrGraph` the bridge
+/// emits and proves the `vTexCoord`-in-a-snippet assumption holds — the snippet
+/// wrapper function is emitted at fragment-stage file scope where `vTexCoord`
+/// (declared `layout(location = 0) in vec2 vTexCoord;`) is in scope, so the
+/// generated slang compiles through the real Phase-1 path.
+#[test]
+fn texcoord_snippet_minimal_graph_compiles() {
+    // Mirrors web/src/nodes/{descriptors/coordinates.ts texcoord, graphToIr.ts}.
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "texcoord",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("texcoord", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+
+    // Type-checks clean — the coord source feeds the required Sample.coord input.
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "minimal texcoord graph did not type-check clean: {diags:?}"
+    );
+
+    let lowered = lower(&graph, &ctx).expect("minimal texcoord graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("texcoord_minimal".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+
+    // The snippet body reads the in-scope `vTexCoord` global from its wrapper fn.
+    assert!(
+        slang.contains("void snippet_texcoord("),
+        "texcoord emitted its own wrapper fn:\n{slang}"
+    );
+    assert!(
+        slang.contains("uv = vTexCoord;"),
+        "snippet body reads vTexCoord:\n{slang}"
+    );
+
+    // Compiles through the real preprocess → glslang → SPIR-V path: a snippet body
+    // referencing an out-of-scope `vTexCoord` would fail here.
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("minimal texcoord graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
 /// Dedup acceptance: a graph sampling both `Original` and `OriginalHistory{0}`
 /// (the same RetroArch texture) must emit a SINGLE `sampler2D Original` decl — two
 /// would be a GLSL redefinition. Proves the lowering canonicalization reaches the
@@ -709,4 +782,403 @@ fn two_snippets_with_like_named_locals_have_no_collision() {
         2,
         "each wrapper keeps its own `float t` local:\n{slang}"
     );
+}
+
+/// #51 Color acceptance: the `Linear → sRGB` colour node (a vec3-port CustomSnippet
+/// using the EXACT piecewise transfer) compiles end-to-end. Mirrors the IrGraph the
+/// TS bridge emits for `Source → swizzle(.rgb) → linearToSrgb → construct(vec4) →
+/// Output`. The snippet body is the verbatim string
+/// `web/src/nodes/descriptors/color.ts` generates for `linearToSrgb`.
+#[test]
+fn color_linear_to_srgb_snippet_compiles() {
+    let srgb_body = "vec3 lo = color * 12.92;\n\
+         vec3 hi = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;\n\
+         vec3 cutoff = step(vec3(0.0031308), color);\n\
+         result = mix(lo, hi, cutoff);";
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "rgb",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "rgb".to_owned(),
+                    },
+                    operands: vec!["in".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "srgb",
+                NodeOp::CustomSnippet {
+                    body: srgb_body.to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec3)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            // construct a vec4 from the vec3 + a 1.0 alpha so Output.color (vec4) is fed.
+            IrNode::new(
+                "one",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 1.0 },
+                },
+            ),
+            IrNode::new(
+                "rgba",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: PortType::Vec4 },
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "rgb", "in"),
+            IrEdge::new("rgb", "out", "srgb", "color"),
+            IrEdge::new("srgb", "result", "rgba", "a"),
+            IrEdge::new("one", "out", "rgba", "b"),
+            IrEdge::new("rgba", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "linearToSrgb colour graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("linearToSrgb colour graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("color_srgb".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    // The exact piecewise constants reached the emitted source (not a pow(2.2)).
+    assert!(
+        slang.contains("0.0031308"),
+        "exact sRGB break point emitted:\n{slang}"
+    );
+    assert!(
+        slang.contains("1.0 / 2.4"),
+        "exact sRGB exponent emitted:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("linearToSrgb colour graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
+/// #51 Sampling acceptance: the `CRT Mask` generator (a CustomSnippet reading a
+/// `vec2 uv` + a `vec4 OutputSize` wired from a Builtin OutputSize node) compiles
+/// end-to-end, and the mask pitch is driven by `uv * outputSize.xy` so it tracks
+/// the simulated-viewport scale. Mirrors the IrGraph the TS bridge emits for
+/// `Texcoord + Builtin(OutputSize) → crtMask → mul(Source.rgb) → construct(vec4) →
+/// Output`. The snippet body is the verbatim string `sampling.ts` generates for the
+/// aperture-grille mask at strength 0.5.
+#[test]
+fn sampling_crt_mask_snippet_compiles_and_tracks_output_size() {
+    let mask_body = "vec2 px = uv * outputSize.xy;\n\
+         float phase = mod(px.x, 3.0);\n\
+         vec3 m = vec3(step(phase, 1.0), step(1.0, phase) * step(phase, 2.0), step(2.0, phase));\n\
+         result = mix(vec3(1.0), m * 3.0, 0.5);";
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "osize",
+                NodeOp::Builtin {
+                    semantic: BuiltinSemantic::OutputSize,
+                },
+            ),
+            IrNode::new(
+                "mask",
+                NodeOp::CustomSnippet {
+                    body: mask_body.to_owned(),
+                    inputs: vec![
+                        PortDecl::new("uv", PortType::Vec2),
+                        PortDecl::new("outputSize", PortType::Vec4),
+                    ],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            // Sample the image and tint by the mask, then construct a vec4.
+            IrNode::new(
+                "uv2",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "rgb",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "rgb".to_owned(),
+                    },
+                    operands: vec!["in".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "tint",
+                NodeOp::Expr {
+                    op: ExprOp::Mul,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "one",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 1.0 },
+                },
+            ),
+            IrNode::new(
+                "rgba",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: PortType::Vec4 },
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "mask", "uv"),
+            IrEdge::new("osize", "out", "mask", "outputSize"),
+            IrEdge::new("uv2", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "rgb", "in"),
+            IrEdge::new("rgb", "out", "tint", "a"),
+            IrEdge::new("mask", "result", "tint", "b"),
+            IrEdge::new("tint", "out", "rgba", "a"),
+            IrEdge::new("one", "out", "rgba", "b"),
+            IrEdge::new("rgba", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "crtMask sampling graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("crtMask sampling graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("crt_mask".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    // The mask pitch is driven by OutputSize (so it tracks the simulated viewport),
+    // and the OutputSize builtin reached the params block.
+    assert!(
+        slang.contains("uv * outputSize.xy"),
+        "mask pitch tracks OutputSize:\n{slang}"
+    );
+    assert!(
+        slang.contains("OutputSize"),
+        "OutputSize builtin declared in the params block:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("crtMask sampling graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
+/// #51 Color acceptance (YIQ): the `RGB → YIQ → RGB` colour nodes — two vec3-port
+/// CustomSnippets emitting column-major NTSC matrices — compile end-to-end. Mirrors
+/// the IrGraph the TS bridge emits for `Source → swizzle(.rgb) → rgbToYiq → yiqToRgb
+/// → construct(vec4) → Output`. The snippet bodies are the VERBATIM strings
+/// `web/src/nodes/descriptors/color.ts` generates (the column-major `mat3(...)`
+/// literals from `mat3FromRows`), so this pins that the transposed matrix args
+/// compile through the real slang path (a malformed `mat3(...)` would fail here).
+#[test]
+fn color_rgb_yiq_roundtrip_snippet_compiles() {
+    // Column-major (mat3 args are COLUMNS): the row matrix is transposed, exactly as
+    // mat3FromRows emits. See web/src/nodes/descriptors/color.ts.
+    let fwd_body =
+        "result = mat3(0.299, 0.595716, 0.211456, 0.587, -0.274453, -0.522591, 0.114, -0.321263, 0.311135) * color;";
+    let inv_body =
+        "result = mat3(1.0, 1.0, 1.0, 0.956296, -0.272122, -1.106989, 0.621024, -0.647381, 1.704615) * color;";
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "rgb",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "rgb".to_owned(),
+                    },
+                    operands: vec!["in".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "fwd",
+                NodeOp::CustomSnippet {
+                    body: fwd_body.to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec3)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            IrNode::new(
+                "inv",
+                NodeOp::CustomSnippet {
+                    body: inv_body.to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec3)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec3)],
+                },
+            ),
+            IrNode::new(
+                "one",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 1.0 },
+                },
+            ),
+            IrNode::new(
+                "rgba",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: PortType::Vec4 },
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "rgb", "in"),
+            IrEdge::new("rgb", "out", "fwd", "color"),
+            IrEdge::new("fwd", "result", "inv", "color"),
+            IrEdge::new("inv", "result", "rgba", "a"),
+            IrEdge::new("one", "out", "rgba", "b"),
+            IrEdge::new("rgba", "out", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "rgb↔yiq colour graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("rgb↔yiq colour graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("color_yiq".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    // The column-major matrix args reached the emitted source verbatim.
+    assert!(
+        slang.contains("mat3(0.299, 0.595716, 0.211456,"),
+        "forward YIQ matrix emitted column-major:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("rgb↔yiq colour graph slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
+}
+
+/// The frontend custom-snippet node (#52, web/src/nodes/descriptors/custom.ts)
+/// lowers to a `CustomSnippet` whose author-typed body reads its declared input
+/// ports and assigns its declared output ports. This pins the node's DEFAULT body
+/// (a colour-clamp pass-through over a `vec4 color` input → `vec4 result` output):
+/// the exact IrGraph the bridge emits for `Source → CustomSnippet → Output` must
+/// compile through the real slang pipeline (the #52 "a snippet block compiles +
+/// previews through compile_graph" acceptance bar).
+#[test]
+fn custom_snippet_node_default_body_compiles() {
+    let graph = IrGraph {
+        nodes: vec![
+            IrNode::new(
+                "uv",
+                NodeOp::CustomSnippet {
+                    body: "uv = vTexCoord;".to_owned(),
+                    inputs: vec![],
+                    outputs: vec![PortDecl::new("uv", PortType::Vec2)],
+                },
+            ),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            // The descriptor's default data: one vec4 `color` in, one vec4 `result`
+            // out, body = the clamp pass-through (DEFAULT_BODY in custom.ts).
+            IrNode::new(
+                "snippet",
+                NodeOp::CustomSnippet {
+                    body: "result = clamp(color, vec4(0.0), vec4(1.0));".to_owned(),
+                    inputs: vec![PortDecl::new("color", PortType::Vec4)],
+                    outputs: vec![PortDecl::new("result", PortType::Vec4)],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "uv", "src", "coord"),
+            IrEdge::new("src", "out", "snippet", "color"),
+            IrEdge::new("snippet", "result", "output", "color"),
+        ],
+    };
+    let ctx = CheckContext::new();
+    let diags = check(&graph, &ctx);
+    assert!(
+        !diags.has_errors(),
+        "custom-snippet default-body graph did not type-check clean: {diags:?}"
+    );
+    let lowered = lower(&graph, &ctx).expect("custom-snippet graph lowers clean");
+    let slang = emit_pass(
+        &lowered,
+        &EmitOptions {
+            name: Some("custom_snippet_node".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+    );
+    assert!(
+        slang.contains("result = clamp(color, vec4(0.0), vec4(1.0));"),
+        "snippet body inlined verbatim:\n{slang}"
+    );
+    slang_compile::compile_slang(&slang, None).unwrap_or_else(|e| {
+        panic!("custom-snippet node slang did not compile: {e}\n--- emitted ---\n{slang}")
+    });
 }
