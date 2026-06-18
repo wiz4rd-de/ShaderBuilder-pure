@@ -13,8 +13,10 @@
 //! See [`emit`] for the emitted shape and the binding/semantic conventions.
 
 pub mod emit;
+pub mod whole_pass;
 
 pub use emit::{emit_pass, texture_slang_name, EmitOptions, DEFAULT_FORMAT};
+pub use whole_pass::{scan_whole_pass, whole_pass_source, WholePassManifest};
 
 /// Crate identity marker. See [`core_model::NAME`].
 pub const NAME: &str = "codegen-slang";

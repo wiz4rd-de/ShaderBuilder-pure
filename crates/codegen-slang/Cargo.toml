@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 ir = { workspace = true }
 core-model = { workspace = true }
+# Whole-pass code-node pass-through (#43) reuses preset-io's existing
+# `#pragma parameter` + texture-reference scanners rather than re-implementing
+# them. No cycle: preset-io depends only on core-model.
+preset-io = { workspace = true }
 
 [dev-dependencies]
 # Emit-then-compile acceptance: the generated slang must compile through the

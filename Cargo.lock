@@ -414,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "core-model",
  "ir",
+ "preset-io",
  "slang-compile",
 ]
 
