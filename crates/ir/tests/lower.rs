@@ -516,13 +516,19 @@ fn custom_snippet_lowers_with_operand_and_result_temps() {
     // The snippet's result_port output is what feeds FragColor.
     assert_eq!(snip.result, lowered.output);
     if let LoweredOp::CustomSnippet {
+        node_id,
         result_port,
         inputs,
         ..
     } = &snip.op
     {
+        assert_eq!(node_id, "snip");
         assert_eq!(result_port, "out_c");
-        assert_eq!(inputs, &vec!["in_c".to_owned()]);
+        assert_eq!(
+            inputs,
+            &vec![PortDecl::new("in_c", PortType::Vec4)],
+            "lowered snippet carries its typed input ports (for the wrapper signature)"
+        );
     } else {
         unreachable!();
     }

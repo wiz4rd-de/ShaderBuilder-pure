@@ -35,7 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use core_model::ir::{
-    BuiltinSemantic, ConstValue, ExprOp, IrEdge, IrGraph, IrNode, NodeOp, PortType, TextureSource,
+    BuiltinSemantic, ConstValue, ExprOp, IrEdge, IrGraph, IrNode, NodeOp, PortDecl, PortType,
+    TextureSource,
 };
 
 use crate::{check, CheckContext};
@@ -88,18 +89,31 @@ pub enum LoweredOp {
         /// The intrinsic applied.
         op: ExprOp,
     },
-    /// A verbatim GLSL snippet. Operands are the temps feeding `inputs` (in the
-    /// declared input-port order); `inputs`/`outputs`/`body` are carried verbatim
-    /// for the emitter to substitute. The statement's single result temp is the
-    /// snippet's `result_port` output.
+    /// A verbatim GLSL snippet, lowered to a call of a generated **wrapper
+    /// function** (#43). Operands are the temps feeding `inputs` (in the declared
+    /// input-port order); `node_id`/`inputs`/`outputs`/`body` are carried verbatim
+    /// for the emitter to (a) emit one `snippet_<node_id>(...)` function whose
+    /// body is the snippet — so its locals live in their own scope and cannot
+    /// collide with `main` or another snippet — and (b) call it from the SSA
+    /// stream. Lowering emits one [`SsaStmt`] per declared output port (a snippet
+    /// may assign several); this statement's result temp is its `result_port`.
     CustomSnippet {
-        /// The GLSL statement body.
+        /// The stable id of the originating [`NodeOp::CustomSnippet`] node — the
+        /// emitter derives the unique wrapper function name (`snippet_<node_id>`)
+        /// from it so two snippets never share a function and their locals never
+        /// collide.
+        node_id: String,
+        /// The GLSL statement body, verbatim. Reads its input ports by name (the
+        /// wrapper's `in` parameters) and assigns its output ports by name (the
+        /// wrapper's `out` parameters).
         body: String,
-        /// Declared input port names, in the same order as [`SsaStmt::operands`].
-        inputs: Vec<String>,
-        /// All declared output port names (a snippet may assign several; this
-        /// statement's result temp is [`result_port`](LoweredOp::CustomSnippet::result_port)).
-        outputs: Vec<String>,
+        /// Declared typed input ports, in the same order as [`SsaStmt::operands`]
+        /// — the wrapper function's `in` parameters (name + type).
+        inputs: Vec<PortDecl>,
+        /// All declared typed output ports (a snippet may assign several) — the
+        /// wrapper function's `out` parameters. This statement's result temp is
+        /// the [`result_port`](LoweredOp::CustomSnippet::result_port) output.
+        outputs: Vec<PortDecl>,
         /// The output port name this statement's result temp corresponds to.
         result_port: String,
     },
@@ -628,11 +642,11 @@ impl<'g> Lowerer<'g> {
                     .iter()
                     .map(|p| self.input_temp(node_id, &p.name).unwrap_or(TempId(0)))
                     .collect();
-                let input_names: Vec<String> = inputs.iter().map(|p| p.name.clone()).collect();
-                let output_names: Vec<String> = outputs.iter().map(|p| p.name.clone()).collect();
                 // One result temp per declared output port (a snippet may produce
-                // several values). Each statement carries the same body/inputs but
-                // a distinct result_port.
+                // several values). Each statement carries the same node_id / body /
+                // typed ports but a distinct result_port; the emitter emits the
+                // wrapper function once and aliases each output-port temp to the
+                // matching `out` argument.
                 for out in outputs {
                     let result = self.fresh();
                     self.record_out(node_id, &out.name, result);
@@ -640,9 +654,10 @@ impl<'g> Lowerer<'g> {
                         result,
                         ty: out.ty,
                         op: LoweredOp::CustomSnippet {
+                            node_id: node_id.to_owned(),
                             body: body.clone(),
-                            inputs: input_names.clone(),
-                            outputs: output_names.clone(),
+                            inputs: inputs.clone(),
+                            outputs: outputs.clone(),
                             result_port: out.name.clone(),
                         },
                         operands: operand_temps.clone(),
