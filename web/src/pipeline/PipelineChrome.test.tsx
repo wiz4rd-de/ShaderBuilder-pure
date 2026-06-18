@@ -81,4 +81,33 @@ describe("Pipeline chrome", () => {
     await user.click(screen.getByRole("button", { name: "Back to pipeline" }));
     expect(useDocumentStore.getState().level).toBe("pipeline");
   });
+
+  it("drilling into a subgraph shows its crumb; back pops one level (#57)", async () => {
+    const user = userEvent.setup();
+    render(<Chrome />);
+    const store = useDocumentStore.getState();
+    const p0 = store.project.passes[0]!.id;
+
+    // Build a node in the pass, collapse it into a named subgraph, drill in.
+    store.openPass(p0);
+    const n = store.addNode("source", { x: 0, y: 0 });
+    act(() => store.setSelection({ nodeIds: [n], edgeIds: [] }));
+    act(() => store.collapseSelection("Grouped"));
+    const sgId = useDocumentStore
+      .getState()
+      .activeGraph()
+      .nodes.find((node) => node.kind === "subgraph")!.id;
+    act(() => useDocumentStore.getState().openSubgraph(sgId));
+
+    // The breadcrumb shows the subgraph name as the current crumb.
+    const crumb = screen.getByTestId("breadcrumb-subgraph");
+    expect(crumb).toHaveTextContent("Grouped");
+    expect(crumb).toHaveAttribute("data-subgraph-id", sgId);
+
+    // Back pops one level — to the pass graph (still level "pass", path empty).
+    await user.click(screen.getByRole("button", { name: `Back to ${"Pass 1"}` }));
+    const after = useDocumentStore.getState();
+    expect(after.level).toBe("pass");
+    expect(after.subgraphPath).toEqual([]);
+  });
 });

@@ -1,6 +1,6 @@
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useDocumentStore } from "../store/documentStore";
 import { resetIdsForTest } from "../store/ids";
@@ -82,5 +82,41 @@ describe("EditorToolbar + EditorStatusBar", () => {
     // Delete removes the currently-selected (pasted) node.
     await user.click(screen.getByRole("button", { name: "Delete" }));
     expect(screen.getByTestId("status-counts")).toHaveTextContent("2 nodes");
+  });
+
+  it("Collapse turns the selection into a subgraph node; Expand restores it (#57)", async () => {
+    const user = userEvent.setup();
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("MySub");
+    render(<Harness />);
+
+    await user.click(screen.getByRole("button", { name: "Add node" }));
+    const nodeId = useDocumentStore.getState().activeGraph().nodes[0]!.id;
+    act(() => useDocumentStore.getState().setSelection({ nodeIds: [nodeId], edgeIds: [] }));
+
+    // Collapse: one subgraph node replaces the selection; Expand becomes enabled.
+    await user.click(screen.getByRole("button", { name: "Collapse" }));
+    const collapsed = useDocumentStore.getState().activeGraph();
+    expect(collapsed.nodes).toHaveLength(1);
+    expect(collapsed.nodes[0]!.kind).toBe("subgraph");
+    expect(screen.getByRole("button", { name: "Expand" })).toBeEnabled();
+
+    // Expand: the subgraph node is replaced by its interior (the placeholder).
+    await user.click(screen.getByRole("button", { name: "Expand" }));
+    const expanded = useDocumentStore.getState().activeGraph();
+    expect(expanded.nodes.some((n) => n.kind === "subgraph")).toBe(false);
+    expect(expanded.nodes).toHaveLength(1);
+
+    promptSpy.mockRestore();
+  });
+
+  it("Expand is disabled unless exactly one subgraph node is selected", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+    expect(screen.getByRole("button", { name: "Expand" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Add node" }));
+    const nodeId = useDocumentStore.getState().activeGraph().nodes[0]!.id;
+    act(() => useDocumentStore.getState().setSelection({ nodeIds: [nodeId], edgeIds: [] }));
+    // A plain (non-subgraph) node selected → Expand stays disabled.
+    expect(screen.getByRole("button", { name: "Expand" })).toBeDisabled();
   });
 });
