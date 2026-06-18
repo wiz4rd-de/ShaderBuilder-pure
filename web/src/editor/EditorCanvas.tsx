@@ -18,6 +18,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { useCallback, useMemo, useState } from "react";
 
+import { NODE_TYPES } from "../nodes/nodeTypes";
 import { useDocumentStore } from "../store/documentStore";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorToolbar } from "./EditorToolbar";
@@ -103,6 +104,7 @@ function CanvasInner() {
         <ReactFlow
           nodes={nodes}
           edges={edges}
+          nodeTypes={NODE_TYPES}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}

@@ -1,19 +1,24 @@
-// A minimal node palette shown as a context menu on the canvas (#45). It offers
-// the single generic placeholder node so the canvas is usable BEFORE the real
-// taxonomy (#49) lands; #49 replaces this list with the node-descriptor registry.
+// The node palette context menu (#49) — now driven by the node-descriptor
+// REGISTRY. Every registered kind is offered, grouped by category, and inserts a
+// node carrying that descriptor's `defaultData()`. Adding a node kind = adding a
+// descriptor; this menu needs no change.
 import type { Vec2 } from "../bindings/Vec2";
+import { descriptorsByCategory, nonEmptyCategories } from "../nodes/registry";
+import type { NodeCategory } from "../nodes/types";
 import { useDocumentStore } from "../store/documentStore";
-import { PLACEHOLDER_KIND } from "../store/factories";
 
-/** One palette entry: the node kind to insert and how to label it. */
-interface PaletteEntry {
-  kind: string;
-  label: string;
-}
-
-// Until #49's registry exists, the palette is a single generic node. Adding to
-// this array is the temporary way to surface more node kinds.
-const PALETTE: PaletteEntry[] = [{ kind: PLACEHOLDER_KIND, label: "Placeholder node" }];
+/** Human section headings for each category. */
+const CATEGORY_LABEL: Record<NodeCategory, string> = {
+  input: "Inputs / Samplers",
+  coordinate: "Coordinates / UV",
+  constant: "Constants",
+  parameter: "Parameters",
+  builtin: "Builtins",
+  math: "Math",
+  color: "Color",
+  custom: "Custom",
+  output: "Output",
+};
 
 export interface NodePaletteMenuProps {
   /** Screen-space anchor (where the user right-clicked). */
@@ -28,8 +33,8 @@ export function NodePaletteMenu({ screen, graphPosition, onClose }: NodePaletteM
   const addNode = useDocumentStore((s) => s.addNode);
   const setSelection = useDocumentStore((s) => s.setSelection);
 
-  function insert(kind: string): void {
-    const id = addNode(kind, graphPosition);
+  function insert(kind: string, data: Record<string, unknown>): void {
+    const id = addNode(kind, graphPosition, data);
     setSelection({ nodeIds: [id], edgeIds: [] });
     onClose();
   }
@@ -41,16 +46,22 @@ export function NodePaletteMenu({ screen, graphPosition, onClose }: NodePaletteM
       aria-label="Insert node"
       style={{ left: screen.x, top: screen.y }}
     >
-      {PALETTE.map((entry) => (
-        <button
-          key={entry.kind}
-          type="button"
-          role="menuitem"
-          className="editor__palette-item"
-          onClick={() => insert(entry.kind)}
-        >
-          {entry.label}
-        </button>
+      {nonEmptyCategories().map((category) => (
+        <div key={category} className="editor__palette-group">
+          <div className="editor__palette-heading">{CATEGORY_LABEL[category]}</div>
+          {descriptorsByCategory(category).map((descriptor) => (
+            <button
+              key={descriptor.kind}
+              type="button"
+              role="menuitem"
+              className="editor__palette-item"
+              title={descriptor.description}
+              onClick={() => insert(descriptor.kind, descriptor.defaultData())}
+            >
+              {descriptor.label}
+            </button>
+          ))}
+        </div>
       ))}
     </div>
   );

@@ -22,9 +22,10 @@ export type EditorRfEdge = RfEdge;
 export function toRfNode(node: Node, selected: boolean): EditorRfNode {
   return {
     id: node.id,
-    // RF node.type ⇄ core Node.kind. The default RF renderer is used until the
-    // taxonomy (#49) registers per-kind node components.
-    type: "default",
+    // RF node.type ⇄ core Node.kind. The taxonomy registry (#49) registers a
+    // component for every kind (see nodes/nodeTypes.ts); unknown kinds fall back
+    // to TaxonomyNode's "unknown node" card.
+    type: node.kind,
     position: { x: node.position.x, y: node.position.y },
     data: { ...node.data, label: deriveLabel(node) },
     selected,

@@ -120,6 +120,117 @@
   color: #0b0d10;
 }
 
+.editor__palette {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.editor__palette-group + .editor__palette-group {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
+.editor__palette-heading {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  padding: 4px 10px 2px;
+}
+
+/* ---- Taxonomy node (#49): one component renders every node kind ---- */
+.taxonomy-node {
+  min-width: 132px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 30%);
+}
+
+.react-flow__node.selected .taxonomy-node {
+  border-color: var(--accent);
+}
+
+.taxonomy-node__title {
+  padding: 5px 10px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  background: var(--panel);
+}
+
+.taxonomy-node__subtitle {
+  padding: 4px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.taxonomy-node__ports {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.taxonomy-node__col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.taxonomy-node__col--out {
+  text-align: right;
+}
+
+.taxonomy-node__port {
+  position: relative;
+  padding: 2px 10px;
+}
+
+.taxonomy-node__port-label {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.taxonomy-node__handle {
+  width: 9px;
+  height: 9px;
+  background: var(--accent);
+  border: 1px solid var(--bg);
+}
+
+/* Type-tinted handles so port types are visually distinguishable. */
+.taxonomy-node__handle--float {
+  background: #7fc97f;
+}
+.taxonomy-node__handle--vec2 {
+  background: #5aa9e6;
+}
+.taxonomy-node__handle--vec3 {
+  background: #c792ea;
+}
+.taxonomy-node__handle--vec4 {
+  background: #e6a15a;
+}
+.taxonomy-node__handle--int {
+  background: #d6d65a;
+}
+.taxonomy-node__handle--bool {
+  background: #e65a8b;
+}
+.taxonomy-node__handle--sampler2D {
+  background: #8b93a1;
+}
+
+.taxonomy-node--unknown {
+  border-style: dashed;
+  opacity: 0.8;
+}
+
 .editor__statusbar {
   flex: 0 0 auto;
   display: flex;
