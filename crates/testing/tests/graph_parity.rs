@@ -123,6 +123,10 @@ struct Fixture {
     overrides: Vec<ParamOverride>,
     /// The committed hand-written-equivalent `.slang` file name.
     handwritten: &'static str,
+    /// The frame index to render at. Defaults to [`FRAME_INDEX`] (0); a builtin
+    /// fixture reading `FrameCount` renders at a `> 0` index so the live counter
+    /// value (and its `int(...)` cast) actually perturbs the image.
+    frame_index: u64,
 }
 
 /// Render the generated graph and the hand-written equivalent through the same
@@ -137,7 +141,7 @@ fn assert_parity(fx: &Fixture) {
         &fx.overrides,
         &src,
         VIEWPORT,
-        FRAME_INDEX,
+        fx.frame_index,
     )
     .unwrap_or_else(|e| panic!("fixture `{}` generated-slang render: {e}", fx.name));
 
@@ -149,7 +153,7 @@ fn assert_parity(fx: &Fixture) {
             )
         });
     let handwritten =
-        render_handwritten_slang(&hand_src, &fx.overrides, &src, VIEWPORT, FRAME_INDEX)
+        render_handwritten_slang(&hand_src, &fx.overrides, &src, VIEWPORT, fx.frame_index)
             .unwrap_or_else(|e| panic!("fixture `{}` hand-written render: {e}", fx.name));
 
     let report = diff_images(&generated, &handwritten, TOLERANCE, MAX_FRACTION);
@@ -224,6 +228,7 @@ fn fixture_color_invert() -> Fixture {
         },
         overrides: vec![],
         handwritten: "color_invert.slang",
+        frame_index: FRAME_INDEX,
     }
 }
 
@@ -267,6 +272,7 @@ fn fixture_uv_warp() -> Fixture {
         },
         overrides: vec![],
         handwritten: "uv_warp.slang",
+        frame_index: FRAME_INDEX,
     }
 }
 
@@ -345,6 +351,7 @@ fn fixture_param_contrast(name: &'static str, overrides: Vec<ParamOverride>) -> 
         },
         overrides,
         handwritten: "param_contrast.slang",
+        frame_index: FRAME_INDEX,
     }
 }
 
@@ -459,6 +466,7 @@ fn fixture_blur() -> Fixture {
         },
         overrides: vec![],
         handwritten: "blur.slang",
+        frame_index: FRAME_INDEX,
     }
 }
 
@@ -505,8 +513,372 @@ fn fixture_snippet_channel_swap() -> Fixture {
         },
         overrides: vec![],
         handwritten: "snippet_channel_swap.slang",
+        frame_index: FRAME_INDEX,
     }
 }
+
+/// SWIZZLE (`.bgra`): sample `Source` then swizzle `.bgra` into the output —
+/// reverses R<->B, keeps G/A. The swizzle mask is operand-order-sensitive, so a
+/// wrong mask moves pixels (the red/green source split flips channels). Exercises
+/// `ExprOp::Swizzle` end-to-end. `texture(Source, vTexCoord).bgra`.
+fn fixture_swizzle_bgra() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "sw",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "bgra".to_owned(),
+                    },
+                    operands: vec!["v".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("src", "out", "sw", "v"),
+            IrEdge::new("sw", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "swizzle_bgra",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("swizzle_bgra".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "swizzle_bgra.slang",
+        frame_index: FRAME_INDEX,
+    }
+}
+
+/// CONSTRUCT (vec4 from vec3 + scalar): sample `Source`, take `.rgb` (a vec3),
+/// then `Construct(vec4)` from (that vec3, a const float alpha 1.0). The
+/// constructor's operand ORDER and grouping matter, so a wrong order moves
+/// pixels. Exercises `ExprOp::Construct` (the explicit-widening path) plus a
+/// `Swizzle`. `vec4(texture(Source, vTexCoord).rgb, 1.0)`.
+fn fixture_construct_vec4() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "rgb",
+                NodeOp::Expr {
+                    op: ExprOp::Swizzle {
+                        mask: "rgb".to_owned(),
+                    },
+                    operands: vec!["v".to_owned()],
+                },
+            ),
+            IrNode::new(
+                "alpha",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 1.0 },
+                },
+            ),
+            IrNode::new(
+                "ctor",
+                NodeOp::Expr {
+                    op: ExprOp::Construct { ty: PortType::Vec4 },
+                    operands: vec!["xyz".to_owned(), "w".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("src", "out", "rgb", "v"),
+            IrEdge::new("rgb", "out", "ctor", "xyz"),
+            IrEdge::new("alpha", "out", "ctor", "w"),
+            IrEdge::new("ctor", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "construct_vec4",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("construct_vec4".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "construct_vec4.slang",
+        frame_index: FRAME_INDEX,
+    }
+}
+
+/// MIX (operand order): `mix(color, blue, 0.25)` — 75% source + 25% blend.
+/// `mix(a, b, t)` is order-sensitive (it is `a*(1-t)+b*t`), so swapping a/b or a
+/// wrong `t` moves pixels. Exercises `ExprOp::Mix` with vector operands and a
+/// scalar `t`. `mix(texture(Source, vTexCoord), vec4(0,0,1,1), 0.25)`.
+fn fixture_mix_blend() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "blend",
+                NodeOp::Const {
+                    value: ConstValue::Vec4 {
+                        value: [0.0, 0.0, 1.0, 1.0],
+                    },
+                },
+            ),
+            IrNode::new(
+                "t",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.25 },
+                },
+            ),
+            IrNode::new(
+                "mix",
+                NodeOp::Expr {
+                    op: ExprOp::Mix,
+                    operands: vec!["a".to_owned(), "b".to_owned(), "t".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("src", "out", "mix", "a"),
+            IrEdge::new("blend", "out", "mix", "b"),
+            IrEdge::new("t", "out", "mix", "t"),
+            IrEdge::new("mix", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "mix_blend",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("mix_blend".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "mix_blend.slang",
+        frame_index: FRAME_INDEX,
+    }
+}
+
+/// CLAMP (operand order): `clamp(color, 0.25, 0.65)` — the band `[lo, hi]` is
+/// order-sensitive (lo before hi). With the source channels spanning ~0.08..0.78
+/// the band genuinely moves pixels (low channels clamp up, high channels clamp
+/// down). Exercises `ExprOp::Clamp` with a vector `x` and scalar bounds.
+/// `clamp(texture(Source, vTexCoord), 0.25, 0.65)`.
+fn fixture_clamp_band() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "lo",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.25 },
+                },
+            ),
+            IrNode::new(
+                "hi",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.65 },
+                },
+            ),
+            IrNode::new(
+                "clamp",
+                NodeOp::Expr {
+                    op: ExprOp::Clamp,
+                    operands: vec!["x".to_owned(), "lo".to_owned(), "hi".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("src", "out", "clamp", "x"),
+            IrEdge::new("lo", "out", "clamp", "lo"),
+            IrEdge::new("hi", "out", "clamp", "hi"),
+            IrEdge::new("clamp", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "clamp_band",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("clamp_band".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "clamp_band.slang",
+        frame_index: FRAME_INDEX,
+    }
+}
+
+/// DIV (operand order): `color / 2.0` — division is order-sensitive
+/// (`a / b` != `b / a`), so a swapped numerator/denominator would compute
+/// `2.0 / color` and move pixels far. Exercises `ExprOp::Div` with a vector
+/// numerator and scalar denominator. `texture(Source, vTexCoord) / 2.0`.
+fn fixture_div_scale() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "two",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 2.0 },
+                },
+            ),
+            IrNode::new(
+                "div",
+                NodeOp::Expr {
+                    op: ExprOp::Div,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("src", "out", "div", "a"),
+            IrEdge::new("two", "out", "div", "b"),
+            IrEdge::new("div", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "div_scale",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("div_scale".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "div_scale.slang",
+        frame_index: FRAME_INDEX,
+    }
+}
+
+/// BUILTIN read (`FrameCount`, at frame_index > 0): a `Builtin(FrameCount)` (a
+/// `uint` in the params block, typed `int` in the IR — read through the emitter's
+/// `int(...)` cast) drives a scalar `phase = fract(FrameCount * 0.25)`, then the
+/// sampled color is scaled by it. Rendered at [`FRAME_COUNT_INDEX`] (= 2, so
+/// `FrameCount == 2` ⇒ `phase = fract(0.5) = 0.5`), the live counter VALUE and
+/// its cast both perturb the image — a wrong cast or a baked/zero FrameCount
+/// would change the result. `texture(...) * fract(int(params.FrameCount) * 0.25)`.
+fn fixture_builtin_framecount() -> Fixture {
+    let graph = IrGraph {
+        nodes: vec![
+            screen_uv_node("uv", "out_uv"),
+            IrNode::new(
+                "src",
+                NodeOp::Sample {
+                    texture: TextureSource::Source,
+                },
+            ),
+            IrNode::new(
+                "fc",
+                NodeOp::Builtin {
+                    semantic: core_model::ir::BuiltinSemantic::FrameCount,
+                },
+            ),
+            IrNode::new(
+                "quarter",
+                NodeOp::Const {
+                    value: ConstValue::Float { value: 0.25 },
+                },
+            ),
+            // FrameCount (int, widened to float) * 0.25
+            IrNode::new(
+                "phaseRaw",
+                NodeOp::Expr {
+                    op: ExprOp::Mul,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            // fract(FrameCount * 0.25)
+            IrNode::new(
+                "phase",
+                NodeOp::Expr {
+                    op: ExprOp::Fract,
+                    operands: vec!["x".to_owned()],
+                },
+            ),
+            // color * phase
+            IrNode::new(
+                "tint",
+                NodeOp::Expr {
+                    op: ExprOp::Mul,
+                    operands: vec!["a".to_owned(), "b".to_owned()],
+                },
+            ),
+            IrNode::new("output", NodeOp::Output),
+        ],
+        edges: vec![
+            IrEdge::new("uv", "out_uv", "src", "coord"),
+            IrEdge::new("fc", "out", "phaseRaw", "a"),
+            IrEdge::new("quarter", "out", "phaseRaw", "b"),
+            IrEdge::new("phaseRaw", "out", "phase", "x"),
+            IrEdge::new("src", "out", "tint", "a"),
+            IrEdge::new("phase", "out", "tint", "b"),
+            IrEdge::new("tint", "out", "output", "color"),
+        ],
+    };
+    Fixture {
+        name: "builtin_framecount",
+        graph,
+        ctx: CheckContext::new(),
+        opts: EmitOptions {
+            name: Some("builtin_framecount".to_owned()),
+            format: None,
+            parameters: vec![],
+        },
+        overrides: vec![],
+        handwritten: "builtin_framecount.slang",
+        frame_index: FRAME_COUNT_INDEX,
+    }
+}
+
+/// The frame index the `FrameCount` builtin fixture renders at: a value `> 0` so
+/// the live counter perturbs the image. `2` ⇒ `FrameCount == 2` (the engine's
+/// post-2-advance state) ⇒ `phase = fract(2 * 0.25) = fract(0.5) = 0.5`.
+const FRAME_COUNT_INDEX: u64 = 2;
 
 // ----------------------------------------------------------------------------
 // Tests — one per fixture (granular so a failure names the exact op family).
@@ -538,6 +910,74 @@ fn parity_blur() {
 #[test]
 fn parity_snippet_channel_swap() {
     assert_parity(&fixture_snippet_channel_swap());
+}
+
+#[test]
+fn parity_swizzle_bgra() {
+    assert_parity(&fixture_swizzle_bgra());
+}
+
+#[test]
+fn parity_construct_vec4() {
+    assert_parity(&fixture_construct_vec4());
+}
+
+#[test]
+fn parity_mix_blend() {
+    assert_parity(&fixture_mix_blend());
+}
+
+#[test]
+fn parity_clamp_band() {
+    assert_parity(&fixture_clamp_band());
+}
+
+#[test]
+fn parity_div_scale() {
+    assert_parity(&fixture_div_scale());
+}
+
+/// The `FrameCount` builtin fixture is rendered at frame_index > 0, so beyond the
+/// generated-vs-hand-written parity check we also confirm the live counter VALUE
+/// actually moved the pixels: the frame-2 render (phase = 0.5) must differ from a
+/// frame-0 render (phase = fract(0) = 0 ⇒ black), proving the FrameCount read is
+/// live (and correctly cast) rather than a baked constant. A codegen bug that
+/// dropped the cast would fail to compile; one that read a wrong/zero value would
+/// fail this differs-from-frame-0 assertion.
+#[test]
+fn parity_builtin_framecount_is_live() {
+    let fx = fixture_builtin_framecount();
+    // 1. Generated == hand-written at frame_index = 2.
+    assert_parity(&fx);
+
+    // 2. The render at frame 2 (phase 0.5) differs from frame 0 (phase 0, black),
+    //    proving the FrameCount value flows live into the shader.
+    let src = fixed_source();
+    let frame2 = render_graph_to_image(
+        &fx.graph,
+        &fx.ctx,
+        &fx.opts,
+        &fx.overrides,
+        &src,
+        VIEWPORT,
+        FRAME_COUNT_INDEX,
+    )
+    .expect("frame-2 FrameCount render");
+    let frame0 = render_graph_to_image(
+        &fx.graph,
+        &fx.ctx,
+        &fx.opts,
+        &fx.overrides,
+        &src,
+        VIEWPORT,
+        0,
+    )
+    .expect("frame-0 FrameCount render");
+    assert_differs(
+        &frame2,
+        &frame0,
+        "FrameCount must change the output between frame 0 and frame 2",
+    );
 }
 
 /// PARAM DRIVEN: confirm a LIVE parameter value flows through the params UBO. With
