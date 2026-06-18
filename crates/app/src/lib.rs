@@ -47,6 +47,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Native "reveal in file manager" for the export-bundle confirmation (#64):
+        // the opener plugin's `revealItemInDir` opens the OS file manager at the
+        // written bundle. Needs the dep + `.plugin()` + the opener capability.
+        .plugin(tauri_plugin_opener::init())
         .manage(preview::PreviewState::default())
         .manage(session::DirtyState::default())
         // Window close with unsaved edits (#63): the close handler runs in the Rust

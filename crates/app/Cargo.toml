@@ -37,6 +37,7 @@ slang-compile = { workspace = true }
 preview-engine = { workspace = true }
 source = { workspace = true }
 preset-io = { workspace = true }
+tauri-plugin-opener = "2.5.4"
 
 [dev-dependencies]
 # Throwaway dirs for the `export_preset` command test (#36).
