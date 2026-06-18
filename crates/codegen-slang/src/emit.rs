@@ -267,8 +267,9 @@ fn emit_vertex_stage(out: &mut String) {
 }
 
 /// The fragment stage: the `vTexCoord` in / `FragColor` out plumbing, the sampler
-/// bindings (deterministic manifest order), then one GLSL statement per SSA temp
-/// ending in the `FragColor = <output>` write.
+/// bindings (deterministic manifest order), the generated CustomSnippet **wrapper
+/// functions** (one per snippet node, at file scope), then one GLSL statement per
+/// SSA temp ending in the `FragColor = <output>` write.
 fn emit_fragment_stage(out: &mut String, lowered: &LoweredIr, opts: &EmitOptions) {
     out.push_str(
         "#pragma stage fragment\n\
@@ -288,39 +289,53 @@ fn emit_fragment_stage(out: &mut String, lowered: &LoweredIr, opts: &EmitOptions
     }
     out.push('\n');
 
-    // Lowering emits one SSA statement per snippet *output port*, all carrying
-    // the same body/operands. Resolve each output port's GLSL type from the
-    // statements (each statement's `ty` is its `result_port`'s type), keyed by the
-    // snippet instance (operand tuple + body), so the snippet block — which
-    // declares *all* output locals — can be emitted exactly once.
-    let snippet_output_types = collect_snippet_output_types(lowered);
-
-    out.push_str("void main()\n{\n");
-    // Track which CustomSnippet bodies have already been inlined so the body runs
-    // exactly once; each output-port temp then aliases the matching output local.
-    let mut emitted_snippets: Vec<(Vec<TempId>, String)> = Vec::new();
+    // CustomSnippet wrapper functions, at fragment-stage file scope (before
+    // `main`). Each snippet node becomes one `snippet_<node_id>(in …, out …)`
+    // function whose body is the snippet verbatim — so the body's locals live in
+    // their own scope and can never collide with `main` or another snippet's
+    // locals (#43). Emitted once per node, deterministically (first-seen order).
+    let mut emitted_fns: Vec<String> = Vec::new();
     for stmt in &lowered.stmts {
         if let LoweredOp::CustomSnippet {
+            node_id,
             body,
             inputs,
+            outputs,
+            ..
+        } = &stmt.op
+        {
+            if !emitted_fns.contains(node_id) {
+                emit_snippet_fn(out, node_id, body, inputs, outputs);
+                emitted_fns.push(node_id.clone());
+            }
+        }
+    }
+
+    out.push_str("void main()\n{\n");
+    // Track which CustomSnippet nodes have already been *called* so the call (and
+    // its output-local declarations) is emitted exactly once; each output-port
+    // temp then aliases the matching output local the call wrote.
+    let mut called_snippets: Vec<String> = Vec::new();
+    for stmt in &lowered.stmts {
+        if let LoweredOp::CustomSnippet {
+            node_id,
+            outputs,
             result_port,
             ..
         } = &stmt.op
         {
-            let key = (stmt.operands.clone(), body.clone());
-            if !emitted_snippets.contains(&key) {
-                let outputs = snippet_output_types.get(&key).cloned().unwrap_or_default();
-                emit_snippet_block(out, body, inputs, &outputs, &stmt.operands);
-                emitted_snippets.push(key);
+            if !called_snippets.contains(node_id) {
+                emit_snippet_call(out, node_id, outputs, &stmt.operands);
+                called_snippets.push(node_id.clone());
             }
             // This statement's result temp aliases the snippet's `result_port`
-            // output local (declared by the block above).
+            // output local (written by the call above).
             let _ = writeln!(
                 out,
                 "    {} {} = {};",
                 glsl_type(stmt.ty),
                 stmt.result,
-                result_port
+                snippet_out_local(node_id, result_port),
             );
             continue;
         }
@@ -337,62 +352,83 @@ fn emit_fragment_stage(out: &mut String, lowered: &LoweredIr, opts: &EmitOptions
     out.push_str("}\n");
 }
 
-/// For each CustomSnippet instance (keyed by its operand tuple + body), the
-/// `(output-port-name, type)` of every output port it produces — gathered from
-/// the per-output-port SSA statements (each statement's `ty` is its
-/// `result_port`'s type). Preserves the statement order so the declared output
-/// locals come out deterministically.
-type SnippetKey = (Vec<TempId>, String);
-fn collect_snippet_output_types(
-    lowered: &LoweredIr,
-) -> std::collections::HashMap<SnippetKey, Vec<PortDecl>> {
-    let mut map: std::collections::HashMap<SnippetKey, Vec<PortDecl>> =
-        std::collections::HashMap::new();
-    for stmt in &lowered.stmts {
-        if let LoweredOp::CustomSnippet {
-            body, result_port, ..
-        } = &stmt.op
-        {
-            let key = (stmt.operands.clone(), body.clone());
-            let entry = map.entry(key).or_default();
-            if !entry.iter().any(|d| &d.name == result_port) {
-                entry.push(PortDecl::new(result_port.clone(), stmt.ty));
-            }
-        }
-    }
-    map
+/// The unique wrapper-function name for a CustomSnippet node. Derived from the
+/// node id (sanitized to a valid GLSL identifier) so two snippet nodes never
+/// share a function — the property that makes their locals collision-free.
+fn snippet_fn_name(node_id: &str) -> String {
+    format!("snippet_{}", sanitize_ident(node_id))
 }
 
-/// Inline a [`LoweredOp::CustomSnippet`] body once: bind each input port to its
-/// operand temp, declare each output port local, then emit the snippet `body`
-/// verbatim (it reads inputs and assigns outputs by name). The caller then binds
-/// each output-port SSA temp to the matching output local.
-fn emit_snippet_block(
+/// The `main`-scope local that receives a snippet's `out` argument for `port`.
+/// Namespaced by the (sanitized) node id so two snippet calls writing a
+/// like-named output port (e.g. both `out_color`) get distinct `main` locals.
+fn snippet_out_local(node_id: &str, port: &str) -> String {
+    format!("{}_{}", snippet_fn_name(node_id), port)
+}
+
+/// Map an arbitrary node id to a valid GLSL identifier: keep `[A-Za-z0-9_]`,
+/// replace every other byte with `_`. (Hand-built Phase-4 ids are already
+/// identifier-like; this is defensive against ids the Phase-5 editor may mint.)
+fn sanitize_ident(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Emit one CustomSnippet **wrapper function** at fragment-stage file scope:
+///
+/// ```glsl
+/// void snippet_<id>(in <ty> <in0>, …, out <ty> <out0>, …)
+/// {
+///     <body verbatim>
+/// }
+/// ```
+///
+/// Inputs are `in` parameters (read-only by-value) and outputs are `out`
+/// parameters the body assigns. The body references its ports by their declared
+/// names — exactly the parameter names — so it needs no substitution, and its
+/// local variables are scoped to this function (collision-free across snippets).
+fn emit_snippet_fn(
     out: &mut String,
+    node_id: &str,
     body: &str,
-    inputs: &[String],
+    inputs: &[PortDecl],
     outputs: &[PortDecl],
-    operands: &[TempId],
 ) {
-    // Bind each input port name to its operand temp with a `#define`. The lowered
-    // `CustomSnippet` op does not carry the input port types (only the names), so
-    // an aliasing macro — rather than a typed local copy — is how we wire inputs
-    // without re-deriving their types; the body then reads `port` and it expands
-    // to `tN`. `#define`/`#undef` must start at column 0 (preprocessor lines).
-    for (port, operand) in inputs.iter().zip(operands.iter()) {
-        let _ = writeln!(out, "#define {port} {operand}");
-    }
-    // Declare the output port locals the body assigns into.
-    for decl in outputs {
-        let _ = writeln!(out, "    {} {};", glsl_type(decl.ty), decl.name);
-    }
-    // The body verbatim — reads the input #defines, assigns the output locals.
+    let params = inputs
+        .iter()
+        .map(|p| format!("in {} {}", glsl_type(p.ty), p.name))
+        .chain(
+            outputs
+                .iter()
+                .map(|p| format!("out {} {}", glsl_type(p.ty), p.name)),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(out, "void {}({})", snippet_fn_name(node_id), params);
+    out.push_str("{\n");
     for line in body.lines() {
         let _ = writeln!(out, "    {}", line.trim_end());
     }
-    for port in inputs {
-        let _ = writeln!(out, "#undef {port}");
+    out.push_str("}\n\n");
+}
+
+/// Emit a snippet's call site in `main`: declare a `main`-scope local for each
+/// `out` port, then call `snippet_<id>(<operand temps…>, <out locals…>)`. The
+/// caller then aliases each output-port SSA temp to its `main` local.
+fn emit_snippet_call(out: &mut String, node_id: &str, outputs: &[PortDecl], operands: &[TempId]) {
+    for decl in outputs {
+        let _ = writeln!(
+            out,
+            "    {} {};",
+            glsl_type(decl.ty),
+            snippet_out_local(node_id, &decl.name),
+        );
     }
+    let in_args = operands.iter().map(ToString::to_string);
+    let out_args = outputs.iter().map(|p| snippet_out_local(node_id, &p.name));
+    let args = in_args.chain(out_args).collect::<Vec<_>>().join(", ");
+    let _ = writeln!(out, "    {}({});", snippet_fn_name(node_id), args);
 }
 
 /// The right-hand-side GLSL expression for one SSA statement (the left-hand side

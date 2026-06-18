@@ -23,17 +23,18 @@ layout(location = 0) in vec2 vTexCoord;
 layout(location = 0) out vec4 FragColor;
 layout(set = 0, binding = 2) uniform sampler2D Source;
 
+void snippet_snippet(in vec4 in_color, in float gain, out vec4 out_color)
+{
+    out_color = clamp(in_color * gain, 0.0, 1.0);
+}
+
 void main()
 {
     float t0 = 1.25;
     vec2 t1 = vec2(0.5, 0.5);
     vec4 t2 = texture(Source, t1);
-#define in_color t2
-#define gain t0
-    vec4 out_color;
-    out_color = clamp(in_color * gain, 0.0, 1.0);
-#undef in_color
-#undef gain
-    vec4 t3 = out_color;
+    vec4 snippet_snippet_out_color;
+    snippet_snippet(t2, t0, snippet_snippet_out_color);
+    vec4 t3 = snippet_snippet_out_color;
     FragColor = t3;
 }
