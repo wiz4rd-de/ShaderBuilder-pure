@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock the scan command — return a fixed parameter + reference set so the summary
 // is deterministic regardless of body text.
-const invoke = vi.fn((cmd: string): Promise<unknown> => {
+const invoke = vi.fn((cmd: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (cmd === "scan_pass_source") {
     return Promise.resolve({
       parameters: [
@@ -75,5 +75,41 @@ describe("WholePassEditor (#52)", () => {
     render(<WholePassEditor />);
     fireEvent.click(screen.getByText("Convert to node graph"));
     expect(store().project.passes[0]!.source.kind).toBe("graph");
+  });
+
+  it("an IMPORTED whole-pass pass (with a filename) renders + is editable (#52)", () => {
+    // Mirror what the Phase-3 import path produces: a PassSource.WholePassCode
+    // carrying the original .slang filename, loaded into the store.
+    const imported = {
+      ...store().project,
+      passes: [
+        {
+          id: "imp",
+          name: "crt-pass1",
+          source: {
+            kind: "wholePassCode" as const,
+            source: "#version 450\n// imported crt pass\nvoid main() {}\n",
+            filename: "crt-pass1.slang",
+            opaque: true,
+          },
+          parameters: [],
+          settings: store().project.passes[0]!.settings,
+          references: [],
+        },
+      ],
+    };
+    store().loadProject(imported);
+    store().openPass("imp");
+    render(<WholePassEditor />);
+    // The imported filename is shown and its verbatim source is editable.
+    expect(screen.getByText("crt-pass1.slang")).toBeTruthy();
+    const code = screen.getByLabelText("Pass source") as HTMLTextAreaElement;
+    expect(code.value).toContain("imported crt pass");
+    fireEvent.change(code, { target: { value: code.value + "// edited" } });
+    fireEvent.blur(code);
+    const pass = store().project.passes[0]!;
+    if (pass.source.kind === "wholePassCode") {
+      expect(pass.source.source).toContain("// edited");
+    }
   });
 });
