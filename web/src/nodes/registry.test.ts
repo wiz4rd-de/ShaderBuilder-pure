@@ -86,6 +86,29 @@ describe("node-descriptor registry", () => {
     }
   });
 
+  it("every customSnippet descriptor's PortSpec names equal its lowered PortDecl names", () => {
+    // The checker matches CustomSnippet edges STRICTLY by declared PortDecl name,
+    // and the React-Flow handle id = the canvas PortSpec name (graphToIr copies
+    // edge.sourcePort/targetPort verbatim). So a descriptor whose canvas PortSpec
+    // names differ from the names its `toNodeOp` snippet emits makes EVERY edge
+    // through that node an unknownPort/danglingInput. Guard the whole registry.
+    for (const d of listDescriptors()) {
+      const data = d.defaultData();
+      let op: NodeOp;
+      try {
+        op = d.toNodeOp(data);
+      } catch {
+        // `param`/`lut` intentionally throw on empty default data — skip them.
+        continue;
+      }
+      if (op.kind !== "customSnippet") continue;
+      const inputNames = d.inputs(data).map((p) => p.name);
+      const outputNames = d.outputs(data).map((p) => p.name);
+      expect(op.inputs.map((p) => p.name), `${d.kind} inputs`).toEqual(inputNames);
+      expect(op.outputs.map((p) => p.name), `${d.kind} outputs`).toEqual(outputNames);
+    }
+  });
+
   it("only non-empty categories are listed, in canonical order", () => {
     const cats = nonEmptyCategories();
     expect(cats).toContain("input");

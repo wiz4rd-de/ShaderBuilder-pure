@@ -15,10 +15,17 @@
 import { readNumber } from "../data";
 import type { NodeData, NodeDescriptor, PortSpec } from "../types";
 
+// A CustomSnippet needs DISTINCT input vs output port names (they are separate
+// GLSL params), and the checker matches snippet edges STRICTLY by PortDecl name
+// while the canvas handle id = the PortSpec name. So the transform descriptors'
+// canvas PortSpec names MUST equal the PortDecl names their `toNodeOp` emits
+// (`in_uv` / `out_uv`), or every edge through them is unknownPort/danglingInput.
 /** A vec2 UV input port (the upstream coordinate a transform consumes). */
-const UV_IN: PortSpec[] = [{ name: "uv", type: "vec2", label: "UV" }];
-/** A vec2 UV output port (what every coordinate node yields). */
-const UV_OUT: PortSpec[] = [{ name: "uv", type: "vec2", label: "UV" }];
+const UV_IN: PortSpec[] = [{ name: "in_uv", type: "vec2", label: "UV" }];
+/** A vec2 UV output port (what a UV transform yields). */
+const UV_OUT: PortSpec[] = [{ name: "out_uv", type: "vec2", label: "UV" }];
+/** The Texcoord source's single vec2 output (its snippet assigns `uv`). */
+const TEXCOORD_OUT: PortSpec[] = [{ name: "uv", type: "vec2", label: "UV" }];
 
 /** Format a number as a GLSL float literal (always with a decimal point). */
 function glslFloat(n: number): string {
@@ -32,7 +39,7 @@ export const texcoordDescriptor: NodeDescriptor = {
   label: "Texcoord",
   description: "The standard fragment UV (vTexCoord).",
   inputs: () => [],
-  outputs: () => UV_OUT,
+  outputs: () => TEXCOORD_OUT,
   defaultData: () => ({}),
   inspector: () => [],
   toNodeOp: () => ({
