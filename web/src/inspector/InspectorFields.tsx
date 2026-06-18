@@ -176,6 +176,19 @@ function SelectField({ field, data, editor }: FieldProps): React.JSX.Element {
 
 // ---- vecN -----------------------------------------------------------------
 
+/**
+ * Decide the next local text for a vec editor on a store-driven re-render. Keeps
+ * the current per-component text WHEN it already parses to the incoming stored
+ * values — so an in-progress decimal like "0." (which parses to 0, matching a
+ * stored 0) is NOT clobbered back to "0" while the user is still typing. An
+ * EXTERNAL change (undo/redo, a genuinely different value) parses differently,
+ * so it correctly resyncs the text. Exported for unit testing.
+ */
+export function reconcileVecText(prev: string[], current: number[]): string[] {
+  const matches = current.every((v, i) => parseNumber(prev[i] ?? "", false) === v);
+  return matches ? prev : current.map(String);
+}
+
 function VecField({ field, data, editor }: FieldProps): React.JSX.Element {
   const len = VEC_LEN[field.kind] ?? 0;
   const stored = Array.isArray(data[field.key]) ? (data[field.key] as unknown[]) : [];
@@ -184,7 +197,10 @@ function VecField({ field, data, editor }: FieldProps): React.JSX.Element {
     return typeof c === "number" && Number.isFinite(c) ? c : 0;
   });
   const [text, setText] = useState(current.map(String));
-  useEffect(() => setText(current.map(String)), [stored.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setText((prev) => reconcileVecText(prev, current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stored.join(",")]);
 
   return (
     <div className="inspector__vec">
