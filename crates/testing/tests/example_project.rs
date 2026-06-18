@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use core_model::{PassSource, Project};
+use source::Frame;
 
 /// `fixtures/example/crt-scanlines-curvature.slangp`.
 fn example_slangp() -> PathBuf {
@@ -106,6 +107,39 @@ fn example_project_exports_cleanly_and_reimports() {
         "export → re-import was lossy:\n{}",
         diff.report()
     );
+}
+
+/// A tiny non-trivial source frame (a red/green split with a vertical blue ramp)
+/// so the curvature warp + scanline modulation have content to act on.
+fn source_frame() -> Frame {
+    let (w, h) = (16u32, 16u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = if x < w / 2 { 220 } else { 30 };
+            let g = if x < w / 2 { 30 } else { 220 };
+            let b = (y * 255 / (h - 1)) as u8;
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    Frame::new(w, h, rgba)
+}
+
+#[test]
+fn example_previews_live_through_the_engine() {
+    // Drive the SAME `.slangp` the example project is built from through the real
+    // headless render path (the app's live-preview engine seam). A successful,
+    // non-blank render proves the example "previews live": both passes compile and
+    // run on the GPU. Runs on the GPU box in CI alongside the golden suite.
+    let src = source_frame();
+    let image = testing::render_preset_to_image(&example_slangp(), &src, (64, 64), 0)
+        .expect("example renders through the engine");
+    assert_eq!(image.dimensions(), (64, 64));
+
+    // The output must not be the all-black "waiting"/error frame: the curvature +
+    // scanline passes turn the coloured source into a visibly non-black image.
+    let any_lit = image.pixels().any(|p| p[0] > 5 || p[1] > 5 || p[2] > 5);
+    assert!(any_lit, "example preview rendered an all-black frame");
 }
 
 #[test]
