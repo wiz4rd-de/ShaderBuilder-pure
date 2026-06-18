@@ -147,3 +147,36 @@ export function formatRgba(sample: PixelSample, opts: ReadoutOptions): [string, 
 export function formatCoord(sample: PixelSample): string {
   return `(${sample.x}, ${sample.y})`;
 }
+
+/** A CSS position (px) within the canvas element's box. */
+export interface BoxPosition {
+  left: number;
+  top: number;
+}
+
+/**
+ * The inverse of [`domToCanvasPixel`] for crosshair placement (#61): the CSS
+ * position (relative to the canvas element's box top-left) of a CANVAS PIXEL's
+ * CENTER, accounting for the `object-fit: contain` scale + centering margin. Used
+ * to anchor the hover/pin crosshairs over the rendered image.
+ */
+export function canvasPixelToBoxPosition(
+  px: number,
+  py: number,
+  boxWidth: number,
+  boxHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
+): BoxPosition {
+  if (boxWidth <= 0 || boxHeight <= 0 || canvasWidth <= 0 || canvasHeight <= 0) {
+    return { left: 0, top: 0 };
+  }
+  const scale = Math.min(boxWidth / canvasWidth, boxHeight / canvasHeight);
+  const marginX = (boxWidth - canvasWidth * scale) / 2;
+  const marginY = (boxHeight - canvasHeight * scale) / 2;
+  // The pixel's CENTER (`+0.5`) in box CSS space.
+  return {
+    left: marginX + (px + 0.5) * scale,
+    top: marginY + (py + 0.5) * scale,
+  };
+}

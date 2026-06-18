@@ -2,10 +2,16 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { EngineStatus } from "../bindings/EngineStatus";
+import type { PixelSample } from "../bindings/PixelSample";
 import { useDocumentStore } from "../store/documentStore";
 import { CompareControls } from "./CompareControls";
 import { drawCompare } from "./compareCompositor";
 import { useCompareStore } from "./compareStore";
+import { InspectorControls } from "./InspectorControls";
+import { InspectorOverlay } from "./InspectorOverlay";
+import type { CanvasGeometry } from "./InspectorOverlay";
+import { useInspectorStore } from "./inspectorStore";
+import { domToCanvasPixel } from "./pixelInspect";
 import { SplitDivider } from "./SplitDivider";
 import { parseFrame, toArrayBuffer } from "./frame";
 
@@ -188,14 +194,147 @@ export function PreviewCanvas() {
     }
   }, [setReference]);
 
+  // ---- Pixel inspector (#61) ----
+  // The inspector reads a pixel ON DEMAND via the `inspect_pixel` command (a
+  // render-thread readback) on hover/click — NEVER per frame, so the 60 fps stream
+  // is untouched. We measure the canvas's displayed box so crosshairs land on the
+  // right CSS spot over the object-fit:contain image.
+  const inspectorEnabled = useInspectorStore((s) => s.enabled);
+  const setHover = useInspectorStore((s) => s.setHover);
+  const pin = useInspectorStore((s) => s.pin);
+  const [canvasGeometry, setCanvasGeometry] = useState<CanvasGeometry | null>(null);
+
+  // Track the canvas's displayed box so the overlay can place crosshairs. Measured
+  // on mount + resize (ResizeObserver) since the pane flexes with the window.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const measure = () => {
+      const rect = canvas.getBoundingClientRect();
+      setCanvasGeometry({
+        boxWidth: rect.width,
+        boxHeight: rect.height,
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+      });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  // The last pane pixel a probe was issued for, to debounce: a fresh `inspect_pixel`
+  // is only fired when the cursor moves to a different pane pixel (a per-move probe
+  // would spam the render thread). A pending flag drops overlapping requests.
+  const lastProbedRef = useRef<string | null>(null);
+  const probeInFlightRef = useRef(false);
+
+  /** Map a pointer/mouse event to the canvas pixel under it (object-fit:contain
+   * aware). Accepts the common `clientX/clientY` shape so both pointer and click
+   * events can call it. */
+  const eventToCanvasPixel = useCallback(
+    (e: { clientX: number; clientY: number }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        return null;
+      }
+      const rect = canvas.getBoundingClientRect();
+      return domToCanvasPixel(
+        e.clientX - rect.left,
+        e.clientY - rect.top,
+        rect.width,
+        rect.height,
+        canvas.width,
+        canvas.height,
+      );
+    },
+    [],
+  );
+
+  /** Probe one pane pixel via the render-thread readback, updating the hover. */
+  const probePixel = useCallback(
+    async (px: number, py: number): Promise<PixelSample | null> => {
+      if (probeInFlightRef.current) {
+        return null;
+      }
+      probeInFlightRef.current = true;
+      try {
+        const sample = await invoke<PixelSample>("inspect_pixel", { x: px, y: py });
+        return sample;
+      } catch {
+        return null; // a stalled/torn-down render thread: drop this probe
+      } finally {
+        probeInFlightRef.current = false;
+      }
+    },
+    [],
+  );
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!inspectorEnabled) {
+        return;
+      }
+      const pane = eventToCanvasPixel(e);
+      if (!pane) {
+        // In the contain margin (off the rendered image): clear the hover.
+        setHover(null);
+        lastProbedRef.current = null;
+        return;
+      }
+      const key = `${pane.x},${pane.y}`;
+      if (key === lastProbedRef.current) {
+        return; // same pane pixel — debounce
+      }
+      lastProbedRef.current = key;
+      void probePixel(pane.x, pane.y).then((sample) => {
+        if (sample) {
+          setHover({ pane, sample });
+        }
+      });
+    },
+    [inspectorEnabled, eventToCanvasPixel, probePixel, setHover],
+  );
+
+  const handlePointerLeave = useCallback(() => {
+    setHover(null);
+    lastProbedRef.current = null;
+  }, [setHover]);
+
+  // Click-to-pin: probe the clicked pixel and pin the result (persists while
+  // panning the graph; cleared via the inspector controls).
+  const handleClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!inspectorEnabled) {
+        return;
+      }
+      const pane = eventToCanvasPixel(e);
+      if (!pane) {
+        return;
+      }
+      void probePixel(pane.x, pane.y).then((sample) => {
+        if (sample && sample.inside) {
+          pin(pane, sample);
+        }
+      });
+    },
+    [inspectorEnabled, eventToCanvasPixel, probePixel, pin],
+  );
+
   return (
     <div className="preview__canvas-wrap">
       <div className="preview__viewport" ref={paneRef}>
         <canvas
           ref={canvasRef}
-          className="preview__canvas"
+          className={`preview__canvas${inspectorEnabled ? " preview__canvas--inspecting" : ""}`}
           width={PREVIEW_WIDTH}
           height={PREVIEW_HEIGHT}
+          onPointerMove={handlePointerMove}
+          onPointerLeave={handlePointerLeave}
+          onClick={handleClick}
         />
         {mode === "split" && reference ? (
           <SplitDivider
@@ -204,11 +343,13 @@ export function PreviewCanvas() {
             pos={splitPos}
           />
         ) : null}
+        <InspectorOverlay geometry={canvasGeometry} />
       </div>
       <CompareControls
         hasLiveFrame={hasLiveFrame}
         onSetReference={handleSetReference}
       />
+      <InspectorControls />
       <div className="preview__stats">
         <button type="button" onClick={() => setStreaming((s) => !s)}>
           {streaming ? "Stop" : "Start"}

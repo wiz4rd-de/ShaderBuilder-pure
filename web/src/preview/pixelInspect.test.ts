@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { PixelSample } from "../bindings/PixelSample";
 import {
+  canvasPixelToBoxPosition,
   domToCanvasPixel,
   formatChannel,
   formatCoord,
@@ -42,6 +43,30 @@ describe("domToCanvasPixel", () => {
   it("returns null for a degenerate box or canvas", () => {
     expect(domToCanvasPixel(0, 0, 0, 80, 100, 80)).toBeNull();
     expect(domToCanvasPixel(0, 0, 100, 80, 0, 80)).toBeNull();
+  });
+});
+
+describe("canvasPixelToBoxPosition (crosshair placement)", () => {
+  it("places a pixel center at the right box position with a contain margin", () => {
+    // Canvas 100x100 in a 200x100 box: scale 1, 50px left/right margin. Pixel (0,0)
+    // center is at box-left margin + 0.5 = 50.5, top 0.5.
+    const p = canvasPixelToBoxPosition(0, 0, 200, 100, 100, 100);
+    expect(p.left).toBeCloseTo(50.5, 5);
+    expect(p.top).toBeCloseTo(0.5, 5);
+  });
+
+  it("round-trips with domToCanvasPixel (a pixel center maps back to itself)", () => {
+    const box = [200, 100] as const;
+    const canvas = [100, 100] as const;
+    for (const [px, py] of [
+      [0, 0],
+      [50, 50],
+      [99, 99],
+    ] as const) {
+      const pos = canvasPixelToBoxPosition(px, py, box[0], box[1], canvas[0], canvas[1]);
+      const back = domToCanvasPixel(pos.left, pos.top, box[0], box[1], canvas[0], canvas[1]);
+      expect(back).toEqual({ x: px, y: py });
+    }
   });
 });
 
