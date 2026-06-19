@@ -270,3 +270,51 @@ describe("documentStore — ≥20 mixed operations, exact-state undo/redo", () =
     expect(store().canRedo()).toBe(false);
   });
 });
+
+describe("documentStore — engine problems vs compile (#14)", () => {
+  const cleanCompile = {
+    diagnosticsByNode: {},
+    problems: [],
+    valid: true,
+    sourcesByPassId: {},
+  };
+
+  it("preserves a device-level engine problem across a successful compile", () => {
+    // A pipeline-wide device failure: no passId, code deviceLost.
+    store().pushEngineProblem({
+      severity: "error",
+      code: "deviceLost",
+      message: "the GPU device was lost",
+      passId: null,
+      nodeId: null,
+    });
+    store().setEngineStatus("stopped");
+    expect(store().engineProblems).toHaveLength(1);
+
+    // A subsequent successful compile (an unrelated edit) must NOT clear the
+    // device problem while the engine is still stopped — dispatchPreview only
+    // re-emits slangCompile, so it could never re-derive this.
+    store().setCompileStatus(cleanCompile);
+
+    expect(store().engineProblems).toHaveLength(1);
+    expect(store().engineProblems[0]!.diagnostic.code).toBe("deviceLost");
+    expect(store().engineStatus).toBe("stopped");
+  });
+
+  it("clears a pass-level slangCompile engine problem on the next compile", () => {
+    // A pass-tagged compile failure: dispatchPreview re-establishes it, so the
+    // stale one must be cleared by the fresh compile.
+    store().pushEngineProblem({
+      severity: "error",
+      code: "slangCompile",
+      message: "syntax error",
+      passId: "pass-1",
+      nodeId: null,
+    });
+    expect(store().engineProblems).toHaveLength(1);
+
+    store().setCompileStatus(cleanCompile);
+
+    expect(store().engineProblems).toHaveLength(0);
+  });
+});

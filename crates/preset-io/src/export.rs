@@ -123,10 +123,78 @@ pub fn export_preset(
     extras: &BTreeMap<String, String>,
 ) -> Result<ExportReport, ExportError> {
     let dest_dir = dest_dir.as_ref();
-    std::fs::create_dir_all(dest_dir)?;
+
+    // F4 (atomicity): build the whole bundle in a sibling staging dir, then rename
+    // it into place only after every file is written. An ENOSPC/permission failure
+    // mid-write leaves the staging dir (which we remove) rather than orphan `.slang`
+    // files with no manifest at the destination. Mirrors the tmp+rename convention
+    // in session.rs / library.rs.
+    //
+    // The staging dir is a sibling of `dest_dir` (so the final rename is same-
+    // filesystem and therefore atomic). On any failure we best-effort remove it so
+    // no partial bundle is left behind.
+    let staging = staging_dir_for(dest_dir);
+    // A leftover from a previous interrupted export must not poison this one.
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let result = write_bundle(project, &staging, extras);
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => {
+            // Clean up the partial staging bundle; the real destination is untouched.
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    // Atomically swap the finished bundle into place. `rename` cannot replace a
+    // non-empty existing directory, so clear an existing destination first.
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir)?;
+    }
+    if let Some(parent) = dest_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Err(e) = std::fs::rename(&staging, dest_dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(ExportError::Io(e));
+    }
+
+    // The report carried staging-relative paths only via `preset_path`; restamp it
+    // to the real destination (the relative pass/texture file names are unchanged).
+    Ok(ExportReport {
+        preset_path: dest_dir.join(PRESET_FILENAME),
+        ..report
+    })
+}
+
+/// The sibling staging directory `export_preset` builds the bundle in before the
+/// atomic rename into `dest_dir`. A `<name>.tmp-bundle` sibling so the rename is
+/// same-filesystem (and thus atomic) and never escapes the destination's parent.
+fn staging_dir_for(dest_dir: &Path) -> PathBuf {
+    let mut name = dest_dir
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp-bundle");
+    match dest_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Write the full bundle (pass `.slang` files, LUT textures, `preset.slangp`) into
+/// `dir`. Factored out of [`export_preset`] so the caller can stage into a temp dir
+/// and atomically rename on success / clean up on failure (F4).
+fn write_bundle(
+    project: &Project,
+    dir: &Path,
+    extras: &BTreeMap<String, String>,
+) -> Result<ExportReport, ExportError> {
+    std::fs::create_dir_all(dir)?;
 
     let mut report = ExportReport {
-        preset_path: dest_dir.join(PRESET_FILENAME),
+        preset_path: dir.join(PRESET_FILENAME),
         ..Default::default()
     };
 
@@ -139,7 +207,7 @@ pub fn export_preset(
         };
         // Byte-for-byte: write the stored bytes with no normalization so an
         // unmodified imported pass is byte-identical to its original.
-        std::fs::write(dest_dir.join(file), source.as_bytes())?;
+        std::fs::write(dir.join(file), source.as_bytes())?;
         // B5 (minimal mitigation): this pass body may `#include` other files that
         // are NOT copied into the bundle. The full fix — capturing and reproducing
         // the transitive include closure with its relative layout — is a tracked
@@ -158,11 +226,11 @@ pub fn export_preset(
     // 2. LUT PNGs into `textures/`, with collision-free names.
     let texture_files = texture_file_names(&project.luts);
     if !project.luts.is_empty() {
-        std::fs::create_dir_all(dest_dir.join(TEXTURES_DIR))?;
+        std::fs::create_dir_all(dir.join(TEXTURES_DIR))?;
     }
     for (lut, file) in project.luts.iter().zip(&texture_files) {
         let rel = format!("{TEXTURES_DIR}/{file}");
-        let dst = dest_dir.join(&rel);
+        let dst = dir.join(&rel);
         // Copy the source image in if it exists; otherwise still emit the
         // relative reference and note that the bundle is missing the bytes.
         match std::fs::copy(&lut.path, &dst) {
@@ -840,6 +908,89 @@ mod tests {
             "no include -> no include warning: {:?}",
             report.warnings
         );
+    }
+
+    #[test]
+    fn successful_export_leaves_no_staging_sibling() {
+        // F4: a successful export builds the bundle in a `<name>.tmp-bundle` sibling
+        // and renames it into place, so no staging dir survives.
+        let dir = tempfile::tempdir().unwrap();
+        let project = sample_project();
+        let out = dir.path().join("bundle");
+        export_preset(&project, &out, &BTreeMap::new()).expect("exports");
+
+        assert!(out.join(PRESET_FILENAME).is_file(), "bundle landed");
+        let staging = dir.path().join("bundle.tmp-bundle");
+        assert!(
+            !staging.exists(),
+            "staging dir must be renamed away, not left behind"
+        );
+    }
+
+    #[test]
+    fn failed_export_leaves_no_partial_bundle_and_preserves_existing() {
+        // F4: when a mid-write fails (here: the staging dir itself can't be created
+        // because the destination's parent is a regular file), the export returns an
+        // Io error, leaves NO partial bundle at the destination, and an existing
+        // destination bundle is preserved untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let project = sample_project();
+
+        // First, a real successful export so a destination bundle exists.
+        let out = dir.path().join("bundle");
+        export_preset(&project, &out, &BTreeMap::new()).expect("first export");
+        let manifest_before = std::fs::read(out.join(PRESET_FILENAME)).unwrap();
+        let entries_before: BTreeSet<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        // Now force a failure: a destination whose parent is a regular file, so the
+        // sibling-staging `create_dir_all` fails before any byte is written.
+        let blocker = dir.path().join("not_a_dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad_dest = blocker.join("bundle");
+        let err = export_preset(&project, &bad_dest, &BTreeMap::new()).unwrap_err();
+        assert!(matches!(err, ExportError::Io(_)), "io error: {err:?}");
+        assert!(
+            !bad_dest.exists(),
+            "no partial bundle at the failed destination"
+        );
+        // No staging sibling left behind.
+        assert!(!blocker.join("bundle.tmp-bundle").exists());
+
+        // The previously-exported good bundle is byte-for-byte untouched.
+        assert_eq!(
+            std::fs::read(out.join(PRESET_FILENAME)).unwrap(),
+            manifest_before
+        );
+        let entries_after: BTreeSet<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries_before, entries_after, "existing bundle preserved");
+    }
+
+    #[test]
+    fn re_export_over_existing_bundle_drops_stale_files() {
+        // F4 corollary: the atomic swap replaces the destination wholesale, so a
+        // file that existed in a prior bundle but not the new one is gone (the
+        // remove-then-rename does not merge stale files into the new bundle).
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("bundle");
+
+        let project = sample_project();
+        export_preset(&project, &out, &BTreeMap::new()).expect("first export");
+        // Drop a stray file into the existing bundle.
+        std::fs::write(out.join("STRAY.txt"), b"stale").unwrap();
+        assert!(out.join("STRAY.txt").exists());
+
+        export_preset(&project, &out, &BTreeMap::new()).expect("second export");
+        assert!(
+            !out.join("STRAY.txt").exists(),
+            "stale file must not survive a re-export"
+        );
+        assert!(out.join(PRESET_FILENAME).is_file());
     }
 
     #[test]

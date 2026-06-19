@@ -6,6 +6,9 @@
 
 .app__titlebar {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 14px;
   font-weight: 600;
   background: var(--panel);
@@ -20,10 +23,165 @@
 }
 
 .app__project {
-  float: right;
+  margin-left: auto;
   font-weight: 400;
   font-size: 12px;
   color: var(--muted);
+}
+
+.app__path {
+  color: var(--muted);
+}
+
+/* --- File menu (#63) --- */
+.filemenu {
+  position: relative;
+  font-weight: 400;
+}
+
+.filemenu__trigger {
+  font: inherit;
+  font-size: 13px;
+  padding: 2px 10px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.filemenu__trigger:hover,
+.filemenu__trigger[aria-expanded="true"] {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.filemenu__dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  min-width: 220px;
+  margin-top: 4px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 35%);
+  display: flex;
+  flex-direction: column;
+}
+
+.filemenu__dropdown > button,
+.filemenu__recent {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.filemenu__dropdown > button:hover,
+.filemenu__recent:hover {
+  background: var(--bg);
+}
+
+.filemenu__shortcut {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.filemenu__sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
+.filemenu__submenu {
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin: 2px 0;
+}
+
+.filemenu__submenu-label,
+.filemenu__empty {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 10px;
+}
+
+.filemenu__recent {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.filemenu__recent-name {
+  font-size: 13px;
+}
+
+.filemenu__recent-path {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* --- Confirm / recovery modal (#63) --- */
+.confirm__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 45%);
+}
+
+.confirm__dialog {
+  min-width: 320px;
+  max-width: 480px;
+  padding: 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
+}
+
+.confirm__message {
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+
+.confirm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm__btn {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 14px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.confirm__btn--primary {
+  background: var(--accent, #3b82f6);
+  border-color: var(--accent, #3b82f6);
+  color: #fff;
 }
 
 .app__body {
@@ -350,6 +508,25 @@
   opacity: 0.8;
 }
 
+/* ---- Drag-time connection affordances (#65) ---------------------------------
+ * While a wire is being dragged, React Flow tags candidate handles: the source
+ * handle gets `.connectingfrom`, a hovered target gets `.connectingto`, and a
+ * type-COMPATIBLE target (per our `isValidConnection`) additionally gets
+ * `.valid`. We highlight compatible handles and dim incompatible ones so the
+ * legal drop targets are obvious before release. */
+.react-flow__handle.connectionindicator.valid {
+  box-shadow: 0 0 0 3px rgba(127, 201, 127, 0.45);
+  transform: scale(1.25);
+}
+.react-flow__handle.connectingto:not(.valid) {
+  opacity: 0.3;
+  box-shadow: 0 0 0 2px rgba(230, 90, 90, 0.5);
+}
+/* The handle the drag started from reads as active. */
+.react-flow__handle.connectingfrom {
+  transform: scale(1.25);
+}
+
 /* ---- Pipeline view + breadcrumb (#46) ---- */
 .pipeline-breadcrumb {
   flex: 0 0 auto;
@@ -477,6 +654,29 @@
 .react-flow__edge.pipeline-edge--passFeedback .react-flow__edge-path {
   stroke: #e65a8b;
   stroke-dasharray: 5 4;
+}
+
+/* ---- Pass-graph edge legality (#65) -----------------------------------------
+ * An edge rendered ILLEGAL by a later node-type/data change is flagged inline as
+ * a red, dashed wire (the authoritative compile diagnostic still highlights the
+ * sink node). A still-legal but implicitly-COERCED edge (int→float widen,
+ * float→vecN broadcast) is tinted so the conversion is visible. */
+.react-flow__edge.editor-edge--invalid .react-flow__edge-path {
+  stroke: #e65a5a;
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+}
+.react-flow__edge.editor-edge--widen .react-flow__edge-path,
+.react-flow__edge.editor-edge--broadcast .react-flow__edge-path {
+  stroke: #d6c65a;
+  stroke-dasharray: 2 3;
+}
+.react-flow__edge.editor-edge--invalid .react-flow__edge-text {
+  fill: #e65a5a;
+}
+.react-flow__edge.editor-edge--widen .react-flow__edge-text,
+.react-flow__edge.editor-edge--broadcast .react-flow__edge-text {
+  fill: #b8a93a;
 }
 
 .editor__statusbar {
@@ -1037,6 +1237,15 @@
   min-height: 0;
 }
 
+/* The canvas + split-divider overlay share one positioning context (#60) so the
+   divider can be absolutely placed over the rendered frame. */
+.preview__viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
 .preview__canvas {
   flex: 1 1 auto;
   min-height: 0;
@@ -1047,6 +1256,211 @@
   background: #000;
   /* Retro content is low-res by nature — keep pixels crisp when upscaled. */
   image-rendering: pixelated;
+}
+
+/* ---- A/B compare + split-view (#60) ---- */
+.preview__compare {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.preview__compare button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.preview__compare button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.preview__compare button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.preview__compare-modes {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.preview__compare-modes button {
+  border: none;
+  border-radius: 0;
+  border-right: 1px solid var(--border);
+}
+.preview__compare-modes button:last-child {
+  border-right: none;
+}
+.preview__compare-mode--active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.preview__compare-shown {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The split divider line + grab handle laid over the rendered frame. */
+.preview__divider {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+.preview__divider--vertical {
+  cursor: ew-resize;
+  /* A zero-width line; the visible bar is a centered pseudo via the handle. */
+  border-left: 2px solid var(--accent);
+  transform: translateX(-1px);
+}
+.preview__divider--horizontal {
+  cursor: ns-resize;
+  border-top: 2px solid var(--accent);
+  transform: translateY(-1px);
+}
+
+.preview__divider-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+/* ---- Pixel inspector (#61) ---- */
+.preview__canvas--inspecting {
+  cursor: crosshair;
+}
+
+.preview__inspect-controls {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.preview__inspect-controls button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.preview__inspect-controls button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.preview__inspect-controls button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.preview__inspect-toggle--active,
+.preview__inspect-unit--active {
+  border-color: var(--accent) !important;
+  background: var(--accent) !important;
+  color: var(--bg) !important;
+}
+.preview__inspect-units {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.preview__inspect-units button {
+  border: none;
+  border-radius: 0;
+}
+
+/* The overlay layer: covers the rendered frame, click-through except readouts. */
+.preview__inspect-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+/* A crosshair anchored on a pane pixel (positioned by left/top from JS). */
+.preview__inspect-mark {
+  position: absolute;
+  transform: translate(-50%, -50%);
+}
+.preview__inspect-crosshair {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7);
+}
+.preview__inspect-mark--pinned .preview__inspect-crosshair {
+  border-color: #ffce54;
+}
+
+/* The readout box: viewport coordinate + RGBA, anchored beside the crosshair. */
+.preview__inspect-readout {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.preview__inspect-mark--pinned .preview__inspect-readout {
+  pointer-events: auto;
+  border-color: #ffce54;
+}
+.preview__inspect-readout-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.preview__inspect-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+.preview__inspect-coord {
+  color: var(--muted);
+}
+.preview__inspect-unpin {
+  font: inherit;
+  line-height: 1;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.preview__inspect-unpin:hover {
+  color: #ffce54;
 }
 
 .preview__stats {
@@ -1399,4 +1813,489 @@
 .library__item-actions {
   display: flex;
   gap: 6px;
+}
+
+/* ---- Error UX (#62): toasts, engine status badge, error boundary ---- */
+
+/* Engine status badge on the preview stats row. */
+.preview__status {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+}
+.preview__status--live {
+  color: #7ee0a0;
+  border-color: #2f6b46;
+}
+.preview__status--lastGood {
+  color: #e6c25a;
+  border-color: #6b5a2f;
+}
+.preview__status--stopped {
+  color: #e6705a;
+  border-color: #6b352f;
+}
+
+/* Engine-origin tag on a problems row. */
+.problems__origin {
+  color: #e6c25a;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.problems__jump:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+
+/* Non-blocking toast stack, bottom-right. */
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 380px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.toast--error {
+  border-left: 3px solid #e6705a;
+}
+.toast--warning {
+  border-left: 3px solid #e6c25a;
+}
+.toast--info {
+  border-left: 3px solid var(--accent);
+}
+.toast__message {
+  flex: 1 1 auto;
+  line-height: 1.35;
+}
+.toast__dismiss {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.toast__dismiss:hover {
+  color: var(--text);
+}
+
+/* Recoverable error-boundary fallback. */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+}
+.error-boundary__card {
+  max-width: 460px;
+  text-align: center;
+  padding: 24px;
+  border: 1px solid #6b352f;
+  border-radius: 8px;
+  background: var(--panel);
+}
+.error-boundary__title {
+  margin: 0 0 8px;
+  font-size: 16px;
+  color: #e6705a;
+}
+.error-boundary__message {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+  word-break: break-word;
+}
+.error-boundary__retry {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 16px;
+  cursor: pointer;
+}
+.error-boundary__retry:hover {
+  border-color: var(--accent);
+}
+
+/* Export-bundle dialog (#64). */
+.export-dialog {
+  min-width: 420px;
+  max-width: 560px;
+}
+.export-dialog__title {
+  margin: 0 0 16px;
+  font-size: 16px;
+}
+.export-dialog__field {
+  display: block;
+  margin-bottom: 14px;
+}
+.export-dialog__label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--muted, #9aa);
+}
+.export-dialog__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.export-dialog__dest {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.export-dialog__input {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+.export-dialog__summary {
+  display: flex;
+  gap: 24px;
+  margin: 4px 0 14px;
+}
+.export-dialog__summary div {
+  display: flex;
+  flex-direction: column;
+}
+.export-dialog__summary dt {
+  font-size: 11px;
+  color: var(--muted, #9aa);
+}
+.export-dialog__summary dd {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+.export-dialog__blockers {
+  margin-bottom: 14px;
+  padding: 10px;
+  background: rgb(220 60 60 / 10%);
+  border: 1px solid rgb(220 60 60 / 40%);
+  border-radius: 4px;
+}
+.export-dialog__blockers-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.export-dialog__blockers ul {
+  margin: 0;
+  padding-left: 18px;
+}
+.export-dialog__blocker {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.export-dialog__jump {
+  margin-left: 8px;
+  font: inherit;
+  font-size: 12px;
+  padding: 1px 8px;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.export-dialog__success {
+  margin: 0 0 12px;
+  font-size: 14px;
+  word-break: break-all;
+}
+.export-dialog__warnings {
+  margin: 0 0 12px;
+  padding-left: 18px;
+}
+.export-dialog__warning {
+  font-size: 12px;
+  color: var(--warn, #d89b2b);
+}
+.export-dialog__error {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--error, #e06666);
+}
+
+/* --- Help button + dialog (#66) --- */
+.helpbutton {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  padding: 2px 10px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.helpbutton:hover {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.helpdialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+.helpdialog {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 22px 22px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+}
+.helpdialog__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.helpdialog__title {
+  margin: 0;
+  font-size: 18px;
+}
+.helpdialog__close {
+  font-size: 20px;
+  line-height: 1;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.helpdialog__close:hover {
+  color: var(--text);
+}
+.helpdialog__section {
+  margin-top: 14px;
+}
+.helpdialog__heading {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+.helpdialog__text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.helpdialog__text code,
+.helpdialog__note code {
+  color: var(--text);
+}
+.helpdialog__shortcut-group {
+  margin-top: 10px;
+}
+.helpdialog__shortcut-group-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.helpdialog__shortcuts {
+  width: 100%;
+  border-collapse: collapse;
+}
+.helpdialog__shortcut-label {
+  text-align: left;
+  font-weight: 400;
+  font-size: 13px;
+  padding: 3px 0;
+  width: 55%;
+}
+.helpdialog__shortcut-keys {
+  text-align: right;
+  font-size: 13px;
+}
+.helpdialog__or {
+  color: var(--muted);
+  font-size: 12px;
+}
+.helpdialog__kbd,
+.helpdialog kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  font: inherit;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.helpdialog__note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* --- First-run start screen (#66) --- */
+.startscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  overflow: auto;
+  padding: 24px;
+}
+.startscreen__panel {
+  width: min(680px, 94vw);
+}
+.startscreen__title {
+  margin: 0 0 4px;
+  font-size: 28px;
+}
+.startscreen__subtitle {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 8px;
+}
+.startscreen__lead {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.startscreen__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.startscreen__action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  color: inherit;
+}
+.startscreen__action:hover {
+  border-color: var(--accent);
+}
+.startscreen__action--primary {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.startscreen__action-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.startscreen__action-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+.startscreen__recents {
+  margin-top: 22px;
+}
+.startscreen__recents-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.startscreen__recents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.startscreen__recent {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  gap: 1px;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: inherit;
+}
+.startscreen__recent:hover {
+  background: var(--panel);
+}
+.startscreen__recent-name {
+  font-size: 13px;
+}
+.startscreen__recent-path {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.startscreen__footer {
+  margin-top: 24px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.startscreen__help-link {
+  font: inherit;
+  font-size: 13px;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+}
+.startscreen__help-link:hover {
+  text-decoration: underline;
 }

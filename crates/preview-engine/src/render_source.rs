@@ -133,6 +133,44 @@ pub enum RenderCommand {
     /// Replace the registered LUTs (#27): the preset's `textures` family, decoded
     /// by the app and bound by name as `<NAME>`. An empty list clears stale LUTs.
     SetLuts(Vec<crate::LutSpec>),
+    /// Inspect one preview pixel ON DEMAND (#61, Spec §8.5): map the given PANE
+    /// coordinate to a simulated-viewport pixel, read that pixel back from the
+    /// offscreen target, and reply on `respond` with the [`InspectResult`]. Routed
+    /// through the render thread because [`crate::Renderer::read_pixel_region`]
+    /// blocks on a `device.poll(wait)` — only the render thread may touch the
+    /// renderer. Sent on hover/click (debounced by the app), NEVER per frame.
+    InspectPixel {
+        /// The pane pixel X to inspect (clamped to the pane by the mapping).
+        x: u32,
+        /// The pane pixel Y to inspect.
+        y: u32,
+        /// One-shot reply channel: the render thread sends exactly one
+        /// [`InspectResult`] (the app blocks on the receiving end).
+        respond: std::sync::mpsc::Sender<InspectResult>,
+    },
+}
+
+/// The result of an [`RenderCommand::InspectPixel`] probe (#61), computed on the
+/// render thread and sent back over the command's reply channel. Engine-local (the
+/// engine has no `core-model` dependency, like [`EngineStatus`]); the app maps it
+/// to [`core_model::PixelSample`] at the IPC boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectResult {
+    /// Whether the pane coordinate mapped to a real content pixel (`true`) or a
+    /// letterbox bar (`false` — no sample).
+    pub inside: bool,
+    /// The simulated-viewport pixel X the pane coordinate maps to (`0` when outside).
+    pub x: u32,
+    /// The simulated-viewport pixel Y.
+    pub y: u32,
+    /// The simulated-viewport width the coordinate is reported against (the §9
+    /// content-rect width).
+    pub viewport_width: u32,
+    /// The simulated-viewport height.
+    pub viewport_height: u32,
+    /// The inspected pixel's RGBA bytes from the offscreen target (`[0; 4]` when
+    /// outside). `Rgba8Unorm` today, so these are the exact stored values.
+    pub rgba: [u8; 4],
 }
 
 /// The transport's render rate (the §10 *animation* clock): `render_into` is
@@ -157,6 +195,43 @@ pub struct PositionUpdate {
     pub index: usize,
     /// The number of frames in the pump (`>= 1`).
     pub len: usize,
+}
+
+/// The render engine's liveness state (#62), reported from the render thread so
+/// the preview pane can distinguish a fresh render from a held last-good frame
+/// from a stopped engine. The app maps this to `core_model::EngineStatus` at the
+/// IPC boundary (the engine deliberately has no dependency on `core-model`, like
+/// [`crate::ViewportConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStatus {
+    /// A fresh frame was rendered this tick — the preview is live.
+    Live,
+    /// The latest render could not produce a fresh frame; the pane holds the last
+    /// good output (or the neutral waiting frame before the first render).
+    LastGood,
+    /// The render thread has stopped — no further frames will arrive.
+    Stopped,
+}
+
+/// A structured engine event reported from the render thread (#62): either a
+/// liveness-status transition or a render error. Carried over an optional channel
+/// (like [`PositionUpdate`]) so the render thread never blocks and never touches
+/// the `AppHandle`; the app forwards it to the webview as the `engine-event` Tauri
+/// event, mapping it to the `core_model` wire types at the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineEvent {
+    /// A liveness-status transition (live / last-good / stopped).
+    Status(EngineStatus),
+    /// A render error: a short stable `code` + a human-readable `message`. Engine
+    /// errors are not pass-tagged here (the engine renders a chain it was given);
+    /// pass/node tagging for slang-compile failures is added by the app, which
+    /// owns the pass→source mapping.
+    Error {
+        /// A short, stable, machine-readable category tag (e.g. `"deviceLost"`).
+        code: String,
+        /// The human-readable explanation of the problem.
+        message: String,
+    },
 }
 
 /// A [`FrameSource`] that renders a source image through a compiled slang shader
@@ -189,6 +264,14 @@ pub struct RenderSource {
     position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
     /// The last position reported on `position_tx`, to suppress duplicate emits.
     last_reported_position: Option<usize>,
+    /// Optional sink for engine status/error events (#62). When set, each
+    /// `render_into` reports a live/last-good status *transition* (duplicates
+    /// suppressed) and render failures send an [`EngineEvent::Error`]. The app
+    /// forwards these as the `engine-event` Tauri event. `None` in headless tests.
+    event_tx: Option<std::sync::mpsc::Sender<EngineEvent>>,
+    /// The last status reported on `event_tx`, to suppress duplicate emits (so a
+    /// steadily-live or steadily-last-good stream sends one transition, not 60/s).
+    last_reported_status: Option<EngineStatus>,
 }
 
 impl RenderSource {
@@ -214,6 +297,20 @@ impl RenderSource {
         commands: Receiver<RenderCommand>,
         position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
     ) -> Result<Self, RendererError> {
+        Self::with_sinks(width, height, commands, position_tx, None)
+    }
+
+    /// Like [`RenderSource::with_position_sink`] but also wiring an engine
+    /// status/error sink (#62): live/last-good status transitions and render
+    /// failures are reported on `event_tx` for the app to forward as the
+    /// `engine-event` Tauri event. Either sink may be `None` (headless tests).
+    pub fn with_sinks(
+        width: u32,
+        height: u32,
+        commands: Receiver<RenderCommand>,
+        position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
+        event_tx: Option<std::sync::mpsc::Sender<EngineEvent>>,
+    ) -> Result<Self, RendererError> {
         Ok(Self {
             renderer: Renderer::new(width, height)?,
             commands,
@@ -224,19 +321,35 @@ impl RenderSource {
             fps: DEFAULT_PUMP_FPS,
             tick_accum: 0,
             pump_primed: false,
-            position_tx: None,
+            position_tx,
             last_reported_position: None,
-        }
-        .with_pos_sink(position_tx))
+            event_tx,
+            last_reported_status: None,
+        })
     }
 
-    /// Attach the position sink (small helper so the struct literal stays readable).
-    fn with_pos_sink(
-        mut self,
-        position_tx: Option<std::sync::mpsc::Sender<PositionUpdate>>,
-    ) -> Self {
-        self.position_tx = position_tx;
-        self
+    /// Report an engine status TRANSITION on the event sink (#62), suppressing
+    /// duplicates so a steady stream sends one event per change, not per frame. A
+    /// `None` sink (headless tests) is a no-op.
+    fn report_status(&mut self, status: EngineStatus) {
+        if self.last_reported_status == Some(status) {
+            return;
+        }
+        self.last_reported_status = Some(status);
+        if let Some(tx) = &self.event_tx {
+            // A closed receiver (app torn down) is harmless — drop the event.
+            let _ = tx.send(EngineEvent::Status(status));
+        }
+    }
+
+    /// Report a render error on the event sink (#62). A `None` sink is a no-op.
+    fn report_error(&self, code: &str, message: String) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(EngineEvent::Error {
+                code: code.to_string(),
+                message,
+            });
+        }
     }
 
     /// Drain and apply every queued command. Loads are applied in arrival order;
@@ -300,7 +413,51 @@ impl RenderSource {
                 RenderCommand::SetLuts(luts) => {
                     self.renderer.set_luts(luts);
                 }
+                RenderCommand::InspectPixel { x, y, respond } => {
+                    let result = self.inspect_pixel(x, y);
+                    // A dropped receiver (the app gave up waiting) is harmless.
+                    let _ = respond.send(result);
+                }
             }
+        }
+    }
+
+    /// Map a PANE coordinate to a simulated-viewport pixel and read it back ON
+    /// DEMAND (#61). Reuses [`crate::Renderer::pane_mapping`] (the §30 composite-rect
+    /// math) so the reported coordinate is in SIMULATED-VIEWPORT space — letterbox
+    /// bars map to "outside" (no sample). The readback BLOCKS, so this only runs
+    /// here on the render thread, in response to a single inspect command.
+    fn inspect_pixel(&self, x: u32, y: u32) -> InspectResult {
+        let mapping = self.renderer.pane_mapping();
+        let (vw, vh) = mapping.content_size;
+        let mapped = mapping.map_pane_pixel(x, y);
+        if !mapped.inside {
+            return InspectResult {
+                inside: false,
+                x: 0,
+                y: 0,
+                viewport_width: vw,
+                viewport_height: vh,
+                rgba: [0, 0, 0, 0],
+            };
+        }
+        // Read the SINGLE pane pixel under the cursor from the offscreen target. The
+        // value is the content as composited into the pane (pre-stream-downsample —
+        // the pane offscreen IS the read-back surface). A 1×1 region keeps the probe
+        // cheap. A readback failure degrades to a black sample rather than erroring.
+        let rgba = match self.renderer.read_pixel_region(x, y, 1, 1) {
+            Ok(frame) if frame.rgba.len() >= 4 => {
+                [frame.rgba[0], frame.rgba[1], frame.rgba[2], frame.rgba[3]]
+            }
+            _ => [0, 0, 0, 0],
+        };
+        InspectResult {
+            inside: true,
+            x: mapped.x,
+            y: mapped.y,
+            viewport_width: vw,
+            viewport_height: vh,
+            rgba,
         }
     }
 
@@ -442,17 +599,30 @@ impl FrameSource for RenderSource {
         buf.clear();
 
         // Render one frame and read it back; on any failure fall through to the
-        // waiting frame so the stream keeps a valid, pane-sized output.
-        if self.ready() && self.renderer.render().is_ok() {
-            if let Ok(frame) = self.renderer.read_back() {
-                let header = FrameHeader::rgba8(frame.width, frame.height, index);
-                buf.reserve(FRAME_HEADER_LEN + header.payload_len());
-                header.write_to(buf);
-                buf.extend_from_slice(&frame.rgba);
-                return;
+        // waiting frame so the stream keeps a valid, pane-sized output. A fresh
+        // frame reports `Live`; a not-ready or failed render holds the last-good
+        // frame and reports `LastGood` (NOT an error — the §F "waiting" frame is a
+        // valid rendering state, #62). A hard render/readback FAILURE (distinct
+        // from "not ready yet") additionally reports a structured error event.
+        if self.ready() {
+            match self.renderer.render() {
+                Ok(()) => match self.renderer.read_back() {
+                    Ok(frame) => {
+                        let header = FrameHeader::rgba8(frame.width, frame.height, index);
+                        buf.reserve(FRAME_HEADER_LEN + header.payload_len());
+                        header.write_to(buf);
+                        buf.extend_from_slice(&frame.rgba);
+                        self.report_status(EngineStatus::Live);
+                        return;
+                    }
+                    Err(err) => self.report_error("readback", err.to_string()),
+                },
+                Err(err) => self.report_error("renderFailed", err.to_string()),
             }
         }
 
+        // Not ready yet, or a render/readback failure: hold the last-good frame.
+        self.report_status(EngineStatus::LastGood);
         write_solid_frame(buf, width, height, index, WAITING_RGBA);
     }
 }
@@ -781,6 +951,168 @@ void main() { FragColor = vec4(params.X, 0.0, 0.0, 1.0); }
             after_seek.iter().any(|u| u.index == 2 && u.len == 3),
             "seek must report position 2 of len 3, got {after_seek:?}"
         );
+    }
+
+    #[test]
+    fn engine_status_reports_last_good_before_ready_then_live() {
+        // #62: before a shader+source are loaded the engine holds the waiting frame
+        // and reports `LastGood` (NOT an error — the waiting frame is a valid
+        // rendering state); once both are set it renders and reports `Live`. The
+        // status is a TRANSITION, deduped, so a steady stream emits one per change.
+        let (tx, rx) = mpsc::channel();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let mut src = RenderSource::with_sinks(8, 8, rx, None, Some(ev_tx)).expect("wgpu device");
+
+        let mut buf = Vec::new();
+        // No shader/source yet: two renders, but only ONE LastGood transition.
+        src.render_into(0, &mut buf);
+        src.render_into(1, &mut buf);
+
+        let shader = compile_slang(DEFAULT_SHADER, None).expect("compile");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(8, 8)))
+            .unwrap();
+        // Now ready: two renders, only ONE Live transition.
+        src.render_into(2, &mut buf);
+        src.render_into(3, &mut buf);
+
+        let events: Vec<EngineEvent> = ev_rx.try_iter().collect();
+        assert_eq!(
+            events,
+            vec![
+                EngineEvent::Status(EngineStatus::LastGood),
+                EngineEvent::Status(EngineStatus::Live),
+            ],
+            "expected exactly one LastGood then one Live transition, got {events:?}"
+        );
+    }
+
+    // ---- Pixel inspector (#61): on-demand readback + pane→viewport mapping. ----
+
+    /// A constant-color fragment shader (R/G/B from params) so the inspected pixel
+    /// has a KNOWN value regardless of source content.
+    const CONST_COLOR_SHADER: &str = "#version 450
+#pragma parameter R \"R\" 0.0 0.0 1.0 0.01
+#pragma parameter G \"G\" 0.0 0.0 1.0 0.01
+#pragma parameter B \"B\" 0.0 0.0 1.0 0.01
+layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; } global;
+layout(std140, set = 0, binding = 3) uniform Params { float R; float G; float B; } params;
+#pragma stage vertex
+layout(location = 0) in vec4 Position;
+layout(location = 1) in vec2 TexCoord;
+void main() { gl_Position = global.MVP * Position; }
+#pragma stage fragment
+layout(location = 0) out vec4 FragColor;
+layout(set = 0, binding = 1) uniform texture2D Source;
+layout(set = 0, binding = 2) uniform sampler Smp;
+void main() { FragColor = vec4(params.R, params.G, params.B, 1.0); }
+";
+
+    /// Drive an InspectPixel command through the channel exactly as the Tauri
+    /// command does, render a frame, then read the reply.
+    fn inspect(
+        src: &mut RenderSource,
+        tx: &mpsc::Sender<RenderCommand>,
+        x: u32,
+        y: u32,
+    ) -> InspectResult {
+        let (rtx, rrx) = mpsc::channel();
+        tx.send(RenderCommand::InspectPixel { x, y, respond: rtx })
+            .unwrap();
+        // The inspect command is drained at the start of the next render.
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+        rrx.recv().expect("inspect reply")
+    }
+
+    #[test]
+    fn inspect_pixel_reports_the_known_rendered_color() {
+        // No simulated viewport: the pane IS the content, so the inspected pixel is
+        // the rendered constant color and the coordinate maps 1:1.
+        let (tx, rx) = mpsc::channel();
+        let mut src = RenderSource::new(16, 16, rx).expect("wgpu device");
+        let shader = compile_slang(CONST_COLOR_SHADER, None).expect("compile const shader");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(8, 8)))
+            .unwrap();
+        // R=0.8 (~204), G=0.4 (~102), B=0.0.
+        tx.send(RenderCommand::SetParameter {
+            name: "R".into(),
+            value: 0.8,
+        })
+        .unwrap();
+        tx.send(RenderCommand::SetParameter {
+            name: "G".into(),
+            value: 0.4,
+        })
+        .unwrap();
+        // Render so the offscreen holds the color BEFORE inspecting (the inspector
+        // reads the currently-displayed offscreen, drained before its own render).
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+
+        let result = inspect(&mut src, &tx, 5, 7);
+        assert!(result.inside, "a pane pixel maps to content");
+        // Pane == viewport (no simulated viewport) so the coordinate is identity.
+        assert_eq!((result.x, result.y), (5, 7), "1:1 pane→viewport coordinate");
+        assert_eq!((result.viewport_width, result.viewport_height), (16, 16));
+        assert!(
+            (result.rgba[0] as i32 - 204).abs() <= 4,
+            "R~204, got {}",
+            result.rgba[0]
+        );
+        assert!(
+            (result.rgba[1] as i32 - 102).abs() <= 4,
+            "G~102, got {}",
+            result.rgba[1]
+        );
+        assert!(result.rgba[2] <= 4, "B~0, got {}", result.rgba[2]);
+        assert_eq!(result.rgba[3], 255, "opaque");
+    }
+
+    #[test]
+    fn inspect_pixel_maps_pane_to_simulated_viewport_and_flags_letterbox() {
+        // A simulated viewport larger than the pane with letterbox bars: an inside
+        // pane pixel reports a SIMULATED-VIEWPORT coordinate (not a raw pane pixel),
+        // and a bar pixel reports outside. Source 64x64 (square) into a 200x100
+        // output pillarboxes → content 100x100, bars left/right.
+        let (tx, rx) = mpsc::channel();
+        let mut src = RenderSource::new(40, 20, rx).expect("wgpu device");
+        let shader = compile_slang(DEFAULT_SHADER, None).expect("compile");
+        tx.send(RenderCommand::SetShader(shader)).unwrap();
+        tx.send(RenderCommand::SetSource(test_pattern(64, 64)))
+            .unwrap();
+        tx.send(RenderCommand::SetSimulatedViewport(Some(
+            crate::ViewportConfig {
+                width: 200,
+                height: 100,
+                integer_scale: false,
+            },
+        )))
+        .unwrap();
+        let mut buf = Vec::new();
+        src.render_into(0, &mut buf);
+
+        // The content is 100x100 (square source pillarboxed into 200x100), centered
+        // in the 200x100 output → composited into a centered rect in the 40x20 pane.
+        let center = inspect(&mut src, &tx, 20, 10);
+        assert!(center.inside, "pane center is on the content");
+        assert_eq!(
+            (center.viewport_width, center.viewport_height),
+            (100, 100),
+            "reported against the §9 content size, not the pane"
+        );
+        // The reported coordinate is in viewport (content) space, near the middle.
+        assert!(
+            center.x > 30 && center.x < 70 && center.y > 30 && center.y < 70,
+            "viewport-space coordinate near the content center, got ({},{})",
+            center.x,
+            center.y
+        );
+
+        // The far-left pane column is in the pillarbox bar → outside.
+        let bar = inspect(&mut src, &tx, 0, 10);
+        assert!(!bar.inside, "left pillarbox bar reports outside");
     }
 
     #[test]

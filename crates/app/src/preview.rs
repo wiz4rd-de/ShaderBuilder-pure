@@ -16,8 +16,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use core_model::{EngineErrorEvent, EngineEvent, EngineStatus, PixelFormat, PixelSample};
 use preview_engine::{
-    FrameSource, PositionUpdate, RenderCommand, RenderSource, SourceSpec, TestPattern,
+    EngineEvent as RenderEvent, EngineStatus as RenderStatus, FrameSource, InspectResult,
+    PositionUpdate, RenderCommand, RenderSource, SourceSpec, TestPattern,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
@@ -43,6 +45,39 @@ pub struct PositionPayload {
 
 /// The Tauri event name carrying [`PositionPayload`] (#31).
 const SOURCE_POSITION_EVENT: &str = "source-position";
+
+/// The Tauri event name carrying [`core_model::EngineEvent`] (#62): structured
+/// render status (live / last-good / stopped) + render/compile errors.
+const ENGINE_EVENT: &str = "engine-event";
+
+/// Map an engine-local [`RenderStatus`] (#62) to the `core_model` wire status.
+fn map_status(status: RenderStatus) -> EngineStatus {
+    match status {
+        RenderStatus::Live => EngineStatus::Live,
+        RenderStatus::LastGood => EngineStatus::LastGood,
+        RenderStatus::Stopped => EngineStatus::Stopped,
+    }
+}
+
+/// Map an engine-local [`RenderEvent`] (#62) to the `core_model` wire event, tagged
+/// with the owning `stream_id` so the frontend can ignore a superseded stream's
+/// late events (#12, #13). A render-thread error carries no pass tag (the engine
+/// renders a chain it was given); pass/node tagging is added by the app for
+/// slang-compile failures.
+fn map_engine_event(stream_id: &str, event: RenderEvent) -> EngineEvent {
+    match event {
+        RenderEvent::Status(status) => EngineEvent::status(stream_id, map_status(status)),
+        RenderEvent::Error { code, message } => {
+            EngineEvent::error(stream_id, EngineErrorEvent::error(code, message))
+        }
+    }
+}
+
+/// Emit a `core_model::EngineEvent` (#62) to the webview. A dropped/closed
+/// webview makes emit fail harmlessly — the app stays usable either way.
+fn emit_engine_event(app: &AppHandle, event: EngineEvent) {
+    let _ = app.emit(ENGINE_EVENT, event);
+}
 
 /// The single active preview stream: a caller-supplied id, its stop flag, the
 /// command channel to its render thread, and the current pane size (so a
@@ -98,6 +133,13 @@ impl PreviewState {
         self.active.lock().unwrap().as_ref().map(|s| s.viewport)
     }
 
+    /// The active stream's id, if any (#12/#13): used to tag command-side engine
+    /// events (e.g. a `load_chain_sources` slang-compile failure) so the frontend
+    /// routes them to the live stream and ignores those from a superseded one.
+    fn active_id(&self) -> Option<String> {
+        self.active.lock().unwrap().as_ref().map(|s| s.id.clone())
+    }
+
     /// Record a new pane size on the active stream (so later `load_source`
     /// defaults track it).
     fn set_viewport_size(&self, width: u32, height: u32) {
@@ -136,7 +178,7 @@ pub fn start_preview_stream(
     let running = Arc::new(AtomicBool::new(true));
     let (commands, rx) = mpsc::channel();
     *state.active.lock().unwrap() = Some(ActiveStream {
-        id: stream_id,
+        id: stream_id.clone(),
         running: running.clone(),
         commands,
         viewport: (width, height),
@@ -148,12 +190,13 @@ pub fn start_preview_stream(
     // event. The render loop is never blocked on emission. The forwarder exits
     // when the render thread drops its sender (stream stopped).
     let (pos_tx, pos_rx) = mpsc::channel::<PositionUpdate>();
+    let pos_app = app.clone();
     let forward_running = running.clone();
     std::thread::spawn(move || {
         for update in pos_rx {
             // A dropped/closed webview makes emit fail — keep forwarding; the loop
             // ends when the render thread's sender is dropped.
-            let _ = app.emit(
+            let _ = pos_app.emit(
                 SOURCE_POSITION_EVENT,
                 PositionPayload {
                     index: update.index,
@@ -164,14 +207,47 @@ pub fn start_preview_stream(
         forward_running.store(false, Ordering::Relaxed);
     });
 
+    // Engine status/error event forwarding (#62): the render thread reports typed
+    // status transitions (live / last-good) and render errors on a channel; this
+    // forwarder (which holds the `AppHandle`) maps them to the `core_model` wire
+    // shape and emits the `engine-event` Tauri event. The render loop is never
+    // blocked on emission; the forwarder exits when the render thread drops its
+    // sender (stream stopped).
+    let (event_tx, event_rx) = mpsc::channel::<RenderEvent>();
+    let event_app = app.clone();
+    let event_stream_id = stream_id.clone();
     std::thread::spawn(move || {
-        match RenderSource::with_position_sink(width, height, rx, Some(pos_tx)) {
+        for event in event_rx {
+            emit_engine_event(&event_app, map_engine_event(&event_stream_id, event));
+        }
+    });
+
+    std::thread::spawn(move || {
+        match RenderSource::with_sinks(width, height, rx, Some(pos_tx), Some(event_tx)) {
             Ok(source) => pump_frames(&channel, source, &running, FRAME_PERIOD),
             Err(err) => {
                 eprintln!("preview: renderer unavailable, no frames will stream: {err}");
+                // Surface the hard startup failure as a non-fatal engine error +
+                // a Stopped status so the UI shows a recoverable message, not a
+                // silent blank pane (#62).
+                emit_engine_event(
+                    &app,
+                    EngineEvent::error(
+                        &stream_id,
+                        EngineErrorEvent::error("noAdapter", err.to_string()),
+                    ),
+                );
+                emit_engine_event(&app, EngineEvent::status(&stream_id, EngineStatus::Stopped));
                 running.store(false, Ordering::Relaxed);
             }
         }
+        // The render loop ended (stream stopped / channel closed): tell the UI the
+        // engine stopped so the preview badges "render stopped" rather than holding
+        // a stale frame forever (#62). The event is tagged with this stream's id, so
+        // a deliberate supersede (a newer stream already active) is ignored by the
+        // frontend and cannot clobber the new stream's live status or toast (#12,
+        // #13).
+        emit_engine_event(&app, EngineEvent::status(&stream_id, EngineStatus::Stopped));
     });
 }
 
@@ -339,6 +415,12 @@ pub struct ChainPassInput {
     source: String,
     /// The pass's RetroArch render settings (scale/filter/wrap/format/alias).
     settings: core_model::PassSettings,
+    /// The owning pipeline pass id (#62), so a slang-compile failure on THIS pass
+    /// (the WholePassCode path bypasses node-IR, so the per-pass checker can't
+    /// catch it) maps to a pass-tagged engine error the editor surfaces against
+    /// the right pass. Optional for back-compat with callers that omit it.
+    #[serde(default)]
+    pass_id: Option<String>,
 }
 
 /// Build a multi-pass live-preview **chain** from in-memory generated sources
@@ -351,12 +433,31 @@ pub struct ChainPassInput {
 /// keeps running.
 #[tauri::command]
 pub fn load_chain_sources(
+    app: AppHandle,
     state: State<'_, PreviewState>,
     passes: Vec<ChainPassInput>,
 ) -> Result<(), String> {
     let mut chain = Vec::with_capacity(passes.len());
     for p in &passes {
-        let compiled = slang_compile::compile_slang(&p.source, None).map_err(|e| e.to_string())?;
+        let compiled = match slang_compile::compile_slang(&p.source, None) {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                let message = e.to_string();
+                // Surface the slang-compile failure as a pass-tagged engine error
+                // (#62): the WholePassCode path has no node-IR, so this is the only
+                // place the error can be mapped to its owning pass. The previous
+                // chain keeps rendering last-good output (we don't SetChain).
+                let mut err = EngineErrorEvent::error("slangCompile", message.clone());
+                if let Some(pass_id) = &p.pass_id {
+                    err = err.with_pass(pass_id.clone());
+                }
+                // Tag with the active stream so the frontend routes it to the live
+                // preview (and ignores it if the stream has since been superseded).
+                let stream_id = state.active_id().unwrap_or_default();
+                emit_engine_event(&app, EngineEvent::error(stream_id, err));
+                return Err(message);
+            }
+        };
         chain.push(pass_from_settings(compiled, &p.settings));
     }
     state.send(RenderCommand::SetChain(chain))
@@ -621,6 +722,59 @@ pub fn set_simulated_viewport(
     state.send(RenderCommand::SetSimulatedViewport(config))
 }
 
+/// How long [`inspect_pixel`] waits for the render thread's reply before giving up
+/// (#61). The probe runs on the render thread between frames at ~60 fps, so a reply
+/// normally lands within a frame; this just bounds a stalled/teardown case so the
+/// command never hangs the webview.
+const INSPECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Map an engine-local [`InspectResult`] (#61) to the `core_model` wire sample. The
+/// offscreen is `Rgba8Unorm` today, so the raw bytes are exact stored values; we
+/// normalize to `0..1` and tag the format (the float/srgb hook lives in
+/// [`PixelFormat`]). The sRGB/linear and 0-255/0-1 display toggles are a frontend
+/// concern and do not touch this raw value.
+fn map_inspect(result: InspectResult) -> PixelSample {
+    PixelSample {
+        inside: result.inside,
+        x: result.x,
+        y: result.y,
+        viewport_width: result.viewport_width,
+        viewport_height: result.viewport_height,
+        rgba: [
+            result.rgba[0] as f32 / 255.0,
+            result.rgba[1] as f32 / 255.0,
+            result.rgba[2] as f32 / 255.0,
+            result.rgba[3] as f32 / 255.0,
+        ],
+        format: PixelFormat::Rgba8Unorm,
+    }
+}
+
+/// Inspect one preview pixel ON DEMAND (#61, Spec §8.5): map the PANE coordinate
+/// `(x, y)` to a SIMULATED-VIEWPORT pixel and read that pixel back from the
+/// offscreen target, returning a typed [`PixelSample`].
+///
+/// The actual readback BLOCKS on a `device.poll(wait)`, so it must run on the
+/// render thread — this command sends an [`RenderCommand::InspectPixel`] with a
+/// one-shot reply channel and waits (bounded by [`INSPECT_TIMEOUT`]) for the render
+/// thread to reply. The frontend calls this on hover/click (debounced), NEVER per
+/// frame, so it adds no measurable stutter to the 60 fps stream. A pane coordinate
+/// that lands in a letterbox bar comes back with `inside == false` (no sample).
+#[tauri::command]
+pub fn inspect_pixel(
+    state: State<'_, PreviewState>,
+    x: u32,
+    y: u32,
+) -> Result<PixelSample, String> {
+    let (respond, reply) = mpsc::channel();
+    state.send(RenderCommand::InspectPixel { x, y, respond })?;
+    // Bounded wait: a torn-down/stalled render thread must not hang the webview.
+    reply
+        .recv_timeout(INSPECT_TIMEOUT)
+        .map(map_inspect)
+        .map_err(|_| "preview render thread did not reply to the pixel probe".to_string())
+}
+
 /// Drive a [`FrameSource`], sending each rendered frame over `channel` as raw
 /// binary, paced to `period`, until `running` is cleared or the channel closes.
 ///
@@ -674,6 +828,89 @@ mod tests {
     use preview_engine::{
         GradientSource, ScaleType as EngineScaleType, FRAME_HEADER_LEN, FRAME_MAGIC,
     };
+
+    // ---- Engine status/error event mapping (#62; no GPU, pure). ----
+
+    #[test]
+    fn maps_engine_status_transitions_to_wire_status() {
+        assert_eq!(
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::Live)),
+            EngineEvent::status("s1", EngineStatus::Live)
+        );
+        assert_eq!(
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::LastGood)),
+            EngineEvent::status("s1", EngineStatus::LastGood)
+        );
+        assert_eq!(
+            map_engine_event("s1", RenderEvent::Status(RenderStatus::Stopped)),
+            EngineEvent::status("s1", EngineStatus::Stopped)
+        );
+    }
+
+    #[test]
+    fn maps_engine_render_error_to_untagged_wire_error_with_stream_id() {
+        // A render-thread error carries no pass tag (the engine renders whatever
+        // chain it was given); pass tagging is the app's job for slang failures.
+        // It IS tagged with the owning stream id (#12/#13).
+        let mapped = map_engine_event(
+            "stream-7",
+            RenderEvent::Error {
+                code: "deviceLost".to_string(),
+                message: "the device was lost".to_string(),
+            },
+        );
+        let EngineEvent::Error { stream_id, error } = mapped else {
+            panic!("expected an Error event, got {mapped:?}");
+        };
+        assert_eq!(stream_id, "stream-7", "error carries the owning stream id");
+        assert_eq!(error.code, "deviceLost");
+        assert_eq!(error.message, "the device was lost");
+        assert_eq!(error.severity, core_model::EngineSeverity::Error);
+        assert!(error.pass_id.is_none(), "render errors are not pass-tagged");
+        assert!(error.node_id.is_none());
+    }
+
+    // ---- Pixel-inspector result mapping (#61; pure, no GPU). ----
+
+    #[test]
+    fn map_inspect_normalizes_bytes_and_keeps_viewport_coords() {
+        let result = InspectResult {
+            inside: true,
+            x: 42,
+            y: 17,
+            viewport_width: 320,
+            viewport_height: 240,
+            rgba: [255, 128, 0, 255],
+        };
+        let sample = map_inspect(result);
+        assert!(sample.inside);
+        assert_eq!((sample.x, sample.y), (42, 17), "viewport coords preserved");
+        assert_eq!((sample.viewport_width, sample.viewport_height), (320, 240));
+        assert_eq!(sample.rgba[0], 1.0, "255 -> 1.0");
+        assert!(
+            (sample.rgba[1] - 128.0 / 255.0).abs() < 1e-6,
+            "128 -> ~0.502"
+        );
+        assert_eq!(sample.rgba[2], 0.0, "0 -> 0.0");
+        assert_eq!(sample.rgba[3], 1.0);
+        assert_eq!(sample.format, PixelFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn map_inspect_outside_is_black_with_no_coord() {
+        let result = InspectResult {
+            inside: false,
+            x: 0,
+            y: 0,
+            viewport_width: 100,
+            viewport_height: 80,
+            rgba: [0, 0, 0, 0],
+        };
+        let sample = map_inspect(result);
+        assert!(!sample.inside, "letterbox bar -> outside");
+        assert_eq!(sample.rgba, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!((sample.viewport_width, sample.viewport_height), (100, 80));
+    }
 
     // ---- Preset → engine scale-config mapping (#22; no GPU needed). ----
 

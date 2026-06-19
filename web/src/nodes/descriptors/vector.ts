@@ -26,7 +26,16 @@ function swizzleMask(data: NodeData): string {
   return raw.length > 0 ? raw : "xyzw";
 }
 
-/** The vecN/float PortType a mask of length 1..4 yields (a canvas hint only). */
+/**
+ * The vecN/float PortType a mask of length 1..4 yields — a **canvas handle hint
+ * ONLY**, never the legality verdict. The EDGE-LEGALITY source-output type is
+ * computed input-aware in `portTypeChecking.sourceOutputType` via
+ * `swizzleResult(inputType, mask)` (mirroring `PortType::swizzle_result`): a mask
+ * length alone cannot tell whether the swizzle is legal for the connected input
+ * (e.g. `.xyz` of a vec2), so deriving the verdict from length would FALSE-BLOCK
+ * wires the IR accepts. This hint just gives the handle a colour before an input
+ * is connected.
+ */
 function maskOutputType(mask: string): PortType {
   switch (mask.length) {
     case 1:

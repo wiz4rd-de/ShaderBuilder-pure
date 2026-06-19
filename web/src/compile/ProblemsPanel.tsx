@@ -8,18 +8,30 @@
 import { useDocumentStore } from "../store/documentStore";
 
 export function ProblemsPanel(): React.JSX.Element {
-  const problems = useDocumentStore((s) => s.problems);
+  const compileProblems = useDocumentStore((s) => s.problems);
+  const engineProblems = useDocumentStore((s) => s.engineProblems);
   const pipelineValid = useDocumentStore((s) => s.pipelineValid);
   const compiling = useDocumentStore((s) => s.compiling);
   const openPass = useDocumentStore((s) => s.openPass);
   const setSelection = useDocumentStore((s) => s.setSelection);
 
+  // Show the compile-loop diagnostics AND the engine-synthesized render/compile
+  // errors (#62) in one list — the engine ones (a whole-pass slang failure, a
+  // device-lost) are tagged `origin: "engine"` and appended after the compile set.
+  const problems = [...compileProblems, ...engineProblems];
+
   const errorCount = problems.filter((p) => p.diagnostic.severity === "error").length;
   const warningCount = problems.length - errorCount;
 
   const jumpTo = (passId: string, nodeId: string): void => {
+    if (passId === "") {
+      return; // a pipeline-wide engine error with no pass to navigate to
+    }
     openPass(passId);
-    setSelection({ nodeIds: [nodeId], edgeIds: [] });
+    // Only select a node when the diagnostic names one (engine errors may not).
+    if (nodeId !== "") {
+      setSelection({ nodeIds: [nodeId], edgeIds: [] });
+    }
   };
 
   return (
@@ -48,23 +60,34 @@ export function ProblemsPanel(): React.JSX.Element {
         </div>
       ) : (
         <ul className="problems__list">
-          {problems.map((p, i) => (
-            <li
-              key={`${p.passId}-${i}`}
-              className={`problems__item problems__item--${p.diagnostic.severity}`}
-            >
-              <button
-                type="button"
-                className="problems__jump"
-                onClick={() => jumpTo(p.passId, p.diagnostic.node)}
-                title={`Go to node ${p.diagnostic.node} in ${p.passName}`}
+          {problems.map((p, i) => {
+            const navigable = p.passId !== "";
+            return (
+              <li
+                key={`${p.origin ?? "compile"}-${p.passId}-${i}`}
+                className={`problems__item problems__item--${p.diagnostic.severity}`}
               >
-                <span className="problems__pass">{p.passName}</span>
-                <span className="problems__code">{p.diagnostic.code}</span>
-                <span className="problems__message">{p.diagnostic.message}</span>
-              </button>
-            </li>
-          ))}
+                <button
+                  type="button"
+                  className="problems__jump"
+                  disabled={!navigable}
+                  onClick={() => jumpTo(p.passId, p.diagnostic.node)}
+                  title={
+                    navigable
+                      ? `Go to ${p.diagnostic.node ? `node ${p.diagnostic.node} in ` : ""}${p.passName}`
+                      : p.passName
+                  }
+                >
+                  <span className="problems__pass">{p.passName}</span>
+                  {p.origin === "engine" ? (
+                    <span className="problems__origin">engine</span>
+                  ) : null}
+                  <span className="problems__code">{p.diagnostic.code}</span>
+                  <span className="problems__message">{p.diagnostic.message}</span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

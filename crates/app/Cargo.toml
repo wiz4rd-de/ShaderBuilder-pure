@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 # Split lib + thin bin: the lib (`app_lib`) holds `run()` so it is unit-testable
@@ -23,8 +24,14 @@ tauri-build = { version = "2", features = [] }
 # `app` is the top of the dependency graph: it wires together every other crate.
 [dependencies]
 tauri = { version = "2", features = [] }
+# Native open/save file dialogs for the project save/load UX (#63). Reused by the
+# export-bundle UX (#64). Needs the dep + `.plugin()` registration + the dialog
+# capability permission to work at runtime.
+tauri-plugin-dialog = "2"
 # `#[derive(Serialize)]` for the `source-position` event payload (#31).
 serde = { workspace = true }
+# Parse the embedded example-project JSON resource (#66 `load_example_project`).
+serde_json = { workspace = true }
 core-model = { workspace = true }
 ir = { workspace = true }
 codegen-slang = { workspace = true }
@@ -33,6 +40,7 @@ slang-compile = { workspace = true }
 preview-engine = { workspace = true }
 source = { workspace = true }
 preset-io = { workspace = true }
+tauri-plugin-opener = "2.5.4"
 
 [dev-dependencies]
 # Throwaway dirs for the `export_preset` command test (#36).

@@ -27,6 +27,7 @@ mod import;
 mod params;
 mod scan;
 mod slangp;
+mod validate;
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,7 @@ pub use scan::scan_references;
 pub use slangp::{
     parse_slangp, parse_slangp_str, LutEntry, ParseError, Pass, Preset, ScaleType, WrapMode,
 };
+pub use validate::validate_for_export;
 
 /// Crate identity marker (kept from the Phase 0 scaffold so dependent crates'
 /// smoke tests keep the dependency edge live).

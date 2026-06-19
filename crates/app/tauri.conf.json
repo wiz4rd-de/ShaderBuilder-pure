@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ShaderBuilder",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "de.wiz4rd.shaderbuilder",
   "build": {
     "frontendDist": "../../web/dist",
@@ -28,14 +28,36 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage", "deb"],
     "category": "DeveloperTool",
+    "shortDescription": "Node-based RetroArch slang-shader builder with a live preview.",
+    "longDescription": "ShaderBuilder is a desktop app for authoring RetroArch shader presets (.slangp / .slang) as a node-based visual code generator, with a full real-time wgpu preview of the multi-pass pipeline. Linux-only for v1. Open source (MIT).",
+    "homepage": "https://github.com/wiz4rd-de/ShaderBuilder-pure",
+    "publisher": "ShaderBuilder-pure contributors",
+    "license": "MIT",
+    "licenseFile": "../../LICENSE",
+    "resources": {
+      "resources/example-project.json": "resources/example-project.json",
+      "../../docs/user-guide.md": "docs/user-guide.md",
+      "../../docs/example-project.md": "docs/example-project.md",
+      "../../docs/import-walkthrough.md": "docs/import-walkthrough.md",
+      "../../README.md": "docs/README.md",
+      "../../LICENSE": "docs/LICENSE"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ]
+      }
+    }
   }
 }

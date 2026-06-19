@@ -27,6 +27,8 @@ import {
 import { create } from "zustand";
 
 import type { Diagnostic } from "../bindings/Diagnostic";
+import type { EngineErrorEvent } from "../bindings/EngineErrorEvent";
+import type { EngineStatus } from "../bindings/EngineStatus";
 import type { Graph } from "../bindings/Graph";
 import type { LibraryPayload } from "../bindings/LibraryPayload";
 import type { Node } from "../bindings/Node";
@@ -56,6 +58,7 @@ import {
 } from "./factories";
 import { collapseSelection, expandSubgraph } from "./collapse";
 import { SUBGRAPH_KIND } from "../nodes/subgraph";
+import { judgeConnection } from "../nodes/portTypeChecking";
 import { cloneSnapshot, deepClone, type DocSnapshot } from "./snapshot";
 import { resolveGraph, replaceGraph, subgraphAt } from "./subgraphNav";
 import { nextId } from "./ids";
@@ -94,6 +97,13 @@ export interface ProblemEntry {
   passName: string;
   /** The diagnostic itself (carries the offending node id + message). */
   diagnostic: Diagnostic;
+  /**
+   * Where this problem came from (#62): `"compile"` is the per-pass `compile_graph`
+   * type-checker; `"engine"` is a render-thread / slang-compile failure synthesized
+   * from an `engine-event`. The panel can badge engine problems and skip node
+   * navigation when there is no node to jump to.
+   */
+  origin?: "compile" | "engine";
 }
 
 /** The live compile-loop status the editor surfaces (#54). */
@@ -161,6 +171,13 @@ export interface DocumentState {
   /** Whether the document has unsaved edits since the last load/save/reset. */
   dirty: boolean;
   /**
+   * The native project-file path the document is currently associated with (#63),
+   * or `null` for a new/untitled document that has never been saved. Set on
+   * Save-As / Open / a successful Save; cleared on `reset`/`newProject`. Drives the
+   * title bar and decides Save (overwrite) vs Save-As (prompt for a path).
+   */
+  currentProjectPath: string | null;
+  /**
    * Compile diagnostics keyed by the offending node id (#54 populates this from
    * each pass's `compile_graph` result). The inspector (#47) reads it read-only
    * to surface per-node problems; it is editor-only, never part of a snapshot.
@@ -181,6 +198,29 @@ export interface DocumentState {
   pipelineValid: boolean | null;
   /** Whether a compile is in flight (#54) — the preview may lag the document. */
   compiling: boolean;
+  /**
+   * The render engine's liveness state (#62): `"live"` (fresh frames), `"lastGood"`
+   * (holding the last good / waiting frame), or `"stopped"` (no adapter / device
+   * lost / stream ended). `null` before the first status event. Editor-only; driven
+   * by the `engine-event` listener (useEngineEvents). The preview pane badges it.
+   */
+  engineStatus: EngineStatus | null;
+  /**
+   * The id of the currently-active preview stream (#12/#13), set by the preview
+   * pane when it starts a stream. The `engine-event` listener IGNORES events whose
+   * `streamId` is not this one, so a superseded (stopped/remounted) render thread's
+   * late status/error can neither toast nor clobber the live stream. `null` before
+   * any stream starts. Editor-only.
+   */
+  activeStreamId: string | null;
+  /**
+   * Render/compile errors synthesized from `engine-event`s (#62), pass-tagged when
+   * the engine could map them. Kept SEPARATE from `problems` (which the compile loop
+   * replaces wholesale each round) so an async render error is not clobbered by the
+   * next compile; cleared whenever a fresh compile completes (`setCompileStatus`).
+   * The problems panel renders both lists.
+   */
+  engineProblems: ProblemEntry[];
   /**
    * The generated slang per pass (#55), keyed by pass id, with last-good tracking.
    * Populated by the live compile loop's `setCompileStatus`; read by the read-only
@@ -244,6 +284,23 @@ export interface DocumentState {
   setCompileStatus: (status: CompileLoopStatus) => void;
   /** Mark a compile as in flight / settled (#54) — drives the "compiling" hint. */
   setCompiling: (compiling: boolean) => void;
+
+  // ---- engine status / render errors (#62; the engine-event listener owns these) ----
+  /** Set the render engine's liveness state (#62) from an `engine-event`. */
+  setEngineStatus: (status: EngineStatus) => void;
+  /**
+   * Mark which preview stream is active (#12/#13). The `engine-event` listener
+   * filters events to this stream so a superseded stream's late events are ignored.
+   */
+  setActiveStreamId: (streamId: string | null) => void;
+  /**
+   * Synthesize an engine render/compile error (#62) into the engine problems list,
+   * tagged with its owning pass when known (so the panel can navigate). De-dupes by
+   * (passId, code, message) so a per-frame repeat does not pile up.
+   */
+  pushEngineProblem: (error: EngineErrorEvent) => void;
+  /** Clear all synthesized engine problems (#62) — e.g. when a fresh compile lands. */
+  clearEngineProblems: () => void;
 
   // ---- pipeline / navigation (#46) ----
   /**
@@ -382,10 +439,25 @@ export interface DocumentState {
   toSnapshot: () => DocSnapshot;
   fromSnapshot: (snap: DocSnapshot, options?: { resetHistory?: boolean }) => void;
 
-  /** Replace the whole project (e.g. on file load); clears history + selection. */
-  loadProject: (project: Project, activePassId?: string) => void;
-  /** Reset to a fresh single-pass project. */
+  /**
+   * Replace the whole project (e.g. on file load); clears history + selection.
+   * `path` records the native file the document came from (#63) so the title bar
+   * + Save flow know it; pass `null`/omit for a recovered/untitled document.
+   */
+  loadProject: (project: Project, activePassId?: string, path?: string | null) => void;
+  /** Reset to a fresh single-pass untitled project (#63 New). Clears the path. */
   reset: () => void;
+  /**
+   * Set (or clear) the native file path the document is associated with (#63) —
+   * called after a successful Save / Save-As. Does not touch the document.
+   */
+  setCurrentProjectPath: (path: string | null) => void;
+  /**
+   * Mark the document as saved (#63): clears `dirty` and (optionally) records the
+   * file it was saved to. Used by the Save/Save-As flow after a successful write
+   * so the title-bar `*` indicator and the close-prompt clear.
+   */
+  markSaved: (path?: string) => void;
 }
 
 /**
@@ -526,6 +598,22 @@ function mergePassSources(
   return out;
 }
 
+/**
+ * The stable codes for a PIPELINE-WIDE engine problem (#14): the whole GPU/device
+ * is unavailable, not a single pass. These survive a subsequent compile (which only
+ * re-derives pass-level slangCompile errors) because the device is still dead.
+ */
+const DEVICE_LEVEL_ENGINE_CODES = new Set(["noAdapter", "deviceLost"]);
+
+/**
+ * Whether an engine problem is a pipeline-wide device-level failure (#14): a
+ * device-code problem with no owning pass. dispatchPreview can never re-derive
+ * these, so a fresh compile must NOT clear them while the engine is still stopped.
+ */
+function isDeviceLevelProblem(p: ProblemEntry): boolean {
+  return p.passId === "" && DEVICE_LEVEL_ENGINE_CODES.has(p.diagnostic.code);
+}
+
 const initialProject = makeProject();
 const initialActivePassId = initialProject.passes[0]!.id;
 
@@ -600,10 +688,14 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     selection: { nodeIds: [], edgeIds: [] },
     clipboard: null,
     dirty: false,
+    currentProjectPath: null,
     diagnosticsByNode: {},
     problems: [],
     pipelineValid: null,
     compiling: false,
+    engineStatus: null,
+    activeStreamId: null,
+    engineProblems: [],
     sourcesByPassId: {},
     past: [],
     future: [],
@@ -627,6 +719,14 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         (e) => e.target === target && e.targetPort === targetPort,
       );
       if (dup) {
+        return null;
+      }
+      // Reject a type-incompatible wire (#65) — the SAME `judgeConnection`
+      // verdict the canvas `isValidConnection` hook uses, applied here too so
+      // programmatic adds (paste, future API) can never slip an illegal edge
+      // past the type system. An UNJUDGEABLE edge (unknown kind / dropped port)
+      // is allowed through — compile_graph remains the authority for those.
+      if (!judgeConnection(g, source, sourcePort, target, targetPort).legal) {
         return null;
       }
       const edge = makeEdge(source, sourcePort, target, targetPort);
@@ -748,9 +848,50 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         // source so the read-only viewer (#55) can fall back to it (with a stale
         // marker) when this round produced no source for that pass.
         sourcesByPassId: mergePassSources(s.sourcesByPassId, status.sourcesByPassId),
+        // A fresh compile round supersedes any async render error from the prior
+        // chain (#62): clear the pass-level slangCompile problems the next dispatch
+        // re-establishes, but PRESERVE pipeline-wide device-level problems
+        // (no passId; codes noAdapter/deviceLost) — the GPU is still dead, so they
+        // must not vanish on an unrelated edit (#14). dispatchPreview only re-emits
+        // slangCompile, so it cannot re-derive a device problem.
+        engineProblems: s.engineProblems.filter((p) => isDeviceLevelProblem(p)),
       })),
 
     setCompiling: (compiling) => set({ compiling }),
+
+    setEngineStatus: (status) => set({ engineStatus: status }),
+
+    setActiveStreamId: (streamId) => set({ activeStreamId: streamId }),
+
+    pushEngineProblem: (error) =>
+      set((s) => {
+        const passName =
+          (error.passId && s.project.passes.find((p) => p.id === error.passId)?.name) ||
+          error.passId ||
+          "Engine";
+        const entry: ProblemEntry = {
+          passId: error.passId ?? "",
+          passName,
+          diagnostic: {
+            severity: error.severity,
+            code: error.code,
+            message: error.message,
+            node: error.nodeId ?? "",
+            port: null,
+          },
+          origin: "engine",
+        };
+        // De-dupe an identical repeat (a per-frame render error must not pile up).
+        const isDup = s.engineProblems.some(
+          (p) =>
+            p.passId === entry.passId &&
+            p.diagnostic.code === entry.diagnostic.code &&
+            p.diagnostic.message === entry.diagnostic.message,
+        );
+        return isDup ? {} : { engineProblems: [...s.engineProblems, entry] };
+      }),
+
+    clearEngineProblems: () => set({ engineProblems: [] }),
 
     addPass: (name) => {
       const before = snapshot();
@@ -1266,7 +1407,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       });
     },
 
-    loadProject: (project, activePassId) => {
+    loadProject: (project, activePassId, path) => {
       const firstGraphPass = project.passes.find((p) => p.source.kind === "graph");
       const active = activePassId ?? firstGraphPass?.id ?? project.passes[0]?.id ?? "";
       set({
@@ -1282,11 +1423,17 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        engineStatus: null,
+        engineProblems: [],
         sourcesByPassId: {},
         past: [],
         future: [],
         pendingBaseline: null,
         dirty: false,
+        // `undefined` (path omitted) leaves the current path untouched is NOT what
+        // we want here — loading always re-associates the document, so an omitted
+        // path clears it (a recovered/untitled doc passes null explicitly).
+        currentProjectPath: path ?? null,
       });
     },
 
@@ -1305,13 +1452,24 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
         problems: [],
         pipelineValid: null,
         compiling: false,
+        engineStatus: null,
+        engineProblems: [],
         sourcesByPassId: {},
         past: [],
         future: [],
         pendingBaseline: null,
         dirty: false,
+        currentProjectPath: null,
       });
     },
+
+    setCurrentProjectPath: (path) => set({ currentProjectPath: path }),
+
+    markSaved: (path) =>
+      set((s) => ({
+        dirty: false,
+        currentProjectPath: path ?? s.currentProjectPath,
+      })),
   };
 });
 

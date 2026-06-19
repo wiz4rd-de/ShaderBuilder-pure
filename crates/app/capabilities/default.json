@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Default capability for the main ShaderBuilder window.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:allow-reveal-item-in-dir"
+  ]
 }

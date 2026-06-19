@@ -40,7 +40,7 @@ export function PanelLayout(): React.JSX.Element {
   const [active, setActive] = useState<TabId>("inspector");
   // A live problem count badges the Problems tab so issues are visible without
   // opening it (the live compile loop, #54, keeps `problems` current).
-  const problemCount = useDocumentStore((s) => s.problems.length);
+  const problemCount = useDocumentStore((s) => s.problems.length + s.engineProblems.length);
 
   return (
     <section className="panels" aria-label="Panels">

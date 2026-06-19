@@ -32,3 +32,8 @@ codegen-slang = { workspace = true }
 # #44 harness's temp single-pass `.slangp`/`.slang` bundle, so it is a normal
 # dep now (the harness fn writes the generated bundle to a temp dir).
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# The #66 example-project test (re)generates the bundled native `.json` resource
+# from the `.slangp` fixture and asserts the committed JSON still matches it.
+serde_json = { workspace = true }

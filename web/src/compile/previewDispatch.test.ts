@@ -40,7 +40,7 @@ describe("dispatchPreview", () => {
     expect(dispatched).toBe(true);
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("load_chain_sources", {
-      passes: [{ source: "// s", settings: settings() }],
+      passes: [{ source: "// s", settings: settings(), passId: "a" }],
     });
   });
 
@@ -58,8 +58,8 @@ describe("dispatchPreview", () => {
     );
     expect(invoke).toHaveBeenCalledWith("load_chain_sources", {
       passes: [
-        { source: "// a", settings: settings() },
-        { source: "// b", settings: settings() },
+        { source: "// a", settings: settings(), passId: "a" },
+        { source: "// b", settings: settings(), passId: "b" },
       ],
     });
   });
