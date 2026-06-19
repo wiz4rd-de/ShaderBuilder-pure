@@ -20,7 +20,7 @@ The *how it's built and merged* lives in
 
 ## Status
 
-**v1.0.0 — Linux release.** The full slice ships: a node-based editor that
+**v0.1.0 — first Linux release.** The full slice ships: a node-based editor that
 generates slang passes, a live multi-pass **wgpu** preview, `.slangp` import and
 export-bundle writing, subgraphs + a reusable node library, and the onboarding
 start screen with a bundled **CRT Scanlines + Curvature** example. Linux-only for
@@ -35,14 +35,14 @@ No Rust/Node toolchain is needed to run the app.
 **AppImage** (portable, any distro):
 
 ```bash
-chmod +x ShaderBuilder_1.0.0_amd64.AppImage
-./ShaderBuilder_1.0.0_amd64.AppImage
+chmod +x ShaderBuilder_0.1.0_amd64.AppImage
+./ShaderBuilder_0.1.0_amd64.AppImage
 ```
 
 **.deb** (Debian/Ubuntu):
 
 ```bash
-sudo apt install ./ShaderBuilder_1.0.0_amd64.deb
+sudo apt install ./ShaderBuilder_0.1.0_amd64.deb
 ShaderBuilder            # or launch "ShaderBuilder" from your app menu
 ```
 
