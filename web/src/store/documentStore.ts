@@ -89,6 +89,17 @@ export interface Selection {
   edgeIds: string[];
 }
 
+/** Order-independent id-set equality (a selection is a set; React Flow may hand
+ * it back in a different order, so order must not count as a change). */
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id) => b.includes(id));
+}
+
+/** Whether two selections cover the same node + edge id sets. */
+function selectionsEqual(a: Selection, b: Selection): boolean {
+  return sameIds(a.nodeIds, b.nodeIds) && sameIds(a.edgeIds, b.edgeIds);
+}
+
 /** One row of the aggregate PROBLEMS list (#54): a diagnostic + its origin pass. */
 export interface ProblemEntry {
   /** The pass this diagnostic came from (so the list can group + navigate). */
@@ -833,7 +844,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       });
     },
 
-    setSelection: (selection) => set({ selection }),
+    setSelection: (selection) =>
+      // Idempotent: React Flow's `onSelectionChange` re-fires with the SAME
+      // selection after every prop-driven node rebuild; returning the current
+      // state (no new object) stops that from looping into React #185.
+      set((s) => (selectionsEqual(s.selection, selection) ? s : { selection })),
     clearSelection: () => set({ selection: { nodeIds: [], edgeIds: [] } }),
 
     setDiagnosticsByNode: (byNode) => set({ diagnosticsByNode: byNode }),
@@ -1070,8 +1085,16 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
     },
 
     setPipelineSelection: (passId) => {
-      set((s) => ({ selections: { ...s.selections, pipeline: passId } }));
+      // Idempotent (see setSelection): the pipeline view re-emits the same
+      // selected pass on mount, which otherwise ping-pongs into React #185 when
+      // returning to the pipeline with a pass already selected.
+      set((s) =>
+        s.selections.pipeline === passId
+          ? s
+          : { selections: { ...s.selections, pipeline: passId } },
+      );
     },
+
 
     showPipeline: () => {
       const { level, activePassId, subgraphPath, selection } = get();

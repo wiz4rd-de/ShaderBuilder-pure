@@ -1,16 +1,23 @@
 // Helper for the CONTROLLED editor canvas (EditorCanvas.tsx): split React Flow's
-// `NodeChange[]` into the structural changes that belong in the document and the
-// dimension MEASUREMENTS that must NOT.
+// `NodeChange[]` into the STRUCTURAL changes that belong in the document and the
+// two kinds that must NOT round-trip through it — dimension MEASUREMENTS and
+// SELECTION.
 //
-// React Flow 12 keeps a node hidden until it has measured its on-screen size, and
-// in controlled mode it reads `node.measured` off the `nodes` prop every render
-// (`adoptUserNodes` in @xyflow/system). Our document carries no node dimensions,
-// so if a `dimensions` change is fed back through the store, the next render's
-// nodes are "unmeasured" again → React Flow re-measures → emits another
-// `dimensions` change → … an infinite update loop (React error #185) that also
-// leaves every node permanently invisible. So we cache measurements OUT of the
-// document (in the map this returns into) and only send structural changes
-// (position / select / remove) to the store.
+//  * `dimensions` — React Flow 12 keeps a node hidden until it has measured its
+//    on-screen size, and in controlled mode it reads `node.measured` off the
+//    `nodes` prop every render (`adoptUserNodes` in @xyflow/system). Our document
+//    carries no node dimensions, so if a `dimensions` change is fed back through
+//    the store, the next render's nodes are "unmeasured" again → React Flow
+//    re-measures → emits another `dimensions` change → … an infinite update loop
+//    (React error #185) that also leaves every node permanently invisible. We
+//    cache measurements OUT of the document (in the map this returns into).
+//  * `select` — selection is its own store field, driven by `onSelectionChange`
+//    (→ `setSelection`). Routing `select` changes into the document graph too
+//    would rebuild the project on every click (new node identities), which both
+//    re-triggers the debounced compile loop needlessly AND feeds the selection
+//    ping-pong. The store never reads selection off the graph, so we drop it here.
+//
+// Only position / add / remove / replace reach `applyNodeChanges`.
 import type { NodeChange } from "@xyflow/react";
 
 /** A measured node size, keyed by node id, kept outside the serialized document. */
@@ -50,7 +57,7 @@ export function partitionNodeChanges(
     }
   }
   return {
-    structural: changes.filter((c) => c.type !== "dimensions"),
+    structural: changes.filter((c) => c.type !== "dimensions" && c.type !== "select"),
     measureChanged,
   };
 }

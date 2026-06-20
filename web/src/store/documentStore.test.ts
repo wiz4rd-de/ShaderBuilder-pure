@@ -318,3 +318,36 @@ describe("documentStore — engine problems vs compile (#14)", () => {
     expect(store().engineProblems).toHaveLength(0);
   });
 });
+
+describe("documentStore — selection setters are idempotent (React #185 guard)", () => {
+  // React Flow re-fires `onSelectionChange` with the SAME selection after every
+  // prop-driven node rebuild; if each call produced new state the canvas looped
+  // into "Maximum update depth exceeded". A re-set of the same selection must
+  // therefore be a true no-op (same root state reference → no subscriber notify).
+  it("setSelection ignores re-selection of the same set (any order)", () => {
+    const a = store().addNode("placeholder", { x: 0, y: 0 });
+    const b = store().addNode("placeholder", { x: 1, y: 1 });
+    store().setSelection({ nodeIds: [a, b], edgeIds: [] });
+
+    const before = useDocumentStore.getState();
+    store().setSelection({ nodeIds: [b, a], edgeIds: [] }); // same set, reversed order
+    expect(useDocumentStore.getState()).toBe(before); // no new state → no re-render
+
+    store().setSelection({ nodeIds: [a], edgeIds: [] }); // a genuine change DOES apply
+    expect(useDocumentStore.getState()).not.toBe(before);
+    expect(store().selection.nodeIds).toEqual([a]);
+  });
+
+  it("setPipelineSelection ignores re-selecting the same pass", () => {
+    const passId = store().project.passes[0]!.id;
+    store().setPipelineSelection(passId);
+
+    const before = useDocumentStore.getState();
+    store().setPipelineSelection(passId);
+    expect(useDocumentStore.getState()).toBe(before);
+
+    store().setPipelineSelection(null);
+    expect(useDocumentStore.getState()).not.toBe(before);
+    expect(store().selections.pipeline).toBeNull();
+  });
+});

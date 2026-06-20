@@ -36,7 +36,7 @@ describe("partitionNodeChanges", () => {
     expect(measureChanged).toBe(false);
   });
 
-  it("keeps structural changes (position/select/remove) and drops removed measurements", () => {
+  it("keeps position/remove for the document but drops select (tracked separately) and prunes removed measurements", () => {
     const measured = new Map<string, MeasuredSize>([["node-1", { width: 132, height: 56 }]]);
     const changes: NodeChange[] = [
       { id: "node-1", type: "position", position: { x: 10, y: 20 }, dragging: true },
@@ -46,7 +46,10 @@ describe("partitionNodeChanges", () => {
 
     const { structural } = partitionNodeChanges(changes, measured);
 
-    expect(structural.map((c) => c.type)).toEqual(["position", "select", "remove"]);
+    // `select` must NOT reach the document store — it lives in selection state and
+    // routing it through the graph rebuilds the project on every click (compile
+    // thrash + selection ping-pong). Only position/remove survive.
+    expect(structural.map((c) => c.type)).toEqual(["position", "remove"]);
     expect(measured.has("node-1")).toBe(false); // removal prunes the cache entry
   });
 
