@@ -1,0 +1,102 @@
+name: Release
+
+# v1 is Linux-only (Decision Log #10). This workflow builds the frontend, builds
+# the Tauri Linux bundle (AppImage + .deb), and publishes the artifacts.
+#
+# Two entry points:
+#   * push of a `v*` tag  -> build the bundle AND attach it to a GitHub Release for
+#     that tag (the real release). The tag itself is created out-of-band (see the
+#     release checklist in docs/release-checklist.md) so the version bump lands on
+#     `main` first.
+#   * manual workflow_dispatch -> build the bundle and upload it as a workflow
+#     artifact only (a dry-run / smoke build, no Release published). This is the
+#     automated half of the #67 release smoke test.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: Build Linux bundle (AppImage + .deb)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same Tauri v2 Linux system dependencies the CI `rust` job installs so
+      # the `app` crate links and the bundler can produce an AppImage + .deb.
+      # librsvg2 + the appindicator lib are required by the AppImage/deb tooling.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            build-essential
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: web
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # tauri-action runs `tauri build` (which honors crates/app/tauri.conf.json:
+      # targets = appimage + deb, bundled example/docs/LICENSE resources) and, on a
+      # tag push, creates/updates the GitHub Release and uploads the bundle to it.
+      # The frontend is already built above; beforeBuildCommand rebuilds it but that
+      # is idempotent and keeps the bundle's frontendDist fresh.
+      - name: Build Tauri bundle (+ publish on tag)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/app
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ShaderBuilder ${{ github.ref_type == 'tag' && github.ref_name || 'dev build' }}
+          releaseBody: |
+            ShaderBuilder v1 — Linux build (AppImage + .deb).
+
+            See the README and docs/user-guide.md (also bundled with the artifact)
+            for install/run instructions. Linux-only for v1; MIT licensed; the
+            shipped artifact carries no GPL/LGPL ffmpeg dependency.
+          releaseDraft: true
+          # Only publish a Release on a tag push; workflow_dispatch produces a
+          # bundle but no Release (it is uploaded as a workflow artifact below).
+          includeUpdaterJson: false
+
+      # Always upload the produced bundle as a workflow artifact so a manual
+      # (workflow_dispatch) run yields a downloadable AppImage/.deb for the
+      # scripted/manual smoke test, even when no Release is published.
+      - name: Upload bundle as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaderbuilder-linux-bundle
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,11 @@
+[package]
+name = "ir"
+description = "Graph → IR lowering, type checking, and diagnostics (Architecture §B/§C)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+core-model = { workspace = true }

@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Frontend: typecheck + production build. The built web/dist is also a build
+  # input for the Rust `app` crate (Tauri's generate_context! embeds it), so it
+  # is uploaded for the rust job to consume.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: web
+
+      - name: Build
+        run: npm run build
+        working-directory: web
+
+      - name: Test
+        run: npm test
+        working-directory: web
+
+      - name: Upload web/dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Rust: format, lint (warnings denied), tests, and the TypeScript-bindings
+  # drift check. Needs the frontend build so the Tauri `app` crate compiles.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (fmt + clippy + test + ts-drift)
+    runs-on: ubuntu-latest
+    needs: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download web/dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # Tauri v2 Linux system dependencies (WebKitGTK 4.1 + friends) so the
+      # `app` crate links, plus the toolchain the GPU/compile tests need:
+      #   * glslang-tools — provides `glslangValidator`, the slang-compile backend;
+      #   * spirv-tools — provides `spirv-opt` (the function-inlining pass #32 runs
+      #     before split_samplers so sampler-in-helper-function shaders compile) and
+      #     `spirv-val` (the split_samplers validation test). Without it, inlining
+      #     degrades to a skip and crt-royale + ~38 corpus presets stop compiling;
+      #   * mesa-vulkan-drivers — the lavapipe software Vulkan ICD wgpu renders on;
+      #   * vulkan-tools — `vulkaninfo` for debugging adapter selection in logs.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            build-essential \
+            glslang-tools \
+            spirv-tools \
+            mesa-vulkan-drivers \
+            vulkan-tools
+
+      # Explicitly install the pinned toolchain *with* rustfmt + clippy. `rustup
+      # show` alone is unreliable on the runner: auto-install uses the minimal
+      # profile and skips the components listed in rust-toolchain.toml
+      # (rust-lang/rustup#4337), which would break the fmt/clippy steps.
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Point wgpu at the lavapipe software-Vulkan adapter so the headless GPU
+      # tests (incl. the `e2e_curvature` Phase-1 exit test) run on the GPU-less
+      # runner. We *discover* the ICD path at runtime rather than hardcoding it:
+      # a wrong `VK_ICD_FILENAMES` makes the loader find zero ICDs and every
+      # `Renderer::new` fails with `NoAdapter`. `Renderer::new` builds the
+      # instance via `new_without_display_handle_from_env`, so the exported env
+      # vars are honored. Diagnostics print exactly what the runner provides.
+      - name: Set up lavapipe software Vulkan
+        run: |
+          echo "=== /usr/share/vulkan/icd.d ==="
+          ls -la /usr/share/vulkan/icd.d/ || true
+          echo "=== mesa-vulkan-drivers ICDs ==="
+          dpkg -L mesa-vulkan-drivers | grep -i 'icd.*json' || true
+          LVP="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)"
+          if [ -z "$LVP" ]; then
+            echo "::error::lavapipe ICD not found under /usr/share/vulkan/icd.d/"
+            exit 1
+          fi
+          echo "Using lavapipe ICD: $LVP"
+          {
+            echo "VK_ICD_FILENAMES=$LVP"
+            echo "WGPU_BACKEND=vulkan"
+            echo "LIBGL_ALWAYS_SOFTWARE=1"
+          } >> "$GITHUB_ENV"
+          echo "=== vulkaninfo (lavapipe) ==="
+          VK_ICD_FILENAMES="$LVP" vulkaninfo --summary 2>&1 | head -40 || true
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Golden-image regression harness (#32) + graph->slang->preview PARITY suite
+      # (#44, the Phase-4 exit gate): the corpus fuzzer over the local fixtures, the
+      # self-oracle goldens, the determinism gate, AND the parity suite that renders
+      # a hand-built graph's generated slang vs a hand-written-equivalent `.slang`
+      # and diffs them. Run explicitly with `--test-threads=1` (concurrent wgpu
+      # device creation can SIGSEGV on multi-adapter boxes; serialized here to be
+      # safe). The `testing` crate's tests also run under the workspace `Test` step
+      # above; this dedicated step makes the gate machinery visible as its own check
+      # and is where the diff-artifact uploads below attach. The parity suite renders
+      # both sides on the same adapter (lavapipe in CI), so adapter noise cancels —
+      # it behaves exactly like the golden suite. See docs/golden-image-harness.md —
+      # the RetroArch *reference* comparison remains a documented MANUAL gate (no
+      # RetroArch capture is possible on the headless runner).
+      - name: Golden-image + graph-parity harness (testing crate)
+        run: cargo test -p testing --locked -- --test-threads=1
+
+      # On a golden divergence the harness writes the rendered output + an
+      # amplified diff so a render regression is inspectable from the run.
+      - name: Upload golden diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diff-artifacts
+          path: target/golden-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # On a #44 parity divergence the harness writes the generated + hand-written
+      # renders and an amplified diff so a codegen regression is inspectable.
+      - name: Upload graph-parity diff artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-parity-diff-artifacts
+          path: target/graph-parity-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Capture the rendered curvature snapshot (and passthrough control) the
+      # e2e test writes, so a render regression is inspectable from the run.
+      - name: Upload e2e render artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-render-artifacts
+          path: target/e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      # `cargo test` above regenerated the committed TypeScript bindings (the
+      # ts-rs #[ts(export)] tests). If they differ from what's checked in, the
+      # Rust schema and the TS bindings have drifted — fail the build. Use
+      # `git status --porcelain` so newly-added (untracked) and deleted binding
+      # files are caught too, not just modifications.
+      - name: TypeScript bindings drift check
+        run: |
+          if [ -n "$(git status --porcelain -- web/src/bindings)" ]; then
+            echo "::error::web/src/bindings is stale — run 'cargo test -p core-model' and commit."
+            git status --porcelain -- web/src/bindings
+            git diff -- web/src/bindings
+            exit 1
+          fi

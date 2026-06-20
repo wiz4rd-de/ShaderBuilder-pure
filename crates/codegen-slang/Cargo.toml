@@ -1,0 +1,22 @@
+[package]
+name = "codegen-slang"
+description = "IR → slang emitter + slang preprocessing (Architecture §B/§C). Primary, always-previewed backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ir = { workspace = true }
+core-model = { workspace = true }
+# Whole-pass code-node pass-through (#43) reuses preset-io's existing
+# `#pragma parameter` + texture-reference scanners rather than re-implementing
+# them. No cycle: preset-io depends only on core-model.
+preset-io = { workspace = true }
+
+[dev-dependencies]
+# Emit-then-compile acceptance: the generated slang must compile through the
+# real Phase-1 slang-compile path (preprocess → glslang → SPIR-V). Kept as a
+# dev-dependency so the runtime crate graph stays codegen-slang → ir.
+slang-compile = { workspace = true }

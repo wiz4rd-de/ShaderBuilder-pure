@@ -1,0 +1,22 @@
+# Self-oracle fixture (#32): a preset with a LUT (`textures=`). The single pass
+# IGNORES the source and outputs the LUT sampled across the screen, so the golden
+# is purely the LUT content stretched to the viewport — proving the `textures`
+# family decodes, registers, and binds by name (`<NAME>`), with its own per-LUT
+# sampler settings (#27, §7).
+#
+# LOCAL fixture, NOT a RetroArch reference. The LUT is a tiny committed 2x2 PNG
+# (pal.png): red, green / blue, white. Combined `sampler2D` form (corpus path).
+#
+# `PAL_linear = false` (nearest) and `PAL_wrap_mode = clamp_to_edge` are set
+# explicitly so the four quadrants read the four LUT texels crisply.
+
+shaders = 1
+
+shader0 = lookup.slang
+filter_linear0 = false
+
+textures = PAL
+PAL = pal.png
+PAL_linear = false
+PAL_wrap_mode = clamp_to_edge
+PAL_mipmap = false

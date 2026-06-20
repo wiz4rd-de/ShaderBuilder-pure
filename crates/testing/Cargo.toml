@@ -1,0 +1,39 @@
+[package]
+name = "testing"
+description = "Golden-image regression harness (#32): headless render-preset-to-PNG, image diff, and a corpus fuzzer that import-and-renders a directory of `.slangp` presets. The fidelity gate's *machinery* — see docs/golden-image-harness.md for the (manual) RetroArch-reference capture that closes the Phase-2 fidelity exit gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The harness is a normal library (not just dev-only): a future `cargo run`
+# baseline tool or other crates may call `render_preset_to_image` / `diff_images`.
+# Its dependencies are therefore normal deps; `image` is needed at the API
+# surface (`RgbaImage` is in the public signatures).
+[dependencies]
+preview-engine = { workspace = true }
+preset-io = { workspace = true }
+slang-compile = { workspace = true }
+source = { workspace = true }
+image = { workspace = true }
+# `core-model` is in the public surface of the round-trip harness (#37):
+# `compare_projects` / `RoundTrip` take and return `core_model::Project`.
+core-model = { workspace = true }
+# `ir` + `codegen-slang` back the graph→slang→preview parity harness (#44):
+# `render_graph_to_image` takes a `core_model::ir::IrGraph`, type-checks +
+# lowers it (`ir`), emits slang (`codegen-slang`), and renders it through the
+# engine. They are normal deps (not dev-only) because the harness fn is in the
+# library surface so the Phase-4 exit-gate test — and any future baseline tool —
+# can call it.
+ir = { workspace = true }
+codegen-slang = { workspace = true }
+# `tempfile` backs both the fuzzer's directory-walk round-trip tests and the
+# #44 harness's temp single-pass `.slangp`/`.slang` bundle, so it is a normal
+# dep now (the harness fn writes the generated bundle to a temp dir).
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# The #66 example-project test (re)generates the bundled native `.json` resource
+# from the `.slangp` fixture and asserts the committed JSON still matches it.
+serde_json = { workspace = true }

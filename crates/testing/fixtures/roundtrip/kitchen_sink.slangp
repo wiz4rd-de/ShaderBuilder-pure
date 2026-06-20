@@ -1,0 +1,79 @@
+# Round-trip "kitchen sink" fixture (#37): ONE preset that exercises EVERY parsed
+# feature so the import -> export -> re-import harness proves losslessness across
+# the whole feature surface in a single bundle.
+#
+# Exercised here:
+#   - multi-pass (4 passes)
+#   - ALL scale types: source (combined), absolute + viewport (PER-AXIS), viewport
+#     (combined), and a no-scale pass left to the position default
+#   - aliases (alias0 = SOURCEPASS, referenced by pass 1)
+#   - format keys: srgb_framebuffer, float_framebuffer
+#   - sampler keys: filter_linear, every wrap_mode variant, mipmap_input
+#   - global feedback_pass (pass 2 reads PassFeedback2)
+#   - frame_count_mod
+#   - LUTs with VARIED samplers (GRADE: linear/repeat/mipmap; BORDER: nearest/
+#     clamp_to_edge/no-mipmap)
+#   - #pragma parameters with preset OVERRIDES (BRIGHTNESS, GAMMA overridden;
+#     CONTRAST left at its pragma initial)
+#   - a PRESERVED UNKNOWN KEY (vendor_unknown) the parser keeps and the export
+#     re-emits, so nothing is dropped.
+#
+# LOCAL fixture, NOT a RetroArch reference. The `.slang` bodies are minimal and
+# the harness reads them as BYTES (never compiles them) — this proves the file
+# format round-trips, not that the shaders render.
+
+shaders = 4
+feedback_pass = 2
+
+# pass 0: combined source-scale x2, aliased, sRGB, nearest filter
+shader0 = pass0_source_scale.slang
+alias0 = SOURCEPASS
+scale_type0 = source
+scale0 = 2.0
+filter_linear0 = false
+srgb_framebuffer0 = true
+
+# pass 1: PER-AXIS scale (x absolute 320 px, y viewport x1), float fbo, repeat
+# wrap, linear filter, frame_count_mod
+shader1 = pass1_per_axis_scale.slang
+scale_type_x1 = absolute
+scale_x1 = 320
+scale_type_y1 = viewport
+scale_y1 = 1.0
+float_framebuffer1 = true
+filter_linear1 = true
+wrap_mode1 = repeat
+frame_count_mod1 = 60
+
+# pass 2: the feedback target — mipmap_input + clamp_to_border wrap
+shader2 = pass2_feedback.slang
+scale_type2 = source
+scale2 = 1.0
+mipmap_input2 = true
+wrap_mode2 = clamp_to_border
+
+# pass 3: final pass — combined viewport scale, mirrored_repeat wrap
+shader3 = pass3_viewport.slang
+scale_type3 = viewport
+scale3 = 1.0
+wrap_mode3 = mirrored_repeat
+
+# Two LUTs with DIFFERING sampler settings.
+textures = "GRADE;BORDER"
+GRADE = grade.png
+GRADE_linear = true
+GRADE_wrap_mode = repeat
+GRADE_mipmap = true
+BORDER = border.png
+BORDER_linear = false
+BORDER_wrap_mode = clamp_to_edge
+BORDER_mipmap = false
+
+# Parameter overrides (bare `id = value`): the preset value wins over the pragma
+# initial. CONTRAST is intentionally NOT overridden (stays at its pragma 1.0).
+parameters = "BRIGHTNESS;CONTRAST;GAMMA"
+BRIGHTNESS = 1.25
+GAMMA = 2.4
+
+# An unrecognized key the parser must preserve and the export must re-emit.
+vendor_unknown = some_value
