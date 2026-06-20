@@ -37,6 +37,7 @@ import { WholePassEditor } from "../wholePass/WholePassEditor";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorToolbar } from "./EditorToolbar";
 import { toRfGraph } from "./graphAdapter";
+import { partitionNodeChanges } from "./nodeMeasureCache";
 import { NodePaletteMenu } from "./NodePaletteMenu";
 import { useEditorShortcuts } from "./useEditorShortcuts";
 
@@ -60,7 +61,29 @@ function PassGraph() {
   // so drilling into a subgraph (same pass) gives a fresh React Flow instance.
   const navKey = subgraphPath.length > 0 ? subgraphPath[subgraphPath.length - 1]! : activePassId;
   const rememberedViewport = useDocumentStore((s) => s.viewports.passes[navKey] ?? null);
-  const { nodes, edges } = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
+  // React Flow MEASURED-dimension cache (NOT part of the document). React Flow 12
+  // keeps a node hidden until it has measured its on-screen size, and in
+  // CONTROLLED mode it reads `node.measured` off the `nodes` prop on every render
+  // (see `adoptUserNodes` in @xyflow/system). The document has no node dimensions,
+  // so without this cache every render looked "unmeasured" to React Flow → it
+  // re-measured → fired a `dimensions` change → `applyNodeChanges` rebuilt the
+  // nodes (still unmeasured) → re-measure … an infinite update loop (React error
+  // #185) that also left every node permanently invisible. We stash each node's
+  // measured size here (keyed by id) and merge it back into the derived nodes, so
+  // React Flow sees a stable measurement and the loop never starts.
+  const measured = useRef<Map<string, { width: number; height: number }>>(new Map());
+  const [measuredVersion, setMeasuredVersion] = useState(0);
+
+  const base = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
+  const nodes = useMemo(
+    () =>
+      base.nodes.map((n) => {
+        const m = measured.current.get(n.id);
+        return m ? { ...n, measured: m } : n;
+      }),
+    [base, measuredVersion],
+  );
+  const edges = base.edges;
 
   const applyNodeChanges = useDocumentStore((s) => s.applyNodeChanges);
   const applyEdgeChanges = useDocumentStore((s) => s.applyEdgeChanges);
@@ -83,7 +106,19 @@ function PassGraph() {
   }, [rememberedViewport, applyRfViewport]);
 
   const onNodesChange = useCallback(
-    (changes: NodeChange[]) => applyNodeChanges(changes),
+    (changes: NodeChange[]) => {
+      // Capture React Flow's measurements into the side cache above instead of
+      // round-tripping them through the document store — that round-trip (the doc
+      // carries no dimensions) is what caused the infinite re-measure loop. All
+      // STRUCTURAL changes (position / select / remove) still flow to the store.
+      const { structural, measureChanged } = partitionNodeChanges(changes, measured.current);
+      if (structural.length > 0) {
+        applyNodeChanges(structural);
+      }
+      if (measureChanged) {
+        setMeasuredVersion((v) => v + 1);
+      }
+    },
     [applyNodeChanges],
   );
   const onEdgesChange = useCallback(
