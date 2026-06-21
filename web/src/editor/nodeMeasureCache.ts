@@ -11,11 +11,13 @@
 //    re-measures → emits another `dimensions` change → … an infinite update loop
 //    (React error #185) that also leaves every node permanently invisible. We
 //    cache measurements OUT of the document (in the map this returns into).
-//  * `select` — selection is its own store field, driven by `onSelectionChange`
-//    (→ `setSelection`). Routing `select` changes into the document graph too
-//    would rebuild the project on every click (new node identities), which both
-//    re-triggers the debounced compile loop needlessly AND feeds the selection
-//    ping-pong. The store never reads selection off the graph, so we drop it here.
+//  * `select` — selection is its own store field. The canvas folds `select`
+//    deltas onto it directly (see selectionChanges.ts, called from
+//    onNodesChange/onEdgesChange) rather than through the document graph: routing
+//    `select` into the graph would rebuild the project on every click (new node
+//    identities), needlessly re-triggering the debounced compile loop. So `select`
+//    is filtered OUT of `structural` here too. (We do NOT use React Flow's
+//    `onSelectionChange` — it lagged a click and could ping-pong.)
 //
 // Only position / add / remove / replace reach `applyNodeChanges`.
 import type { NodeChange } from "@xyflow/react";
@@ -24,7 +26,8 @@ import type { NodeChange } from "@xyflow/react";
 export type MeasuredSize = { width: number; height: number };
 
 export interface PartitionedNodeChanges {
-  /** Position / select / remove — applied to the document store. */
+  /** Position / add / remove / replace — applied to the document store (NOT
+   * `select`, which is folded onto the store selection, NOR `dimensions`). */
   structural: NodeChange[];
   /** True when `measured` actually changed (a re-render is needed to surface it). */
   measureChanged: boolean;

@@ -46,6 +46,10 @@ interface PaletteAnchor {
   graphPosition: { x: number; y: number };
 }
 
+/** Stable prop identities so React Flow's StoreUpdater never re-syncs them. */
+const PRO_OPTIONS = { hideAttribution: true } as const;
+const PAN_ON_DRAG: number[] = [1, 2];
+
 /** The per-pass node graph (drilled-in level). */
 function PassGraph() {
   const { screenToFlowPosition, setViewport: applyRfViewport } = useReactFlow();
@@ -114,11 +118,15 @@ function PassGraph() {
       const { structural, measureChanged } = partitionNodeChanges(changes, measured.current);
       // SELECTION is driven here, through the controlled change channel, so the
       // first click registers (see selectionChanges.ts). `select` deltas fold onto
-      // the store selection's node ids; edge selection stays as-is.
-      const cur = useDocumentStore.getState().selection;
-      const sel = applySelectionChanges(cur.nodeIds, changes);
-      if (sel.changed) {
-        setSelection({ nodeIds: sel.ids, edgeIds: cur.edgeIds });
+      // the store selection's node ids; edge selection stays as-is. Skip the whole
+      // fold (a Set build + getState) when the batch has no `select` change — the
+      // common case during a drag/measure burst, which fires position/dimensions only.
+      if (changes.some((c) => c.type === "select")) {
+        const cur = useDocumentStore.getState().selection;
+        const sel = applySelectionChanges(cur.nodeIds, changes);
+        if (sel.changed) {
+          setSelection({ nodeIds: sel.ids, edgeIds: cur.edgeIds });
+        }
       }
       if (structural.length > 0) {
         applyNodeChanges(structural);
@@ -132,10 +140,12 @@ function PassGraph() {
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
       // Edge selection through the controlled channel (mirrors onNodesChange).
-      const cur = useDocumentStore.getState().selection;
-      const sel = applySelectionChanges(cur.edgeIds, changes);
-      if (sel.changed) {
-        setSelection({ nodeIds: cur.nodeIds, edgeIds: sel.ids });
+      if (changes.some((c) => c.type === "select")) {
+        const cur = useDocumentStore.getState().selection;
+        const sel = applySelectionChanges(cur.edgeIds, changes);
+        if (sel.changed) {
+          setSelection({ nodeIds: cur.nodeIds, edgeIds: sel.ids });
+        }
       }
       const structural = changes.filter((c) => c.type !== "select");
       if (structural.length > 0) {
@@ -244,9 +254,9 @@ function PassGraph() {
           onMoveEnd={onMoveEnd}
           onPaneContextMenu={onPaneContextMenu}
           selectionOnDrag
-          panOnDrag={[1, 2]}
+          panOnDrag={PAN_ON_DRAG}
           fitView={!rememberedViewport}
-          proOptions={{ hideAttribution: true }}
+          proOptions={PRO_OPTIONS}
         >
           <Background />
           <Controls />

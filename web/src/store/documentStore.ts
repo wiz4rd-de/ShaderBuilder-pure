@@ -1095,7 +1095,6 @@ export const useDocumentStore = create<DocumentState>((set, get) => {
       );
     },
 
-
     showPipeline: () => {
       const { level, activePassId, subgraphPath, selection } = get();
       if (level === "pipeline") {

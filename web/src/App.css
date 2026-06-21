@@ -511,22 +511,27 @@
 /* ---- Canvas controls (zoom / fit / lock) ----------------------------------
  * React Flow's default Controls are a near-white cluster with light-gray glyphs,
  * which is effectively invisible on the dark editor theme. Re-skin them to the
- * panel palette so the fit-view button (and friends) are actually legible. */
-.react-flow__controls {
+ * panel palette so the fit-view button (and friends) are actually legible.
+ * NOTE: these selectors are intentionally MORE SPECIFIC than React Flow's
+ * (`.react-flow__controls-button`, etc.) because `@xyflow/react/dist/style.css`
+ * is imported (via EditorCanvas) AFTER this file (App.css, imported first in
+ * App.tsx). At equal specificity the later stylesheet would win and revert the
+ * re-skin, so we add an ancestor selector to outrank it regardless of load order. */
+.react-flow .react-flow__controls {
   box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
 }
-.react-flow__controls-button {
+.react-flow__controls .react-flow__controls-button {
   background: var(--panel-2);
   border-bottom: 1px solid var(--border);
   color: var(--text);
 }
-.react-flow__controls-button:hover {
+.react-flow__controls .react-flow__controls-button:hover {
   background: var(--panel);
 }
-.react-flow__controls-button svg {
+.react-flow__controls .react-flow__controls-button svg {
   fill: var(--text);
 }
 
