@@ -20,7 +20,6 @@ import {
   type IsValidConnection,
   type EdgeChange,
   type NodeChange,
-  type OnSelectionChangeParams,
   type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -38,6 +37,7 @@ import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorToolbar } from "./EditorToolbar";
 import { toRfGraph } from "./graphAdapter";
 import { partitionNodeChanges } from "./nodeMeasureCache";
+import { applySelectionChanges } from "./selectionChanges";
 import { NodePaletteMenu } from "./NodePaletteMenu";
 import { useEditorShortcuts } from "./useEditorShortcuts";
 
@@ -109,9 +109,17 @@ function PassGraph() {
     (changes: NodeChange[]) => {
       // Capture React Flow's measurements into the side cache above instead of
       // round-tripping them through the document store — that round-trip (the doc
-      // carries no dimensions) is what caused the infinite re-measure loop. All
-      // STRUCTURAL changes (position / select / remove) still flow to the store.
+      // carries no dimensions) is what caused the infinite re-measure loop. Only
+      // STRUCTURAL changes (position / add / remove) flow to the document store.
       const { structural, measureChanged } = partitionNodeChanges(changes, measured.current);
+      // SELECTION is driven here, through the controlled change channel, so the
+      // first click registers (see selectionChanges.ts). `select` deltas fold onto
+      // the store selection's node ids; edge selection stays as-is.
+      const cur = useDocumentStore.getState().selection;
+      const sel = applySelectionChanges(cur.nodeIds, changes);
+      if (sel.changed) {
+        setSelection({ nodeIds: sel.ids, edgeIds: cur.edgeIds });
+      }
       if (structural.length > 0) {
         applyNodeChanges(structural);
       }
@@ -119,11 +127,22 @@ function PassGraph() {
         setMeasuredVersion((v) => v + 1);
       }
     },
-    [applyNodeChanges],
+    [applyNodeChanges, setSelection],
   );
   const onEdgesChange = useCallback(
-    (changes: EdgeChange[]) => applyEdgeChanges(changes),
-    [applyEdgeChanges],
+    (changes: EdgeChange[]) => {
+      // Edge selection through the controlled channel (mirrors onNodesChange).
+      const cur = useDocumentStore.getState().selection;
+      const sel = applySelectionChanges(cur.edgeIds, changes);
+      if (sel.changed) {
+        setSelection({ nodeIds: cur.nodeIds, edgeIds: sel.ids });
+      }
+      const structural = changes.filter((c) => c.type !== "select");
+      if (structural.length > 0) {
+        applyEdgeChanges(structural);
+      }
+    },
+    [applyEdgeChanges, setSelection],
   );
 
   const onConnect = useCallback(
@@ -167,16 +186,9 @@ function PassGraph() {
     [graph],
   );
 
-  // Mirror RF's selection into the store so toolbar/status/keyboard agree.
-  const onSelectionChange = useCallback(
-    (params: OnSelectionChangeParams) => {
-      setSelection({
-        nodeIds: params.nodes.map((n) => n.id),
-        edgeIds: params.edges.map((e) => e.id),
-      });
-    },
-    [setSelection],
-  );
+  // Selection is mirrored into the store via onNodesChange/onEdgesChange above
+  // (the controlled change channel) — NOT via onSelectionChange, which lagged a
+  // click and could ping-pong with the derived `selected` prop.
 
   // Double-click a subgraph node to drill into its interior (#57).
   const onNodeDoubleClick = useCallback(
@@ -224,7 +236,6 @@ function PassGraph() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           isValidConnection={isValidConnection}
-          onSelectionChange={onSelectionChange}
           onNodeDoubleClick={onNodeDoubleClick}
           onNodeDragStart={onNodeDragStart}
           onNodeDragStop={onNodeDragStop}
