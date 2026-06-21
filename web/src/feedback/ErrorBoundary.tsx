@@ -17,30 +17,39 @@ interface ErrorBoundaryProps {
 
 interface ErrorBoundaryState {
   error: Error | null;
+  /** The React component stack of the failure (from componentDidCatch). */
+  componentStack: string | null;
 }
 
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   constructor(props: ErrorBoundaryProps) {
     super(props);
-    this.state = { error: null };
+    this.state = { error: null, componentStack: null };
   }
 
-  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+  static getDerivedStateFromError(error: Error): Partial<ErrorBoundaryState> {
     return { error };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     // Surface to the console for diagnosis; the UI already shows the fallback.
     console.error(`ErrorBoundary (${this.props.label ?? "app"}) caught`, error, info);
+    this.setState({ componentStack: info.componentStack ?? null });
   }
 
   private reset = (): void => {
-    this.setState({ error: null });
+    this.setState({ error: null, componentStack: null });
   };
 
   render(): ReactNode {
-    const { error } = this.state;
+    const { error, componentStack } = this.state;
     if (error) {
+      // The component stack pinpoints which subtree threw — invaluable for
+      // diagnosing render-time loops/exceptions. Shown in a collapsed disclosure
+      // so it stays out of the way until needed.
+      const details = [error.stack, componentStack && `Component stack:${componentStack}`]
+        .filter(Boolean)
+        .join("\n\n");
       return (
         <div className="error-boundary" role="alert" data-testid="error-boundary">
           <div className="error-boundary__card">
@@ -48,6 +57,14 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
               {this.props.label ? `${this.props.label} hit an error` : "Something went wrong"}
             </h2>
             <p className="error-boundary__message">{error.message || String(error)}</p>
+            {details ? (
+              <details className="error-boundary__details">
+                <summary>Technical details</summary>
+                <pre className="error-boundary__stack" data-testid="error-boundary-stack">
+                  {details}
+                </pre>
+              </details>
+            ) : null}
             <button type="button" className="error-boundary__retry" onClick={this.reset}>
               Try again
             </button>

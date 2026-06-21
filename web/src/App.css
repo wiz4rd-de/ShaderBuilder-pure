@@ -1965,6 +1965,30 @@
 .error-boundary__retry:hover {
   border-color: var(--accent);
 }
+.error-boundary__details {
+  margin: 0 0 16px;
+  text-align: left;
+}
+.error-boundary__details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+}
+.error-boundary__stack {
+  margin: 8px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Export-bundle dialog (#64). */
 .export-dialog {
