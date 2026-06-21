@@ -8,13 +8,20 @@
 //   * double-click a pass → drill into its per-pass graph (openPass).
 //   * pan/zoom            → remembered per-level (setViewport) so back restores it.
 // Reorder/add/remove are driven by the PipelineToolbar (pass order = .slangp index).
+//
+// SELECTION IS ONE-WAY (store → nodes). The pipeline node's `selected` flag is
+// DERIVED from `selections.pipeline`, and selection is changed only by explicit
+// clicks (onNodeClick / onPaneClick). We deliberately do NOT use React Flow's
+// `onSelectionChange` here: that fed React Flow's own selection back into the
+// store, which re-derived the nodes, which made React Flow re-emit the selection,
+// which … looped into "Maximum update depth exceeded" (React #185) on returning
+// to the pipeline with a pass already selected. One-way binding can't ping-pong.
 import {
   Background,
   Controls,
   ReactFlow,
   useReactFlow,
   type Node as RfNode,
-  type OnSelectionChangeParams,
   type Viewport,
 } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
@@ -22,6 +29,9 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useDocumentStore } from "../store/documentStore";
 import { toPipelineGraph } from "./pipelineGraph";
 import { PIPELINE_NODE_TYPES } from "./pipelineNodeTypes";
+
+/** Stable across renders so it never churns React Flow's StoreUpdater. */
+const PRO_OPTIONS = { hideAttribution: true } as const;
 
 export function PipelineCanvas() {
   const project = useDocumentStore((s) => s.project);
@@ -47,10 +57,13 @@ export function PipelineCanvas() {
     }
   }, [rememberedViewport, applyRfViewport]);
 
-  const onSelectionChange = useCallback(
-    (params: OnSelectionChangeParams) => {
-      setPipelineSelection(params.nodes[0]?.id ?? null);
-    },
+  // Click drives selection (one-way: store → derived `selected`). See file header.
+  const onNodeClick = useCallback(
+    (_event: React.MouseEvent, node: RfNode) => setPipelineSelection(node.id),
+    [setPipelineSelection],
+  );
+  const onPaneClick = useCallback(
+    () => setPipelineSelection(null),
     [setPipelineSelection],
   );
 
@@ -71,13 +84,14 @@ export function PipelineCanvas() {
       nodes={nodes}
       edges={edges}
       nodeTypes={PIPELINE_NODE_TYPES}
-      onSelectionChange={onSelectionChange}
+      onNodeClick={onNodeClick}
+      onPaneClick={onPaneClick}
       onNodeDoubleClick={onNodeDoubleClick}
       onMoveEnd={onMoveEnd}
       nodesConnectable={false}
       nodesDraggable={false}
       fitView={!rememberedViewport}
-      proOptions={{ hideAttribution: true }}
+      proOptions={PRO_OPTIONS}
     >
       <Background />
       <Controls />

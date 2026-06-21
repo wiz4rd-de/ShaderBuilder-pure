@@ -20,7 +20,6 @@ import {
   type IsValidConnection,
   type EdgeChange,
   type NodeChange,
-  type OnSelectionChangeParams,
   type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -37,6 +36,8 @@ import { WholePassEditor } from "../wholePass/WholePassEditor";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { EditorToolbar } from "./EditorToolbar";
 import { toRfGraph } from "./graphAdapter";
+import { partitionNodeChanges } from "./nodeMeasureCache";
+import { applySelectionChanges } from "./selectionChanges";
 import { NodePaletteMenu } from "./NodePaletteMenu";
 import { useEditorShortcuts } from "./useEditorShortcuts";
 
@@ -44,6 +45,10 @@ interface PaletteAnchor {
   screen: { x: number; y: number };
   graphPosition: { x: number; y: number };
 }
+
+/** Stable prop identities so React Flow's StoreUpdater never re-syncs them. */
+const PRO_OPTIONS = { hideAttribution: true } as const;
+const PAN_ON_DRAG: number[] = [1, 2];
 
 /** The per-pass node graph (drilled-in level). */
 function PassGraph() {
@@ -60,7 +65,29 @@ function PassGraph() {
   // so drilling into a subgraph (same pass) gives a fresh React Flow instance.
   const navKey = subgraphPath.length > 0 ? subgraphPath[subgraphPath.length - 1]! : activePassId;
   const rememberedViewport = useDocumentStore((s) => s.viewports.passes[navKey] ?? null);
-  const { nodes, edges } = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
+  // React Flow MEASURED-dimension cache (NOT part of the document). React Flow 12
+  // keeps a node hidden until it has measured its on-screen size, and in
+  // CONTROLLED mode it reads `node.measured` off the `nodes` prop on every render
+  // (see `adoptUserNodes` in @xyflow/system). The document has no node dimensions,
+  // so without this cache every render looked "unmeasured" to React Flow → it
+  // re-measured → fired a `dimensions` change → `applyNodeChanges` rebuilt the
+  // nodes (still unmeasured) → re-measure … an infinite update loop (React error
+  // #185) that also left every node permanently invisible. We stash each node's
+  // measured size here (keyed by id) and merge it back into the derived nodes, so
+  // React Flow sees a stable measurement and the loop never starts.
+  const measured = useRef<Map<string, { width: number; height: number }>>(new Map());
+  const [measuredVersion, setMeasuredVersion] = useState(0);
+
+  const base = useMemo(() => toRfGraph(graph, selection), [graph, selection]);
+  const nodes = useMemo(
+    () =>
+      base.nodes.map((n) => {
+        const m = measured.current.get(n.id);
+        return m ? { ...n, measured: m } : n;
+      }),
+    [base, measuredVersion],
+  );
+  const edges = base.edges;
 
   const applyNodeChanges = useDocumentStore((s) => s.applyNodeChanges);
   const applyEdgeChanges = useDocumentStore((s) => s.applyEdgeChanges);
@@ -83,12 +110,49 @@ function PassGraph() {
   }, [rememberedViewport, applyRfViewport]);
 
   const onNodesChange = useCallback(
-    (changes: NodeChange[]) => applyNodeChanges(changes),
-    [applyNodeChanges],
+    (changes: NodeChange[]) => {
+      // Capture React Flow's measurements into the side cache above instead of
+      // round-tripping them through the document store — that round-trip (the doc
+      // carries no dimensions) is what caused the infinite re-measure loop. Only
+      // STRUCTURAL changes (position / add / remove) flow to the document store.
+      const { structural, measureChanged } = partitionNodeChanges(changes, measured.current);
+      // SELECTION is driven here, through the controlled change channel, so the
+      // first click registers (see selectionChanges.ts). `select` deltas fold onto
+      // the store selection's node ids; edge selection stays as-is. Skip the whole
+      // fold (a Set build + getState) when the batch has no `select` change — the
+      // common case during a drag/measure burst, which fires position/dimensions only.
+      if (changes.some((c) => c.type === "select")) {
+        const cur = useDocumentStore.getState().selection;
+        const sel = applySelectionChanges(cur.nodeIds, changes);
+        if (sel.changed) {
+          setSelection({ nodeIds: sel.ids, edgeIds: cur.edgeIds });
+        }
+      }
+      if (structural.length > 0) {
+        applyNodeChanges(structural);
+      }
+      if (measureChanged) {
+        setMeasuredVersion((v) => v + 1);
+      }
+    },
+    [applyNodeChanges, setSelection],
   );
   const onEdgesChange = useCallback(
-    (changes: EdgeChange[]) => applyEdgeChanges(changes),
-    [applyEdgeChanges],
+    (changes: EdgeChange[]) => {
+      // Edge selection through the controlled channel (mirrors onNodesChange).
+      if (changes.some((c) => c.type === "select")) {
+        const cur = useDocumentStore.getState().selection;
+        const sel = applySelectionChanges(cur.edgeIds, changes);
+        if (sel.changed) {
+          setSelection({ nodeIds: cur.nodeIds, edgeIds: sel.ids });
+        }
+      }
+      const structural = changes.filter((c) => c.type !== "select");
+      if (structural.length > 0) {
+        applyEdgeChanges(structural);
+      }
+    },
+    [applyEdgeChanges, setSelection],
   );
 
   const onConnect = useCallback(
@@ -132,16 +196,9 @@ function PassGraph() {
     [graph],
   );
 
-  // Mirror RF's selection into the store so toolbar/status/keyboard agree.
-  const onSelectionChange = useCallback(
-    (params: OnSelectionChangeParams) => {
-      setSelection({
-        nodeIds: params.nodes.map((n) => n.id),
-        edgeIds: params.edges.map((e) => e.id),
-      });
-    },
-    [setSelection],
-  );
+  // Selection is mirrored into the store via onNodesChange/onEdgesChange above
+  // (the controlled change channel) — NOT via onSelectionChange, which lagged a
+  // click and could ping-pong with the derived `selected` prop.
 
   // Double-click a subgraph node to drill into its interior (#57).
   const onNodeDoubleClick = useCallback(
@@ -189,7 +246,6 @@ function PassGraph() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           isValidConnection={isValidConnection}
-          onSelectionChange={onSelectionChange}
           onNodeDoubleClick={onNodeDoubleClick}
           onNodeDragStart={onNodeDragStart}
           onNodeDragStop={onNodeDragStop}
@@ -198,9 +254,9 @@ function PassGraph() {
           onMoveEnd={onMoveEnd}
           onPaneContextMenu={onPaneContextMenu}
           selectionOnDrag
-          panOnDrag={[1, 2]}
+          panOnDrag={PAN_ON_DRAG}
           fitView={!rememberedViewport}
-          proOptions={{ hideAttribution: true }}
+          proOptions={PRO_OPTIONS}
         >
           <Background />
           <Controls />

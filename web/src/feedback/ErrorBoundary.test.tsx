@@ -52,6 +52,22 @@ describe("ErrorBoundary", () => {
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
   });
 
+  it("surfaces the error stack + component stack in a Technical details disclosure", () => {
+    render(
+      <ErrorBoundary label="Editor">
+        <Bomb />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByText("Technical details")).toBeInTheDocument();
+    const stack = screen.getByTestId("error-boundary-stack");
+    // The error's own stack (Error: kaboom) is shown...
+    expect(stack.textContent).toContain("kaboom");
+    // ...and the React component stack (captured in componentDidCatch) names the
+    // throwing component, which is what pinpoints a render-time loop/exception.
+    expect(stack.textContent).toContain("Component stack:");
+    expect(stack.textContent).toContain("Bomb");
+  });
+
   it("recovers when 'Try again' is clicked after the cause is fixed", () => {
     render(
       <ErrorBoundary label="Editor">
