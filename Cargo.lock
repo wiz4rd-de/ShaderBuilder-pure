@@ -55,7 +55,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codegen-glslp",
  "codegen-slang",
@@ -550,14 +550,14 @@ dependencies = [
 
 [[package]]
 name = "codegen-glslp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ir",
 ]
 
 [[package]]
 name = "codegen-slang"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-model",
  "ir",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "core-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1988,7 +1988,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "ir"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-model",
 ]
@@ -2946,7 +2946,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "preset-io"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-model",
  "tempfile",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "preview-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "image",
@@ -3591,7 +3591,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slang-compile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-model",
  "naga",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "source"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-model",
  "image",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "testing"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codegen-slang",
  "core-model",
