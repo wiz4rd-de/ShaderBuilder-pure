@@ -508,6 +508,33 @@
   opacity: 0.8;
 }
 
+/* ---- Canvas controls (zoom / fit / lock) ----------------------------------
+ * React Flow's default Controls are a near-white cluster with light-gray glyphs,
+ * which is effectively invisible on the dark editor theme. Re-skin them to the
+ * panel palette so the fit-view button (and friends) are actually legible.
+ * NOTE: these selectors are intentionally MORE SPECIFIC than React Flow's
+ * (`.react-flow__controls-button`, etc.) because `@xyflow/react/dist/style.css`
+ * is imported (via EditorCanvas) AFTER this file (App.css, imported first in
+ * App.tsx). At equal specificity the later stylesheet would win and revert the
+ * re-skin, so we add an ancestor selector to outrank it regardless of load order. */
+.react-flow .react-flow__controls {
+  box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.react-flow__controls .react-flow__controls-button {
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.react-flow__controls .react-flow__controls-button:hover {
+  background: var(--panel);
+}
+.react-flow__controls .react-flow__controls-button svg {
+  fill: var(--text);
+}
+
 /* ---- Drag-time connection affordances (#65) ---------------------------------
  * While a wire is being dragged, React Flow tags candidate handles: the source
  * handle gets `.connectingfrom`, a hovered target gets `.connectingto`, and a
@@ -1942,6 +1969,30 @@
 }
 .error-boundary__retry:hover {
   border-color: var(--accent);
+}
+.error-boundary__details {
+  margin: 0 0 16px;
+  text-align: left;
+}
+.error-boundary__details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+}
+.error-boundary__stack {
+  margin: 8px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Export-bundle dialog (#64). */
